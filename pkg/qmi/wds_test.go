@@ -185,6 +185,73 @@ func TestParsePacketStatisticsResponse(t *testing.T) {
 	}
 }
 
+func TestParseRuntimeSettingsPCSCFAndIMCN(t *testing.T) {
+	resp := &Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: TLVWDSPCSCFUsingPCO, Value: []byte{0x01}},
+		{Type: TLVWDSPCSCFServerAddrList, Value: []byte{
+			0x02,
+			0x01, 0x02, 0x03, 0x0A, // 10.3.2.1
+			0x05, 0x00, 0x00, 0x0A, // 10.0.0.5
+		}},
+		{Type: TLVWDSPCSCFDomainList, Value: append(
+			[]byte{0x01, 0x0B, 0x00}, []byte("pcscf.ims.x")...)},
+		{Type: TLVWDSIMCNFlag, Value: []byte{0x01}},
+	}}
+
+	s := parseRuntimeSettings(resp)
+
+	if !s.PCSCFUsingPCO {
+		t.Fatal("PCSCFUsingPCO should be true")
+	}
+	if len(s.PCSCFv4) != 2 {
+		t.Fatalf("expected 2 P-CSCF addresses, got %d", len(s.PCSCFv4))
+	}
+	if got := s.PCSCFv4[0].String(); got != "10.3.2.1" {
+		t.Fatalf("first P-CSCF = %s, want 10.3.2.1", got)
+	}
+	if got := s.PCSCFv4[1].String(); got != "10.0.0.5" {
+		t.Fatalf("second P-CSCF = %s, want 10.0.0.5", got)
+	}
+	if len(s.PCSCFDomains) != 1 || s.PCSCFDomains[0] != "pcscf.ims.x" {
+		t.Fatalf("unexpected P-CSCF domains: %#v", s.PCSCFDomains)
+	}
+	if !s.IMCN {
+		t.Fatal("IMCN should be true")
+	}
+}
+
+func TestParseRuntimeSettingsTruncatedPCSCFListIsIgnored(t *testing.T) {
+	resp := &Packet{TLVs: []TLV{
+		successResultTLV(),
+		// count says 2 but only one address follows
+		{Type: TLVWDSPCSCFServerAddrList, Value: []byte{0x02, 0x01, 0x02, 0x03, 0x0A}},
+	}}
+
+	s := parseRuntimeSettings(resp)
+
+	if len(s.PCSCFv4) != 1 {
+		t.Fatalf("expected the one complete address to survive, got %d", len(s.PCSCFv4))
+	}
+}
+
+func TestParseRuntimeSettingsStillParsesIPv4AndMTU(t *testing.T) {
+	resp := &Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: TLVWDSIPv4Address, Value: []byte{0x01, 0x02, 0x03, 0x0A}},
+		wdsTLVUint32(TLVWDSMtu, 1420),
+	}}
+
+	s := parseRuntimeSettings(resp)
+
+	if got := s.IPv4Address.String(); got != "10.3.2.1" {
+		t.Fatalf("IPv4Address = %s, want 10.3.2.1", got)
+	}
+	if s.MTU != 1420 {
+		t.Fatalf("MTU = %d, want 1420", s.MTU)
+	}
+}
+
 func TestParsePacketServiceStatusIndication(t *testing.T) {
 	packet := &Packet{
 		TLVs: []TLV{

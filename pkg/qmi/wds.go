@@ -44,6 +44,16 @@ const (
 	// the WWAN-facing address in TLVWDSIPv6Address.
 	// TLVWDSIPv6DelegatedPrefix 是厂商扩展 TLV（在 Quectel 模组上观察到），携带委派给 CPE 的 IPv6 前缀，与 TLVWDSIPv6Address 中的 WWAN 侧地址不同。
 	TLVWDSIPv6DelegatedPrefix uint8 = 0x57
+
+	// P-CSCF / IMCN TLVs in WDS Get Current Settings.
+	// libqmi data/qmi-service-wds.json: 0x22/0x23/0x24 carry P-CSCF discovery,
+	// 0x2C flags the bearer as IMS-dedicated. There is no IPv6 P-CSCF address
+	// TLV in the WDS service at all — IPv6 P-CSCF must come from the domain
+	// name list (0x24) or from carrier configuration.
+	TLVWDSPCSCFUsingPCO       uint8 = 0x22
+	TLVWDSPCSCFServerAddrList uint8 = 0x23
+	TLVWDSPCSCFDomainList     uint8 = 0x24
+	TLVWDSIMCNFlag            uint8 = 0x2C
 )
 
 // Runtime settings mask bits / 运行时设置掩码位
@@ -64,6 +74,7 @@ const (
 	RuntimeMaskMTU         uint32 = 1 << 13
 	RuntimeMaskDomainName  uint32 = 1 << 14
 	RuntimeMaskIPFamily    uint32 = 1 << 15
+	RuntimeMaskIMCN        uint32 = 1 << 16
 )
 
 // ============================================================================
@@ -469,6 +480,14 @@ type RuntimeSettings struct {
 	IPv6DelegatedPrefix    net.IP
 	IPv6DelegatedPrefixLen int
 	MTU                    int
+	// PCSCFUsingPCO reports whether the network signalled P-CSCF discovery via PCO.
+	PCSCFUsingPCO bool
+	// PCSCFv4 holds the IPv4 P-CSCF addresses delivered by the network.
+	PCSCFv4 []net.IP
+	// PCSCFDomains holds P-CSCF FQDNs, which must be resolved by the caller.
+	PCSCFDomains []string
+	// IMCN reports whether this bearer is the IMS-dedicated PDN.
+	IMCN bool
 }
 
 func parsePacketServiceStatusPacket(packet *Packet, checkResult bool) (ConnectionStatus, error) {
@@ -532,8 +551,9 @@ func (w *WDSService) GetRuntimeSettings(ctx context.Context, ipFamily uint8) (*R
 		return nil, err
 	}
 
-	// Request mask: IP, Gateway, DNS, MTU / 请求掩码: IP, 网关, DNS, MTU
-	mask := RuntimeMaskIPAddr | RuntimeMaskGateway | RuntimeMaskDNS | RuntimeMaskMTU
+	// Request mask: IP, Gateway, DNS, MTU, P-CSCF/IMCN / 请求掩码: IP, 网关, DNS, MTU, P-CSCF/IMCN
+	mask := RuntimeMaskIPAddr | RuntimeMaskGateway | RuntimeMaskDNS | RuntimeMaskMTU |
+		RuntimeMaskPCSCFPCO | RuntimeMaskPCSCFAddr | RuntimeMaskPCSCFDomain | RuntimeMaskIMCN
 	tlvs := []TLV{NewTLVUint32(0x10, mask)}
 
 	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSGetRuntimeSettings, tlvs)
@@ -548,6 +568,16 @@ func (w *WDSService) GetRuntimeSettings(ctx context.Context, ipFamily uint8) (*R
 		return nil, fmt.Errorf("get runtime settings failed: %w", err)
 	}
 
+	return parseRuntimeSettings(resp), nil
+}
+
+// parseRuntimeSettings parses the WDS Get Current Settings response TLVs into
+// a RuntimeSettings value. It performs pure TLV parsing only; result-code
+// checking and request construction stay in GetRuntimeSettings.
+// parseRuntimeSettings 将 WDS Get Current Settings 响应的 TLV 解析为
+// RuntimeSettings 值。它只做纯粹的 TLV 解析；结果码检查和请求构造仍留在
+// GetRuntimeSettings 中。
+func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 	settings := &RuntimeSettings{}
 
 	// Parse IPv4 settings / 解析IPv4设置
@@ -591,7 +621,37 @@ func (w *WDSService) GetRuntimeSettings(ctx context.Context, ipFamily uint8) (*R
 		settings.MTU = int(binary.LittleEndian.Uint32(tlv.Value))
 	}
 
-	return settings, nil
+	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFUsingPCO); tlv != nil && len(tlv.Value) >= 1 {
+		settings.PCSCFUsingPCO = tlv.Value[0] != 0
+	}
+	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFServerAddrList); tlv != nil && len(tlv.Value) >= 1 {
+		count := int(tlv.Value[0])
+		body := tlv.Value[1:]
+		for i := 0; i < count && (i+1)*4 <= len(body); i++ {
+			v := body[i*4 : i*4+4]
+			settings.PCSCFv4 = append(settings.PCSCFv4, net.IPv4(v[3], v[2], v[1], v[0]))
+		}
+	}
+	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFDomainList); tlv != nil && len(tlv.Value) >= 1 {
+		count := int(tlv.Value[0])
+		body := tlv.Value[1:]
+		for i := 0; i < count; i++ {
+			if len(body) < 2 {
+				break
+			}
+			n := int(binary.LittleEndian.Uint16(body[0:2]))
+			if len(body) < 2+n {
+				break
+			}
+			settings.PCSCFDomains = append(settings.PCSCFDomains, string(body[2:2+n]))
+			body = body[2+n:]
+		}
+	}
+	if tlv := FindTLV(resp.TLVs, TLVWDSIMCNFlag); tlv != nil && len(tlv.Value) >= 1 {
+		settings.IMCN = tlv.Value[0] != 0
+	}
+
+	return settings
 }
 
 // RegisterEventReport registers for WDS indications / RegisterEventReport注册WDS指示
