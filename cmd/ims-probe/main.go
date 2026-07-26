@@ -6,8 +6,8 @@
 // to answer the go/no-go question for assumptions A1 (an IMS-APN PDN can
 // coexist with the default data PDN over a QMAP mux) and A2 (the network
 // will hand out an ims APN PDN to a modem that does not advertise native
-// VoLTE support). See docs/verification/2026-07-26-ims-pdn-probe.md for the
-// recorded result of running this against real hardware.
+// VoLTE support). Record the result of running this against real hardware in
+// whatever verification log this project keeps for hardware probes.
 package main
 
 import (
@@ -60,7 +60,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("WDA service: %w", err)
 	}
-	defer wda.Close()
+	defer func() {
+		if err := wda.Close(); err != nil {
+			log.Printf("WARNING: release WDA client: %v", err)
+		}
+	}()
 
 	details, err := wda.GetDataFormatDetails(ctx)
 	if err != nil {
@@ -90,7 +94,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("WDS service: %w", err)
 	}
-	defer wds.Close()
+	defer func() {
+		if err := wds.Close(); err != nil {
+			log.Printf("WARNING: release WDS client: %v", err)
+		}
+	}()
 
 	binding := qmi.MuxBinding{
 		EpType:     details.EndpointType,
@@ -102,6 +110,7 @@ func run() error {
 		return fmt.Errorf("bind mux data port (A1 FAILED): %w", err)
 	}
 	fmt.Println("bound WDS client to mux")
+	fmt.Println("A1 PASSED: QMAP mux created and data port bound")
 
 	family := uint8(0x04)
 	if *ipFamily == 6 {
@@ -114,7 +123,16 @@ func run() error {
 	}
 	fmt.Printf("A2 PASSED: IMS PDN up, handle=%d\n", handle)
 	defer func() {
-		if err := wds.StopNetworkInterface(ctx, handle); err != nil {
+		// Use a fresh context here, not the setup ctx above: ctx carries an
+		// absolute 2-minute deadline shared with the -hold sleep, so on a
+		// long -hold run it may already be expired by the time this runs.
+		// SendRequest returns immediately on an expired context (see
+		// pkg/qmi/client.go), which would silently no-op this cleanup and
+		// leak the IMS PDN on the modem -- the exact hazard this probe
+		// exists to catch.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if err := wds.StopNetworkInterface(stopCtx, handle); err != nil {
 			log.Printf("WARNING: stop network: %v", err)
 		}
 	}()
