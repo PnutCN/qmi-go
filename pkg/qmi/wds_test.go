@@ -235,6 +235,75 @@ func TestParseRuntimeSettingsTruncatedPCSCFListIsIgnored(t *testing.T) {
 	}
 }
 
+// TestParseRuntimeSettingsPCSCFDomainListTruncation pins the safety of the
+// TLVWDSPCSCFDomainList walker against malformed input: an overstated entry
+// count, a string length that runs past the end of the TLV body, and a
+// truncated length prefix must all be ignored without panicking or looping,
+// keeping only the complete entries that were actually readable. It also
+// covers the well-formed multi-entry happy path.
+func TestParseRuntimeSettingsPCSCFDomainListTruncation(t *testing.T) {
+	// lengthPrefixed builds one well-formed entry: a little-endian uint16
+	// byte length followed by the raw string bytes.
+	lengthPrefixed := func(s string) []byte {
+		b := make([]byte, 2, 2+len(s))
+		binary.LittleEndian.PutUint16(b, uint16(len(s)))
+		return append(b, s...)
+	}
+
+	tests := []struct {
+		name        string
+		value       []byte
+		wantDomains []string
+	}{
+		{
+			name: "count overstates entries: only one complete FQDN present",
+			// count=3 but only one length-prefixed entry actually follows
+			value:       append([]byte{0x03}, lengthPrefixed("abc")...),
+			wantDomains: []string{"abc"},
+		},
+		{
+			name: "declared string length runs past end of TLV body",
+			// count=1, length prefix says 20, only 5 bytes follow
+			value:       append([]byte{0x01, 0x14, 0x00}, []byte("hello")...),
+			wantDomains: nil,
+		},
+		{
+			name: "truncated length prefix",
+			// count=1, a single trailing byte where 2 are needed for the length
+			value:       []byte{0x01, 0xAB},
+			wantDomains: nil,
+		},
+		{
+			name: "well-formed multi-entry list",
+			value: append(
+				append([]byte{0x02}, lengthPrefixed("a.com")...),
+				lengthPrefixed("b.example.org")...,
+			),
+			wantDomains: []string{"a.com", "b.example.org"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &Packet{TLVs: []TLV{
+				successResultTLV(),
+				{Type: TLVWDSPCSCFDomainList, Value: tt.value},
+			}}
+
+			s := parseRuntimeSettings(resp)
+
+			if len(s.PCSCFDomains) != len(tt.wantDomains) {
+				t.Fatalf("got %d domains %#v, want %d domains %#v", len(s.PCSCFDomains), s.PCSCFDomains, len(tt.wantDomains), tt.wantDomains)
+			}
+			for i := range tt.wantDomains {
+				if s.PCSCFDomains[i] != tt.wantDomains[i] {
+					t.Fatalf("domain[%d] = %q, want %q", i, s.PCSCFDomains[i], tt.wantDomains[i])
+				}
+			}
+		})
+	}
+}
+
 func TestParseRuntimeSettingsStillParsesIPv4AndMTU(t *testing.T) {
 	resp := &Packet{TLVs: []TLV{
 		successResultTLV(),
@@ -250,6 +319,44 @@ func TestParseRuntimeSettingsStillParsesIPv4AndMTU(t *testing.T) {
 	if s.MTU != 1420 {
 		t.Fatalf("MTU = %d, want 1420", s.MTU)
 	}
+}
+
+// TestParseRuntimeSettingsPCSCFUsingPCOAndIMCNZeroValues covers the false
+// paths for the two boolean flags, which were previously only exercised with
+// 0x01: an explicit 0x00 byte must parse as false, and the flags must also
+// default to false when their TLVs are absent entirely.
+func TestParseRuntimeSettingsPCSCFUsingPCOAndIMCNZeroValues(t *testing.T) {
+	t.Run("explicit zero byte parses as false", func(t *testing.T) {
+		resp := &Packet{TLVs: []TLV{
+			successResultTLV(),
+			{Type: TLVWDSPCSCFUsingPCO, Value: []byte{0x00}},
+			{Type: TLVWDSIMCNFlag, Value: []byte{0x00}},
+		}}
+
+		s := parseRuntimeSettings(resp)
+
+		if s.PCSCFUsingPCO {
+			t.Fatal("PCSCFUsingPCO should be false when TLV byte is 0x00")
+		}
+		if s.IMCN {
+			t.Fatal("IMCN should be false when TLV byte is 0x00")
+		}
+	})
+
+	t.Run("absent TLVs default to false", func(t *testing.T) {
+		resp := &Packet{TLVs: []TLV{
+			successResultTLV(),
+		}}
+
+		s := parseRuntimeSettings(resp)
+
+		if s.PCSCFUsingPCO {
+			t.Fatal("PCSCFUsingPCO should be false when TLV is absent")
+		}
+		if s.IMCN {
+			t.Fatal("IMCN should be false when TLV is absent")
+		}
+	})
 }
 
 func TestParsePacketServiceStatusIndication(t *testing.T) {

@@ -481,12 +481,16 @@ type RuntimeSettings struct {
 	IPv6DelegatedPrefixLen int
 	MTU                    int
 	// PCSCFUsingPCO reports whether the network signalled P-CSCF discovery via PCO.
+	// PCSCFUsingPCO 表示网络是否通过 PCO 信令 P-CSCF 发现。
 	PCSCFUsingPCO bool
 	// PCSCFv4 holds the IPv4 P-CSCF addresses delivered by the network.
+	// PCSCFv4 保存网络下发的 IPv4 P-CSCF 地址。
 	PCSCFv4 []net.IP
 	// PCSCFDomains holds P-CSCF FQDNs, which must be resolved by the caller.
+	// PCSCFDomains 保存 P-CSCF 域名，需由调用方自行解析。
 	PCSCFDomains []string
 	// IMCN reports whether this bearer is the IMS-dedicated PDN.
+	// IMCN 表示该承载是否为 IMS 专用 PDN。
 	IMCN bool
 }
 
