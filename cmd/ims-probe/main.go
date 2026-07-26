@@ -15,6 +15,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
@@ -46,6 +49,9 @@ func run() error {
 		"be discovered automatically -- it must be confirmed on real hardware and this flag adjusted if "+
 		"BindMuxDataPort fails. 4 is the common USB interface number for Quectel QMI endpoints (EC20/EC25).")
 	flag.Parse()
+
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
@@ -158,6 +164,10 @@ func run() error {
 	}
 
 	fmt.Printf("holding PDN for %s — verify the default data PDN is still up\n", *hold)
-	time.Sleep(*hold)
+	select {
+	case <-time.After(*hold):
+	case <-sigCtx.Done():
+		fmt.Println("interrupt received, cleaning up — please wait (do not press Ctrl-C again)")
+	}
 	return nil
 }
