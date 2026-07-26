@@ -89,8 +89,8 @@ func getFormat(ctx context.Context, wda *qmi.WDAService) {
 	fmt.Printf("DlDataAggregation: %d\n", f.DlDataAggregation)
 	fmt.Printf("DlMaxDatagrams: %d\n", f.DlMaxDatagrams)
 	fmt.Printf("DlMaxSize: %d\n", f.DlMaxSize)
-	fmt.Printf("EndpointType: %d\n", f.EndpointType)
-	fmt.Printf("EndpointID: %d\n", f.EndpointID)
+	fmt.Printf("UlMaxDatagrams: %d\n", f.UlMaxDatagrams)
+	fmt.Printf("UlMaxSize: %d\n", f.UlMaxSize)
 	fmt.Println()
 }
 

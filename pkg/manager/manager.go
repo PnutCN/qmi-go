@@ -2647,6 +2647,11 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
 		UlDataAggregation: uint32(qmi.DataFormatUlDataAggDisabled),
 		DlDataAggregation: uint32(qmi.DataFormatDlDataAggDisabled),
+		// EndpointType/InterfaceNumber intentionally left zero (omitted):
+		// Get Data Format cannot report endpoint info back (it's an
+		// INPUT-only TLV on Set Data Format, and numbered differently
+		// there besides -- see DataFormatDetails), so there is nothing
+		// this call could have discovered and forwarded here.
 	}
 	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
 	defer cancel()
