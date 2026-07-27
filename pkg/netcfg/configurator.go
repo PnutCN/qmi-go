@@ -72,6 +72,10 @@ type NetworkConfigurator interface {
 	// RenameInterface 重命名网卡（等同于 `ip link set dev <from> name <to>`）。
 	// qmi_wwan 设备通常要求先关闭接口才能改名，调用方负责改名前后的启停。
 	RenameInterface(from, to string) error
+
+	// ReconcileResidualMux 删除 masterIface 下不在 keepMuxIDs 中的所有 QMAP
+	// mux（清理上次进程异常退出遗留的状态），返回被删除的 mux_id 列表。
+	ReconcileResidualMux(masterIface string, keepMuxIDs []uint8) ([]uint8, error)
 }
 
 var currentConfigurator NetworkConfigurator

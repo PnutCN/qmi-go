@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,11 @@ import (
 type LinuxConfigurator struct{}
 
 var qmapMuxCreateMu sync.Mutex
+
+// sysClassNetRoot is the base of the sysfs netdev tree. A package variable
+// (not a hardcoded literal) so tests can point it at a fake tree instead of
+// the real kernel.
+var sysClassNetRoot = "/sys/class/net"
 
 func NewLinuxConfigurator() *LinuxConfigurator {
 	return &LinuxConfigurator{}
@@ -259,7 +266,7 @@ func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string,
 	qmapMuxCreateMu.Lock()
 	defer qmapMuxCreateMu.Unlock()
 
-	addMuxPath := fmt.Sprintf("/sys/class/net/%s/qmi/add_mux", masterIface)
+	addMuxPath := filepath.Join(sysClassNetRoot, masterIface, "qmi/add_mux")
 
 	// 检查 sysfs 节点是否存在
 	if _, err := os.Stat(addMuxPath); os.IsNotExist(err) {
@@ -299,7 +306,7 @@ func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string,
 }
 
 func qmapMuxInterfaces() (map[string]struct{}, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(sysClassNetRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +353,7 @@ func newQMAPMuxInterface(before, after map[string]struct{}) (string, bool) {
 // DelQMAPMux 销毁指定 MuxID 对应的虚拟网卡
 // 等同于: echo {muxID} > /sys/class/net/{masterIface}/qmi/del_mux
 func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
-	delMuxPath := fmt.Sprintf("/sys/class/net/%s/qmi/del_mux", masterIface)
+	delMuxPath := filepath.Join(sysClassNetRoot, masterIface, "qmi/del_mux")
 
 	if _, err := os.Stat(delMuxPath); os.IsNotExist(err) {
 		return nil // 节点不存在就认为无需清理
@@ -367,7 +374,7 @@ func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
 // /sys/class/net/qmimuxN/qmap/mux_id 这一个真实来源，没有回退猜测；找不到就
 // 如实返回空串，调用方据此判断"确实不存在"而不是被一个猜错的名字误导。
 func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(sysClassNetRoot)
 	if err != nil {
 		return ""
 	}
@@ -377,7 +384,7 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 		if !strings.HasPrefix(name, "qmimux") {
 			continue
 		}
-		muxIDPath := fmt.Sprintf("/sys/class/net/%s/qmap/mux_id", name)
+		muxIDPath := filepath.Join(sysClassNetRoot, name, "qmap/mux_id")
 		if data, err := os.ReadFile(muxIDPath); err == nil {
 			val := strings.TrimSpace(string(data))
 			expected := fmt.Sprintf("0x%x", muxID)
@@ -391,10 +398,73 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 	return ""
 }
 
+// ReconcileResidualMux deletes every QMAP mux under masterIface whose mux_id
+// is not in keepMuxIDs. Call this once, early in device bootstrap, before
+// any add_mux for this session — a mux left allocated by a crashed previous
+// process otherwise makes the next add_mux for the same mux_id fail with
+// EINVAL ("mux_id already present"), and there is no way to distinguish that
+// from a mux this session itself still needs without enumerating by mux_id
+// (never by netdev name — qmimux numbering is global creation order,
+// unrelated to mux_id; see GetQMAPMuxIface's doc comment). Returns the
+// mux_ids it deleted.
+func (l *LinuxConfigurator) ReconcileResidualMux(masterIface string, keepMuxIDs []uint8) ([]uint8, error) {
+	keep := make(map[uint8]bool, len(keepMuxIDs))
+	for _, id := range keepMuxIDs {
+		keep[id] = true
+	}
+
+	entries, err := os.ReadDir(sysClassNetRoot)
+	if err != nil {
+		return nil, fmt.Errorf("netcfg: 扫描 %s 失败: %w", sysClassNetRoot, err)
+	}
+
+	var deleted []uint8
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "qmimux") {
+			continue
+		}
+		lowerPath := filepath.Join(sysClassNetRoot, name, "lower_"+masterIface)
+		if _, err := os.Stat(lowerPath); os.IsNotExist(err) {
+			continue // 属于别的主设备
+		}
+		muxIDPath := filepath.Join(sysClassNetRoot, name, "qmap/mux_id")
+		data, err := os.ReadFile(muxIDPath)
+		if err != nil {
+			continue
+		}
+		id, err := parseMuxIDAttr(strings.TrimSpace(string(data)))
+		if err != nil || keep[id] {
+			continue
+		}
+		if err := l.DelQMAPMux(masterIface, id); err != nil {
+			return deleted, fmt.Errorf("netcfg: 清理残留 mux_id=%d 失败: %w", id, err)
+		}
+		deleted = append(deleted, id)
+	}
+	return deleted, nil
+}
+
+// parseMuxIDAttr parses qmap/mux_id, which the kernel reports as either
+// "0xN" or a plain decimal string depending on driver version (see
+// GetQMAPMuxIface's own dual-format comparison a few lines above).
+func parseMuxIDAttr(s string) (uint8, error) {
+	base := 10
+	if strings.HasPrefix(s, "0x") {
+		s = s[2:]
+		base = 16
+	}
+	v, err := strconv.ParseUint(s, base, 8)
+	if err != nil {
+		return 0, err
+	}
+	return uint8(v), nil
+}
+
 // EnableRawIP 在物理网卡上开启 Raw IP 模式（QMAP 前置条件）
 // 等同于: echo Y > /sys/class/net/{ifname}/qmi/raw_ip
 func (l *LinuxConfigurator) EnableRawIP(ifname string) error {
-	rawIPPath := fmt.Sprintf("/sys/class/net/%s/qmi/raw_ip", ifname)
+	rawIPPath := filepath.Join(sysClassNetRoot, ifname, "qmi/raw_ip")
 
 	if _, err := os.Stat(rawIPPath); os.IsNotExist(err) {
 		return nil // 内核驱动不支持，跳过

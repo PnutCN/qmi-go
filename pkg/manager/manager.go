@@ -1239,6 +1239,25 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		}
 		m.log.Debug("Allocated WDA client")
 
+		keepMuxIDs := []uint8{}
+		if m.cfg.MuxID > 0 {
+			keepMuxIDs = append(keepMuxIDs, m.cfg.MuxID)
+		}
+		// Clear any QMAP mux left allocated by a crashed previous process
+		// before enableRawIP runs. Uses cfg.Device.NetInterface, not
+		// CurrentMasterInterface(): this always runs before this device's
+		// own first-ever rename (Dial's MuxID>0 block, which only fires
+		// later), so the master is still guaranteed to be at its
+		// configured name here. A device left renamed by an earlier crash
+		// is a separate, out-of-scope recovery case -- every step after
+		// this one already fails loudly against a missing sysfs path
+		// rather than silently guessing at a renamed name.
+		if deleted, err := netcfg.ReconcileResidualMux(m.cfg.Device.NetInterface, keepMuxIDs); err != nil {
+			m.log.WithError(err).Warn("清理残留 QMAP mux 失败，继续初始化")
+		} else if len(deleted) > 0 {
+			m.log.Warnf("启动时清理了残留 QMAP mux: %v (上次进程异常退出的遗留状态)", deleted)
+		}
+
 		if err := m.enableRawIP(ctx); err != nil {
 			if ctx.Err() != nil {
 				return fmt.Errorf("failed to enable RawIP mode: %w", ctx.Err())
