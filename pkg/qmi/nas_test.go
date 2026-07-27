@@ -1,6 +1,7 @@
 package qmi
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 )
@@ -388,6 +389,97 @@ func TestDecodeBCDPLMN(t *testing.T) {
 	}
 }
 
+func TestParseSignalInfoPacketNR5G(t *testing.T) {
+	packet := &Packet{TLVs: []TLV{
+		{Type: 0x17, Value: []byte{0xA1, 0xFF, 0x7B, 0x00}}, // RSRP=-95, SNR=12.3 dB
+		{Type: 0x18, Value: []byte{0xF5, 0xFF}},             // RSRQ=-11 dB
+	}}
+
+	info, err := parseSignalInfoPacket(packet)
+	if err != nil {
+		t.Fatalf("parseSignalInfoPacket returned error: %v", err)
+	}
+	if info.NR5GRSRP != -95 || info.NR5GRSRQ != -11 || info.NR5GSINR != 12 {
+		t.Fatalf("unexpected NR5G signal info: %+v", info)
+	}
+}
+
+func nr5gSystemInfoValue() []byte {
+	value := make([]byte, 29)
+	value[0], value[1] = 1, 3 // domain valid, CS+PS
+	value[2], value[3] = 1, 3 // capability valid, CS+PS
+	value[4], value[5] = 1, 0 // roaming valid, off
+	value[6], value[7] = 1, 0 // forbidden valid, false
+	value[8] = 1
+	binary.LittleEndian.PutUint16(value[9:11], 0x1234)
+	value[11] = 1
+	binary.LittleEndian.PutUint32(value[12:16], 0x11223344)
+	value[19] = 1
+	copy(value[20:23], "310")
+	copy(value[23:26], "260")
+	value[26] = 1
+	binary.LittleEndian.PutUint16(value[27:29], 0x5678)
+	return value
+}
+
+func TestParseSysInfoResponseNR5G(t *testing.T) {
+	info, err := parseSysInfoResponse(&Packet{TLVs: []TLV{
+		{Type: 0x4A, Value: []byte{2, 2, 1}},
+		{Type: 0x4B, Value: nr5gSystemInfoValue()},
+		{Type: 0x4E, Value: []byte{1}},
+		{Type: 0x4F, Value: []byte{0}},
+	}})
+	if err != nil {
+		t.Fatalf("parseSysInfoResponse returned error: %v", err)
+	}
+	if !info.NR5GServiceStatusValid || info.NR5GServiceStatus != 2 || !info.NR5GValid || info.NR5GServiceDomain != 3 || info.NR5GMCC != "310" || info.NR5GMNC != "260" || info.NR5GCellID != 0x11223344 || info.NR5GTAC != 0x5678 || !info.ENDCAvailableValid || !info.ENDCAvailable || !info.DCNRRestrictionValid || info.DCNRRestriction {
+		t.Fatalf("unexpected NR5G response info: %+v", info)
+	}
+}
+
+func TestParseSysInfoIndicationNR5G(t *testing.T) {
+	info, err := ParseSysInfoIndication(&Packet{TLVs: []TLV{
+		{Type: 0x4C, Value: []byte{2, 2, 1}},
+		{Type: 0x4D, Value: nr5gSystemInfoValue()},
+		{Type: 0x50, Value: []byte{1}},
+		{Type: 0x51, Value: []byte{0}},
+	}})
+	if err != nil {
+		t.Fatalf("ParseSysInfoIndication returned error: %v", err)
+	}
+	if info.NR5GMCC != "310" || info.NR5GMNC != "260" || info.NR5GCellID != 0x11223344 || !info.ENDCAvailable {
+		t.Fatalf("unexpected NR5G indication info: %+v", info)
+	}
+}
+
+func TestNASServiceGetCellLocationInfoSendsNAS0043(t *testing.T) {
+	client := newUIMUnitTestClient()
+	stop := serveUIMUnitTestRequests(t, client, func(req *Packet) *Packet {
+		if req.ServiceType != ServiceNAS || req.ClientID != 7 || req.MessageID != NASGetCellLocationInfo {
+			t.Fatalf("unexpected cell location request: %+v", req)
+		}
+		if len(req.TLVs) != 0 {
+			t.Fatalf("cell location request TLVs=%+v, want none", req.TLVs)
+		}
+		return &Packet{TLVs: []TLV{
+			successResultTLV(),
+			{Type: 0x13, Value: []byte{
+				0x01, 0x13, 0x00, 0x62, 0x64, 0x00, 0x78, 0x56, 0x34, 0x12,
+				0xA4, 0x01, 0x21, 0x00, 0x07, 0x08, 0x09, 0x0A,
+			}},
+		}}
+	})
+	defer stop()
+
+	info, err := (&NASService{client: client, clientID: 7}).GetCellLocationInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetCellLocationInfo returned error: %v", err)
+	}
+	if info.LTE == nil || info.LTE.MCC != "310" || info.LTE.MNC != "260" || info.LTE.GlobalCellID != 0x12345678 {
+		t.Fatalf("unexpected cell location response: %+v", info)
+	}
+}
+
 func TestParseCellLocationInfoResponse(t *testing.T) {
 	lteTLV := []byte{
 		0x01,
@@ -435,6 +527,95 @@ func TestParseCellLocationInfoResponse(t *testing.T) {
 	}
 	if info.NR5G.TAC != 258 || info.NR5G.GlobalCellID != 0x1122334455667788 || info.NR5G.PhysicalCellID != 321 {
 		t.Fatalf("unexpected NR cell info: %+v", info.NR5G)
+	}
+}
+
+func TestParseCellLocationInfoResponseLTEIntraFrequencyNeighbors(t *testing.T) {
+	neighbor := make([]byte, 10)
+	rsrq, rsrp, rssi := int16(-80), int16(-920), int16(-700)
+	binary.LittleEndian.PutUint16(neighbor[0:2], 66)
+	binary.LittleEndian.PutUint16(neighbor[2:4], uint16(rsrq))
+	binary.LittleEndian.PutUint16(neighbor[4:6], uint16(rsrp))
+	binary.LittleEndian.PutUint16(neighbor[6:8], uint16(rssi))
+	binary.LittleEndian.PutUint16(neighbor[8:10], uint16(23))
+	lte := append([]byte{
+		0x01, 0x13, 0x00, 0x62, 0x64, 0x00, 0x78, 0x56, 0x34, 0x12,
+		0xA4, 0x01, 0x21, 0x00, 0x07, 0x08, 0x09, 0x0A, 0x01,
+	}, neighbor...)
+
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x13, Value: lte},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.LTE == nil || len(info.LTE.IntraFrequencyNeighbors) != 1 {
+		t.Fatalf("unexpected intra-frequency neighbors: %+v", info.LTE)
+	}
+	got := info.LTE.IntraFrequencyNeighbors[0]
+	if got.PhysicalCellID != 66 || got.RSRQ != -80 || got.RSRP != -920 || got.RSSI != -700 || got.CellSelectionRXLevel != 23 {
+		t.Fatalf("unexpected intra-frequency neighbor: %+v", got)
+	}
+}
+
+func TestParseCellLocationInfoResponseLTEInterFrequencyNeighbors(t *testing.T) {
+	neighbor := make([]byte, 10)
+	rsrq, rsrp, rssi := int16(-100), int16(-1000), int16(-650)
+	binary.LittleEndian.PutUint16(neighbor[0:2], 99)
+	binary.LittleEndian.PutUint16(neighbor[2:4], uint16(rsrq))
+	binary.LittleEndian.PutUint16(neighbor[4:6], uint16(rsrp))
+	binary.LittleEndian.PutUint16(neighbor[6:8], uint16(rssi))
+	binary.LittleEndian.PutUint16(neighbor[8:10], uint16(11))
+	inter := append([]byte{0x01, 0x01, 0xEA, 0x04, 0x02, 0x03, 0x05, 0x01}, neighbor...)
+
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x14, Value: inter},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.LTE == nil || len(info.LTE.InterFrequencyNeighbors) != 1 {
+		t.Fatalf("unexpected inter-frequency neighbors: %+v", info.LTE)
+	}
+	got := info.LTE.InterFrequencyNeighbors[0]
+	if got.EARFCN != 1258 || !got.HasCellReselectionPriority || got.CellReselectionPriority != 5 || len(got.Neighbors) != 1 {
+		t.Fatalf("unexpected inter-frequency entry: %+v", got)
+	}
+	if got.Neighbors[0].PhysicalCellID != 99 || got.Neighbors[0].RSRP != -1000 {
+		t.Fatalf("unexpected inter-frequency neighbor: %+v", got.Neighbors[0])
+	}
+}
+
+func TestParseCellLocationInfoResponseNR5GMeasurementsRemainRawTenths(t *testing.T) {
+	nr := make([]byte, 22)
+	rsrq, rsrp, snr := int16(-110), int16(-950), int16(123)
+	copy(nr[0:3], []byte{0x13, 0x00, 0x62})
+	binary.LittleEndian.PutUint16(nr[16:18], uint16(rsrq))
+	binary.LittleEndian.PutUint16(nr[18:20], uint16(rsrp))
+	binary.LittleEndian.PutUint16(nr[20:22], uint16(snr))
+
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x2F, Value: nr},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.NR5G == nil || info.NR5G.RSRQ != -110 || info.NR5G.RSRP != -950 || info.NR5G.SNR != 123 {
+		t.Fatalf("unexpected raw NR5G measurements: %+v", info.NR5G)
+	}
+}
+
+func TestParseCellLocationInfoIndication(t *testing.T) {
+	packet := &Packet{TLVs: []TLV{{Type: 0x13, Value: []byte{
+		0x01, 0x13, 0x00, 0x62, 0x64, 0x00, 0x78, 0x56, 0x34, 0x12,
+		0xA4, 0x01, 0x21, 0x00, 0x07, 0x08, 0x09, 0x0A, 0x00,
+	}}}}
+	info, err := ParseCellLocationInfoIndication(packet)
+	if err != nil {
+		t.Fatalf("ParseCellLocationInfoIndication returned error: %v", err)
+	}
+	if info.LTE == nil || info.LTE.MCC != "310" || info.LTE.MNC != "260" {
+		t.Fatalf("unexpected indication cell info: %+v", info)
 	}
 }
 

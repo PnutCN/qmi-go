@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -13,7 +14,7 @@ import (
 
 func main() {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
-	action := flag.String("action", "all", "Action: all, serving, signal, signal-info, sysinfo, scan, register, dump")
+	action := flag.String("action", "all", "Action: all, serving, signal, signal-info, sysinfo, scan, cell-info, register, dump")
 	useQRTR := flag.Bool("qrtr", false, "Use native QRTR (AF_QIPCRTR) transport instead of a cdc-wdm device")
 	flag.Parse()
 
@@ -40,6 +41,7 @@ func main() {
 		runSignalInfo(ctx, nas)
 		runSysInfo(ctx, nas)
 		runScan(nas)
+		runCellLocationInfo(ctx, nas)
 	case "serving":
 		runServing(ctx, nas)
 	case "signal":
@@ -50,6 +52,8 @@ func main() {
 		runSysInfo(ctx, nas)
 	case "scan":
 		runScan(nas)
+	case "cell-info":
+		runCellLocationInfo(ctx, nas)
 	case "register":
 		runRegister(nas)
 	case "dump":
@@ -141,6 +145,34 @@ func runScan(nas *qmi.NASService) {
 		fmt.Printf("PLMN: %s-%s status=%d rats=%v desc=%q\n", r.MCC, r.MNC, r.Status, r.RATs, r.Description)
 	}
 	fmt.Println()
+}
+
+func runCellLocationInfo(ctx context.Context, nas *qmi.NASService) {
+	info, err := nas.GetCellLocationInfo(ctx)
+	if err != nil {
+		log.Printf("GetCellLocationInfo failed: %v", err)
+		return
+	}
+	fmt.Print(formatCellLocationInfo(info))
+}
+
+func formatCellLocationInfo(info *qmi.CellLocationInfo) string {
+	var output bytes.Buffer
+	output.WriteString("=== NAS Cell Location Info ===\n")
+	if info == nil {
+		return output.String()
+	}
+	if info.LTE != nil {
+		fmt.Fprintf(&output, "LTE: PLMN=%s-%s EARFCN=%d PCI=%d\n", info.LTE.MCC, info.LTE.MNC, info.LTE.EARFCN, info.LTE.ServingCellID)
+		for _, neighbor := range info.LTE.IntraFrequencyNeighbors {
+			fmt.Fprintf(&output, "LTE neighbor PCI=%d RSRP=%.1f dBm RSRQ=%.1f dB\n", neighbor.PhysicalCellID, float64(neighbor.RSRP)/10, float64(neighbor.RSRQ)/10)
+		}
+	}
+	if info.NR5G != nil {
+		fmt.Fprintf(&output, "NR5G: PLMN=%s-%s PCI=%d RSRP: %.1f dBm RSRQ: %.1f dB SNR: %.1f dB\n", info.NR5G.MCC, info.NR5G.MNC, info.NR5G.PhysicalCellID, float64(info.NR5G.RSRP)/10, float64(info.NR5G.RSRQ)/10, float64(info.NR5G.SNR)/10)
+	}
+	output.WriteByte('\n')
+	return output.String()
 }
 
 func runDump(ctx context.Context, client *qmi.Client, nas *qmi.NASService) {

@@ -55,6 +55,20 @@ func TestDispatchIndicationClassifiesNASEventReportSeparately(t *testing.T) {
 	}
 }
 
+func TestDispatchIndicationClassifiesCellLocationInfo(t *testing.T) {
+	c := &Client{
+		eventCh:            make(chan Event, 1),
+		closeCh:            make(chan struct{}),
+		transactions:       make(map[uint32]*transactionEntry),
+		recentTransactions: make(map[uint32]recentTransaction),
+		clientIDs:          make(map[uint16]uint8),
+	}
+	c.dispatchIndication(&Packet{ServiceType: ServiceNAS, MessageID: NASGetCellLocationInfo, IsIndication: true})
+	if got := <-c.eventCh; got.Type != EventNASCellLocationInfoChanged {
+		t.Fatalf("event type=%v want EventNASCellLocationInfoChanged", got.Type)
+	}
+}
+
 func TestModemResetIndicationNotDroppedWhenQueueFull(t *testing.T) {
 	c := &Client{
 		opts:              ClientOptions{ReadDeadline: 5 * time.Millisecond},

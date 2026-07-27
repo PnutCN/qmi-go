@@ -42,6 +42,7 @@ const (
 	EventNASSignalInfoChanged                                   // NAS signal info changed indication / NAS 信号信息变化指示
 	EventNASNetworkReject                                       // NAS network reject indication / NAS 驻网拒绝指示
 	EventNASIncrementalNetworkScan                              // NAS incremental network scan indication / NAS 增量搜网指示
+	EventNASCellLocationInfoChanged                             // NAS cell location info indication / NAS 小区信息变化指示
 	EventModemReset                                             // Modem reset indication / Modem 重置指示
 	EventSimStatusChanged                                       // SIM status changed indication / SIM 状态改变指示
 	EventUIMSessionClosed                                       // UIM session closed indication / UIM 会话关闭指示
@@ -107,6 +108,8 @@ func (e EventType) String() string {
 		return "NASNetworkReject"
 	case EventNASIncrementalNetworkScan:
 		return "NASIncrementalNetworkScan"
+	case EventNASCellLocationInfoChanged:
+		return "NASCellLocationInfoChanged"
 	case EventNASEventReport:
 		return "NASEventReport"
 	case EventModemReset:
@@ -155,6 +158,7 @@ type Event struct {
 	NASSignalInfo             *qmi.SignalInfo                                 // NAS signal info / NAS 信号详情
 	NASNetworkReject          *qmi.NASNetworkRejectInfo                       // NAS network reject / NAS 驻网拒绝
 	NASIncrementalNetwork     *qmi.NASIncrementalNetworkScanInfo              // NAS incremental scan / NAS 增量搜网
+	NASCellLocationInfo       *qmi.CellLocationInfo                           // NAS cell location info / NAS 小区信息
 	PacketServiceStatus       qmi.ConnectionStatus                            // WDS packet service status / WDS 数据服务状态
 	UIMRefresh                *qmi.UIMRefreshIndication                       // UIM refresh indication payload / UIM 刷新指示载荷
 	UIMSlotStatus             *qmi.UIMSlotStatus                              // UIM slot status indication payload / UIM 卡槽状态指示载荷
@@ -467,6 +471,35 @@ func cloneTLVMeta(in []qmi.TLVMeta) []qmi.TLVMeta {
 	return out
 }
 
+func cloneNASCellLocationInfo(in *qmi.CellLocationInfo) *qmi.CellLocationInfo {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.GERAN != nil {
+		value := *in.GERAN
+		out.GERAN = &value
+	}
+	if in.UMTS != nil {
+		value := *in.UMTS
+		out.UMTS = &value
+	}
+	if in.LTE != nil {
+		value := *in.LTE
+		value.IntraFrequencyNeighbors = append([]qmi.LTECellNeighbor(nil), in.LTE.IntraFrequencyNeighbors...)
+		value.InterFrequencyNeighbors = append([]qmi.LTECellInterFrequency(nil), in.LTE.InterFrequencyNeighbors...)
+		for i := range value.InterFrequencyNeighbors {
+			value.InterFrequencyNeighbors[i].Neighbors = append([]qmi.LTECellNeighbor(nil), in.LTE.InterFrequencyNeighbors[i].Neighbors...)
+		}
+		out.LTE = &value
+	}
+	if in.NR5G != nil {
+		value := *in.NR5G
+		out.NR5G = &value
+	}
+	return &out
+}
+
 func cloneEvent(event Event) Event {
 	out := event
 	out.Settings = cloneRuntimeSettings(event.Settings)
@@ -486,6 +519,7 @@ func cloneEvent(event Event) Event {
 	out.NASSignalInfo = cloneSignalInfo(event.NASSignalInfo)
 	out.NASNetworkReject = cloneNASNetworkRejectInfo(event.NASNetworkReject)
 	out.NASIncrementalNetwork = cloneNASIncrementalNetworkScanInfo(event.NASIncrementalNetwork)
+	out.NASCellLocationInfo = cloneNASCellLocationInfo(event.NASCellLocationInfo)
 	out.UIMRefresh = cloneUIMRefreshIndication(event.UIMRefresh)
 	out.UIMSlotStatus = cloneUIMSlotStatus(event.UIMSlotStatus)
 	out.WMSSMSCAddress = cloneWMSSMSCAddress(event.WMSSMSCAddress)
@@ -732,6 +766,14 @@ func (m *Manager) OnNASSignalInfoChanged(handler func(info *qmi.SignalInfo)) {
 	m.OnEvent(func(e Event) {
 		if e.Type == EventNASSignalInfoChanged && handler != nil {
 			handler(e.NASSignalInfo)
+		}
+	})
+}
+
+func (m *Manager) OnNASCellLocationInfoChanged(handler func(info *qmi.CellLocationInfo)) {
+	m.OnEvent(func(e Event) {
+		if e.Type == EventNASCellLocationInfoChanged && handler != nil {
+			handler(e.NASCellLocationInfo)
 		}
 	})
 }

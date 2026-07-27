@@ -68,9 +68,12 @@ type DeviceSnapshot struct {
 	nasNetworkRejectValid bool
 
 	// 来自 NAS IncrementalNetworkScan indication（最近一次任务状态）
-	nasIncrementalScan      *qmi.NASIncrementalNetworkScanInfo
-	lastNASIncrementalScan  time.Time
-	nasIncrementalScanValid bool
+	nasIncrementalScan       *qmi.NASIncrementalNetworkScanInfo
+	lastNASIncrementalScan   time.Time
+	nasIncrementalScanValid  bool
+	nasCellLocationInfo      *qmi.CellLocationInfo
+	lastNASCellLocationInfo  time.Time
+	nasCellLocationInfoValid bool
 
 	// 来自 UIM refresh indication
 	uimRefresh      *qmi.UIMRefreshIndication
@@ -322,6 +325,17 @@ func (s *DeviceSnapshot) updateNASSignalInfo(info *qmi.SignalInfo) {
 	s.mu.Unlock()
 }
 
+func (s *DeviceSnapshot) updateNASCellLocationInfo(info *qmi.CellLocationInfo) {
+	if info == nil {
+		return
+	}
+	s.mu.Lock()
+	s.nasCellLocationInfo = cloneNASCellLocationInfo(info)
+	s.lastNASCellLocationInfo = time.Now()
+	s.nasCellLocationInfoValid = true
+	s.mu.Unlock()
+}
+
 func (s *DeviceSnapshot) updateNASNetworkReject(info *qmi.NASNetworkRejectInfo) {
 	if info == nil {
 		return
@@ -482,6 +496,12 @@ func (s *DeviceSnapshot) NASSignalInfo() (*qmi.SignalInfo, time.Time, bool) {
 	return cloneNASSignalInfo(s.nasSignalInfo), s.lastNASSignalInfo, s.nasSignalInfoValid
 }
 
+func (s *DeviceSnapshot) NASCellLocationInfo() (*qmi.CellLocationInfo, time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneNASCellLocationInfo(s.nasCellLocationInfo), s.lastNASCellLocationInfo, s.nasCellLocationInfoValid
+}
+
 // NASNetworkReject 返回最近一次 NAS 驻网拒绝信息及时间戳和有效标记。
 func (s *DeviceSnapshot) NASNetworkReject() (*qmi.NASNetworkRejectInfo, time.Time, bool) {
 	s.mu.RLock()
@@ -625,6 +645,9 @@ func (s *DeviceSnapshot) Reset() {
 	s.nasIncrementalScan = nil
 	s.lastNASIncrementalScan = time.Time{}
 	s.nasIncrementalScanValid = false
+	s.nasCellLocationInfo = nil
+	s.lastNASCellLocationInfo = time.Time{}
+	s.nasCellLocationInfoValid = false
 	s.uimRefresh = nil
 	s.lastUIMRefresh = time.Time{}
 	s.uimRefreshValid = false

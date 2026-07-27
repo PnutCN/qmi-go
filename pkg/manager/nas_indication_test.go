@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -219,13 +220,81 @@ func TestHandleIndicationNASSignalInfoChanged(t *testing.T) {
 		Type: qmi.EventNASSignalInfoChanged,
 		Packet: &qmi.Packet{TLVs: []qmi.TLV{
 			{Type: 0x14, Value: []byte{0x00, uint8(rsrq), 0x38, 0xFF, 0x32, 0x00}},
-			{Type: 0x17, Value: []byte{0xE7, 0xFF, 0x9C, 0xFF, 0x1E, 0x00}},
+			{Type: 0x17, Value: []byte{0xA1, 0xFF, 0x7B, 0x00}},
+			{Type: 0x18, Value: []byte{0xF5, 0xFF}},
 		}},
 	})
 
 	info, ts, valid := m.snapshot.NASSignalInfo()
-	if !valid || info == nil || info.LTERSRQ != -9 || info.LTERSRP != -200 || info.NR5GSINR != 30 || ts.IsZero() {
+	if !valid || info == nil || info.LTERSRQ != -9 || info.LTERSRP != -200 || info.NR5GRSRP != -95 || info.NR5GRSRQ != -11 || info.NR5GSINR != 12 || ts.IsZero() {
 		t.Fatalf("unexpected nas signal snapshot: valid=%v ts=%v info=%+v", valid, ts, info)
+	}
+}
+
+func TestHandleIndicationNASCellLocationInfoChanged(t *testing.T) {
+	m := &Manager{log: NewNopLogger(), events: NewEventEmitter(), eventCh: make(chan internalEvent, 1)}
+	packet := &qmi.Packet{TLVs: []qmi.TLV{{Type: 0x13, Value: []byte{
+		0x01, 0x13, 0x00, 0x62, 0x64, 0x00, 0x78, 0x56, 0x34, 0x12,
+		0xA4, 0x01, 0x21, 0x00, 0x07, 0x08, 0x09, 0x0A, 0x00,
+	}}}}
+	m.handleIndication(qmi.Event{Type: qmi.EventNASCellLocationInfoChanged, Packet: packet})
+	info, ts, valid := m.snapshot.NASCellLocationInfo()
+	if !valid || info == nil || info.LTE == nil || info.LTE.MNC != "260" || ts.IsZero() {
+		t.Fatalf("unexpected cell location snapshot: valid=%v ts=%v info=%+v", valid, ts, info)
+	}
+	m.snapshot.Reset()
+	if _, _, valid := m.snapshot.NASCellLocationInfo(); valid {
+		t.Fatal("cell location snapshot remains valid after reset")
+	}
+}
+
+func TestNASCellLocationInfoCallbackAndSnapshotDoNotShareNeighbors(t *testing.T) {
+	m := &Manager{log: NewNopLogger(), events: NewEventEmitter(), eventCh: make(chan internalEvent, 1)}
+	callbackDone := make(chan struct{}, 1)
+	m.OnEvent(func(evt Event) {
+		if evt.Type != EventNASCellLocationInfoChanged || evt.NASCellLocationInfo == nil || evt.NASCellLocationInfo.LTE == nil {
+			return
+		}
+		evt.NASCellLocationInfo.LTE.IntraFrequencyNeighbors[0].RSRP = 1
+		evt.NASCellLocationInfo.LTE.InterFrequencyNeighbors[0].Neighbors[0].RSRP = 2
+		callbackDone <- struct{}{}
+	})
+
+	intra := make([]byte, 10)
+	intraRSRP := int16(-920)
+	binary.LittleEndian.PutUint16(intra[0:2], 66)
+	binary.LittleEndian.PutUint16(intra[4:6], uint16(intraRSRP))
+	inter := make([]byte, 10)
+	interRSRP := int16(-1000)
+	binary.LittleEndian.PutUint16(inter[0:2], 99)
+	binary.LittleEndian.PutUint16(inter[4:6], uint16(interRSRP))
+	lte := append([]byte{
+		0x01, 0x13, 0x00, 0x62, 0x64, 0x00, 0x78, 0x56, 0x34, 0x12,
+		0xA4, 0x01, 0x21, 0x00, 0x07, 0x08, 0x09, 0x0A, 0x01,
+	}, intra...)
+	interFreq := append([]byte{0x01, 0x01, 0xEA, 0x04, 0x02, 0x03, 0x05, 0x01}, inter...)
+
+	m.handleIndication(qmi.Event{Type: qmi.EventNASCellLocationInfoChanged, Packet: &qmi.Packet{TLVs: []qmi.TLV{
+		{Type: 0x13, Value: lte},
+		{Type: 0x14, Value: interFreq},
+	}}})
+
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for cell location callback")
+	}
+
+	info, _, valid := m.snapshot.NASCellLocationInfo()
+	if !valid || info == nil || info.LTE == nil || info.LTE.IntraFrequencyNeighbors[0].RSRP != -920 || info.LTE.InterFrequencyNeighbors[0].Neighbors[0].RSRP != -1000 {
+		t.Fatalf("callback mutated cached cell location info: %+v", info)
+	}
+	info.LTE.IntraFrequencyNeighbors[0].RSRP = 3
+	info.LTE.InterFrequencyNeighbors[0].Neighbors[0].RSRP = 4
+
+	again, _, _ := m.snapshot.NASCellLocationInfo()
+	if again.LTE.IntraFrequencyNeighbors[0].RSRP != -920 || again.LTE.InterFrequencyNeighbors[0].Neighbors[0].RSRP != -1000 {
+		t.Fatalf("snapshot caller mutated cached cell location info: %+v", again)
 	}
 }
 

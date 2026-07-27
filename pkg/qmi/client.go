@@ -27,6 +27,7 @@ const (
 	EventNASSignalInfoChanged                            // NAS signal info changed / NAS 信号信息变化
 	EventNASNetworkReject                                // NAS network reject / NAS 驻网拒绝
 	EventNASIncrementalNetworkScan                       // NAS incremental network scan / NAS 增量搜网
+	EventNASCellLocationInfoChanged                      // NAS cell location info / NAS 小区信息变化
 	EventModemReset                                      // CTL revoke client ID (modem reset) / CTL撤销客户端ID (modem重置)
 	EventNewMessage                                      // WMS new message / WMS新消息
 	EventWMSSMSCAddress                                  // WMS SMSC address indication / WMS 短信中心地址指示
@@ -846,6 +847,8 @@ func (c *Client) dispatchIndication(p *Packet) {
 		eventType = EventNASNetworkReject
 	case p.ServiceType == ServiceNAS && p.MessageID == NASIncrementalNetworkScanInd:
 		eventType = EventNASIncrementalNetworkScan
+	case p.ServiceType == ServiceNAS && p.MessageID == NASGetCellLocationInfo:
+		eventType = EventNASCellLocationInfoChanged
 	case p.ServiceType == ServiceWMS && p.MessageID == WMSEventReportInd:
 		eventType = EventNewMessage
 	case p.ServiceType == ServiceWMS && p.MessageID == WMSSMSCAddressInd:

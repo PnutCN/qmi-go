@@ -625,7 +625,7 @@ func (m *Manager) NASSetSystemSelectionPreference(ctx context.Context, pref qmi.
 	})
 }
 
-// NASGetCellLocationInfo 获取当前小区位置与制式信息
+// NASGetCellLocationInfo 获取当前小区位置与制式信息。
 func (m *Manager) NASGetCellLocationInfo(ctx context.Context) (*qmi.CellLocationInfo, error) {
 	return withNASRecoveryValue(m, "NASGetCellLocationInfo", func(nas *qmi.NASService) (*qmi.CellLocationInfo, error) {
 		return nas.GetCellLocationInfo(ctx)

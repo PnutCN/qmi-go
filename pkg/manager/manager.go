@@ -4366,6 +4366,19 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 		}
 		m.emitEvent(event)
 
+	case qmi.EventNASCellLocationInfoChanged:
+		event := m.qmiIndicationEvent(EventNASCellLocationInfoChanged, evt)
+		event.TLVMeta = packetTLVMeta(evt.Packet)
+		if evt.Packet != nil {
+			if info, err := qmi.ParseCellLocationInfoIndication(evt.Packet); err == nil {
+				event.NASCellLocationInfo = info
+				m.snapshot.updateNASCellLocationInfo(info)
+			} else {
+				m.log.WithError(err).Warn("Failed to parse NAS cell location info indication")
+			}
+		}
+		m.emitEvent(event)
+
 	case qmi.EventNASNetworkReject:
 		event := m.qmiIndicationEvent(EventNASNetworkReject, evt)
 		event.TLVMeta = packetTLVMeta(evt.Packet)
