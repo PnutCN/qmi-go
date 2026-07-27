@@ -1271,6 +1271,61 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 	return nil
 }
 
+// EnsureDataPlaneTopology brings the device's QMAP/mux topology to match
+// cfg.MuxID (native if 0; muxed with mux 1 carrying default-data traffic
+// under the device's original name if >0), independent of whether the
+// default connection ever dials. Idempotent and safe to call repeatedly --
+// existing allocations/renames are left untouched.
+//
+// This exists because doConnect's own topology setup never runs for a
+// device whose default connection stays permanently disconnected (e.g.
+// NoDial plus a policy that never enables it) -- yet a sibling IMS PDN
+// (VoLTE) on the same device still needs QMAP established first. Callers
+// building that PDN must call this before leasing QMI services (see
+// LeaseServices) rather than assuming Connect() already ran; a caller
+// that skips this and leases anyway will find the shared client's data
+// format still at whatever it was before -- see the pdnDeps.qmapActive
+// precondition check on the vohive side (ADR-0008) that catches exactly
+// that.
+func (m *Manager) EnsureDataPlaneTopology(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.ensureDataPlaneServices(ctx); err != nil {
+		return fmt.Errorf("qmi manager: 数据面服务分配失败: %w", err)
+	}
+	if m.cfg.MuxID == 0 {
+		return nil
+	}
+
+	m.mu.RLock()
+	masterIface := m.masterIface
+	m.mu.RUnlock()
+	if masterIface == "" {
+		masterIface = m.cfg.Device.NetInterface
+	}
+
+	if err := netcfg.EnableRawIP(masterIface); err != nil {
+		m.log.WithError(err).Warn("开启 Raw IP 模式失败")
+	}
+
+	prepared := prepareMuxedInterfaces(defaultMuxNetcfgOps(), m.log, m.cfg.Device.NetInterface, masterIface, m.cfg.MuxID)
+	if prepared.masterRenamed {
+		m.mu.Lock()
+		m.masterIface = prepared.masterIface
+		m.mu.Unlock()
+	}
+	if prepared.dataIface != "" {
+		m.mu.Lock()
+		m.muxIface = prepared.dataIface
+		m.mu.Unlock()
+	}
+	if prepared.dataIface == "" {
+		return errors.New("qmi manager: 创建默认数据 mux 失败")
+	}
+	return nil
+}
+
 func contextWithMaxTimeout(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -3652,7 +3707,13 @@ func (m *Manager) doConnect() error {
 	dialCtx, cancelDial := m.opContext(m.cfg.Timeouts.Dial)
 	defer cancelDial()
 
-	if err := m.ensureDataPlaneServices(dialCtx); err != nil {
+	// EnsureDataPlaneTopology allocates WDA/WDS(V6), cleans up crash-residual
+	// mux state, and (when MuxID>0) brings the device to QMAP with mux 1
+	// established and renamed -- everything doConnect used to do inline
+	// here. Extracted so a sibling IMS PDN (VoLTE) that needs this same
+	// topology can call it too, independent of whether this default
+	// connection ever dials (see EnsureDataPlaneTopology's own doc comment).
+	if err := m.EnsureDataPlaneTopology(dialCtx); err != nil {
 		m.handleDialFailure(err)
 		return err
 	}
@@ -3664,39 +3725,15 @@ func (m *Manager) doConnect() error {
 		return err
 	}
 
-	// ========== 多路拨号 (QMAP) 准备 ==========
+	// ========== 多路拨号 (QMAP) 绑定 ==========
 	if m.cfg.MuxID > 0 {
 		m.mu.RLock()
 		masterIface := m.masterIface
 		m.mu.RUnlock()
-		if masterIface == "" {
-			masterIface = m.cfg.Device.NetInterface
-		}
 		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
 			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
 
-		// 1. 确保 Raw IP 模式已开启
-		if err := netcfg.EnableRawIP(masterIface); err != nil {
-			m.log.WithError(err).Warn("开启 Raw IP 模式失败")
-		}
-
-		// 1.5-2. 物理主设备改名(仅第一次 mux 时) + 创建 QMAP 虚拟网卡并改回
-		// 设备原始名字，逻辑抽成 prepareMuxedInterfaces 以便脱离 doConnect
-		// 的其余拨号机器单独测试。
-		prepared := prepareMuxedInterfaces(defaultMuxNetcfgOps(), m.log, m.cfg.Device.NetInterface, masterIface, m.cfg.MuxID)
-		if prepared.masterRenamed {
-			m.mu.Lock()
-			m.masterIface = prepared.masterIface
-			m.mu.Unlock()
-		}
-		masterIface = prepared.masterIface
-		if prepared.dataIface != "" {
-			m.mu.Lock()
-			m.muxIface = prepared.dataIface
-			m.mu.Unlock()
-		}
-
-		// 3. 绑定 WDS Client 到 Mux Data Port
+		// 绑定 WDS Client 到 Mux Data Port
 		binding := qmi.MuxBinding{
 			EpType:     0x02, // HSUSB
 			EpIfID:     0x04, // 默认 Interface ID
