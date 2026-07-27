@@ -116,3 +116,4 @@ func (d *DarwinConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string
 func (d *DarwinConfigurator) DelQMAPMux(masterIface string, muxID uint8) error       { return nil }
 func (d *DarwinConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string { return "" }
 func (d *DarwinConfigurator) EnableRawIP(ifname string) error                        { return nil }
+func (d *DarwinConfigurator) RenameInterface(from, to string) error                  { return nil }

@@ -101,3 +101,8 @@ func GetQMAPMuxIface(masterIface string, muxID uint8) string {
 func EnableRawIP(ifname string) error {
 	return GetConfigurator().EnableRawIP(ifname)
 }
+
+// RenameInterface 重命名网卡
+func RenameInterface(from, to string) error {
+	return GetConfigurator().RenameInterface(from, to)
+}

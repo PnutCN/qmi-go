@@ -361,14 +361,12 @@ func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
 
 // GetQMAPMuxIface 根据 MuxID 推导虚拟网卡接口名
 // qmi_wwan 驱动的命名规则: qmimux{muxID - 1}，即 MuxID=1 对应 qmimux0
+// GetQMAPMuxIface 根据 MuxID 反查其虚拟网卡名。qmimux 编号按内核创建顺序全局
+// 递增，与 MuxID 值无关——"MuxID=1 对应 qmimux0" 这类假设已在实测中被证伪
+// (删除 mux_id=2 后新建的 mux_id=3 复用了刚释放的 qmimux0)，因此这里只信
+// /sys/class/net/qmimuxN/qmap/mux_id 这一个真实来源，没有回退猜测；找不到就
+// 如实返回空串，调用方据此判断"确实不存在"而不是被一个猜错的名字误导。
 func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string {
-	// qmi_wwan 驱动创建的虚拟网卡名为 qmimux{N}，N 从 0 开始递增
-	// MuxID=1 => qmimux0, MuxID=2 => qmimux1, ...
-	// 但实际命名取决于创建顺序而非 MuxID 值
-	// 因此我们需要扫描 sysfs 确认
-
-	// 方式1: 扫描 /sys/class/net/ 下所有 qmimux* 开头的接口
-	// 并检查其 upper 设备是否是 masterIface
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		return ""
@@ -379,8 +377,6 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 		if !strings.HasPrefix(name, "qmimux") {
 			continue
 		}
-		// 检查该虚拟网卡是否属于目标物理网卡
-		// 读取 /sys/class/net/qmimuxN/qmap/mux_id
 		muxIDPath := fmt.Sprintf("/sys/class/net/%s/qmap/mux_id", name)
 		if data, err := os.ReadFile(muxIDPath); err == nil {
 			val := strings.TrimSpace(string(data))
@@ -390,13 +386,6 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 				return name
 			}
 		}
-	}
-
-	// 方式2: 如果上面没找到，尝试直接用常规命名推导
-	// 这是一个备选逻辑: 假设 MuxID=1 => qmimux0
-	candidate := fmt.Sprintf("qmimux%d", muxID-1)
-	if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", candidate)); err == nil {
-		return candidate
 	}
 
 	return ""
@@ -426,5 +415,20 @@ func (l *LinuxConfigurator) EnableRawIP(ifname string) error {
 		return fmt.Errorf("开启 raw_ip 失败: %w", err)
 	}
 
+	return nil
+}
+
+// RenameInterface renames a netdev via netlink (equivalent to
+// `ip link set dev <from> name <to>`). qmi_wwan devices generally require
+// the interface to be administratively down for a rename to succeed;
+// callers own bringing it down first and back up afterward if needed.
+func (l *LinuxConfigurator) RenameInterface(from, to string) error {
+	link, err := netlink.LinkByName(from)
+	if err != nil {
+		return fmt.Errorf("netcfg: 查找网卡 %s 失败: %w", from, err)
+	}
+	if err := netlink.LinkSetName(link, to); err != nil {
+		return fmt.Errorf("netcfg: 重命名 %s -> %s 失败: %w", from, to, err)
+	}
 	return nil
 }

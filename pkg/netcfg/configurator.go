@@ -68,6 +68,10 @@ type NetworkConfigurator interface {
 
 	// EnableRawIP 在网卡上开启 Raw IP 模式
 	EnableRawIP(ifname string) error
+
+	// RenameInterface 重命名网卡（等同于 `ip link set dev <from> name <to>`）。
+	// qmi_wwan 设备通常要求先关闭接口才能改名，调用方负责改名前后的启停。
+	RenameInterface(from, to string) error
 }
 
 var currentConfigurator NetworkConfigurator

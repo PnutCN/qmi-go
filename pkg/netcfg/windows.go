@@ -136,3 +136,4 @@ func (w *WindowsConfigurator) AddQMAPMux(masterIface string, muxID uint8) (strin
 func (w *WindowsConfigurator) DelQMAPMux(masterIface string, muxID uint8) error       { return nil }
 func (w *WindowsConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string { return "" }
 func (w *WindowsConfigurator) EnableRawIP(ifname string) error                        { return nil }
+func (w *WindowsConfigurator) RenameInterface(from, to string) error                  { return nil }

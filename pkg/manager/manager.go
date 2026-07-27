@@ -199,7 +199,9 @@ type Manager struct {
 	regNotify chan bool // For fast registration detection / 用于快速注册检测
 
 	// 多路拨号 (QMAP) / Multi-PDN
-	muxIface string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
+	muxIface    string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
+	masterIface string // 当前物理主设备名；未 mux 时为空(CurrentMasterInterface 回落到 cfg.Device.NetInterface)，
+	// mux 后为重命名后的短名，仅供 sysfs add_mux/del_mux/raw_ip 使用
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -2731,6 +2733,106 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	return nil
 }
 
+// muxNetcfgOps groups the netcfg operations prepareMuxedInterfaces needs, so
+// the rename/creation sequencing can be tested without a real kernel or the
+// rest of Manager's dial machinery.
+type muxNetcfgOps struct {
+	bringDown       func(ifname string) error
+	renameInterface func(from, to string) error
+	addQMAPMux      func(masterIface string, muxID uint8) (string, error)
+	deriveMuxNames  func(original string) (masterName, dataName string, err error)
+}
+
+func defaultMuxNetcfgOps() muxNetcfgOps {
+	return muxNetcfgOps{
+		bringDown:       netcfg.BringDown,
+		renameInterface: netcfg.RenameInterface,
+		addQMAPMux:      netcfg.AddQMAPMux,
+		deriveMuxNames:  netcfg.DeriveMuxNames,
+	}
+}
+
+// preparedMuxInterfaces is the outcome of prepareMuxedInterfaces.
+type preparedMuxInterfaces struct {
+	masterIface   string // sysfs name to use for subsequent add_mux/del_mux/raw_ip ops
+	masterRenamed bool   // whether masterIface just changed this call
+	dataIface     string // netdev now carrying default-data traffic ("" if AddQMAPMux failed)
+}
+
+// prepareMuxedInterfaces renames the physical master off originalMaster the
+// first time a device is muxed (currentMaster == originalMaster) so the
+// default-data mux netdev can take over the original name, then creates mux
+// muxID and renames it back to originalMaster. currentMaster is passed
+// separately from originalMaster because on every call after the first, the
+// master already carries its renamed short name and must not be re-derived.
+//
+// Pure with respect to Manager state: it takes its netcfg dependencies as
+// ops and returns the outcome rather than mutating m.masterIface/m.muxIface
+// itself, so the rename/creation decision logic is testable without the
+// rest of doConnect's dial machinery.
+func prepareMuxedInterfaces(ops muxNetcfgOps, log Logger, originalMaster, currentMaster string, muxID uint8) preparedMuxInterfaces {
+	master := currentMaster
+
+	if master == originalMaster {
+		renamedMaster, dataName, err := ops.deriveMuxNames(master)
+		switch {
+		case err != nil:
+			log.WithError(err).Error("推导 mux 网卡命名失败，物理网卡名过长")
+		case dataName != master:
+			log.Errorf("命名推导不变量被打破: 数据网卡名 %s 应等于原始名 %s", dataName, master)
+		default:
+			// RenameInterface 通常要求接口先关闭。netcfg.EnableRawIP 在
+			// raw_ip 已是 Y 时会走快速跳过分支、不保证关闭接口(Task 29 已在
+			// Init 阶段设置过 raw_ip，这里大概率命中该分支)，因此显式关闭
+			// 一次而不是依赖它的副作用。
+			_ = ops.bringDown(master)
+			if rerr := ops.renameInterface(master, renamedMaster); rerr != nil {
+				log.WithError(rerr).Warn("重命名物理主设备失败，继续使用原名进行 sysfs 操作")
+			} else {
+				log.Infof("物理主设备已重命名: %s -> %s", originalMaster, renamedMaster)
+				master = renamedMaster
+			}
+		}
+	}
+
+	result := preparedMuxInterfaces{masterIface: master, masterRenamed: master != currentMaster}
+
+	// 创建 QMAP 虚拟网卡 (如果不存在)，并把默认数据连接的 mux 网卡改回设备
+	// 的原始名字——下游(路由/DNS/UCI/代理绑定)因此无需感知 native/muxed 的
+	// 切换。
+	muxIfname, err := ops.addQMAPMux(master, muxID)
+	if err != nil {
+		log.WithError(err).Errorf("创建 MUX ID=%d 虚拟网卡失败", muxID)
+		// 继续尝试，也许用户已手动创建
+		return result
+	}
+	if muxIfname != originalMaster {
+		if rerr := ops.renameInterface(muxIfname, originalMaster); rerr != nil {
+			log.WithError(rerr).Errorf("重命名默认数据 mux 网卡 %s -> %s 失败，数据面将使用内核分配名", muxIfname, originalMaster)
+		} else {
+			muxIfname = originalMaster
+		}
+	}
+	log.Infof("QMAP 虚拟网卡: %s (MuxID=%d)", muxIfname, muxID)
+	result.dataIface = muxIfname
+	return result
+}
+
+// CurrentMasterInterface returns the physical master netdev's current sysfs
+// name. Equals cfg.Device.NetInterface until this device is first muxed;
+// afterward it is the renamed short name (see the MuxID>0 Dial block).
+// cellularBearerSource implementations must call this live rather than
+// caching the value at construction, since the rename only happens once
+// Dial actually runs.
+func (m *Manager) CurrentMasterInterface() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.masterIface == "" {
+		return m.cfg.Device.NetInterface
+	}
+	return m.masterIface
+}
+
 func (m *Manager) checkSIM() error {
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
@@ -3453,7 +3555,12 @@ func (m *Manager) doConnect() error {
 
 	// ========== 多路拨号 (QMAP) 准备 ==========
 	if m.cfg.MuxID > 0 {
-		masterIface := m.cfg.Device.NetInterface
+		m.mu.RLock()
+		masterIface := m.masterIface
+		m.mu.RUnlock()
+		if masterIface == "" {
+			masterIface = m.cfg.Device.NetInterface
+		}
 		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
 			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
 
@@ -3462,15 +3569,19 @@ func (m *Manager) doConnect() error {
 			m.log.WithError(err).Warn("开启 Raw IP 模式失败")
 		}
 
-		// 2. 创建 QMAP 虚拟网卡 (如果不存在)
-		muxIfname, err := netcfg.AddQMAPMux(masterIface, m.cfg.MuxID)
-		if err != nil {
-			m.log.WithError(err).Errorf("创建 MUX ID=%d 虚拟网卡失败", m.cfg.MuxID)
-			// 继续尝试，也许用户已手动创建
-		} else {
-			m.log.Infof("QMAP 虚拟网卡: %s (MuxID=%d)", muxIfname, m.cfg.MuxID)
+		// 1.5-2. 物理主设备改名(仅第一次 mux 时) + 创建 QMAP 虚拟网卡并改回
+		// 设备原始名字，逻辑抽成 prepareMuxedInterfaces 以便脱离 doConnect
+		// 的其余拨号机器单独测试。
+		prepared := prepareMuxedInterfaces(defaultMuxNetcfgOps(), m.log, m.cfg.Device.NetInterface, masterIface, m.cfg.MuxID)
+		if prepared.masterRenamed {
 			m.mu.Lock()
-			m.muxIface = muxIfname
+			m.masterIface = prepared.masterIface
+			m.mu.Unlock()
+		}
+		masterIface = prepared.masterIface
+		if prepared.dataIface != "" {
+			m.mu.Lock()
+			m.muxIface = prepared.dataIface
 			m.mu.Unlock()
 		}
 
