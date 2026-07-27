@@ -2852,6 +2852,98 @@ func (m *Manager) CurrentMasterInterface() string {
 	return m.masterIface
 }
 
+// LeasedServices are WDA/WDS/NAS client-id handles allocated on a Manager's
+// already-open QMI client, for an external caller (e.g. a second PDN such
+// as a VoLTE IMS bearer) that needs its own client-ids without opening a
+// second connection to the modem's control device.
+//
+// Opening a second raw connection to the same cdc-wdm device is unsafe, not
+// just wasteful: the kernel driver has no way to route each response to the
+// reader that sent the matching request, so two readers on one device split
+// and steal each other's responses (observed: a GET_VERSION_INFO response
+// meant for the second connection delivered to the first, both connections
+// timing out and the modem misdiagnosed as reset). Worse, if the second
+// connection's client issues a CTL SYNC (many QMI client implementations do
+// this on open, to clear residual client-ids from a crashed previous
+// process), the modem releases every client-id on the device — silently
+// killing the first connection's UIM/NAS/DMS/WMS/VOICE clients too. See
+// ADR-0008 / the qmi-go S1 change.
+//
+// QMI client-id is the correct multiplexing unit for this (that is what it
+// is for): SendRequest is already safe for concurrent use by this Manager's
+// own UIM/DMS/NAS/WMS/VOICE clients, all sharing one *qmi.Client — leased
+// services join that same pattern rather than opening a competing one.
+type LeasedServices struct {
+	WDA *qmi.WDAService
+	WDS *qmi.WDSService
+	NAS *qmi.NASService
+}
+
+// Close releases the three leased client-ids. Safe to call once; safe to
+// call with any subset of fields populated (a partially-constructed lease
+// on error only needs to release what succeeded).
+func (l *LeasedServices) Close() error {
+	if l == nil {
+		return nil
+	}
+	var errs []error
+	if l.WDS != nil {
+		if err := l.WDS.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if l.WDA != nil {
+		if err := l.WDA.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if l.NAS != nil {
+		if err := l.NAS.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// LeaseServices allocates independent WDA, WDS, and NAS client-ids on this
+// Manager's shared QMI client (see LeasedServices' doc comment for why this
+// exists instead of the caller opening its own connection). Returns an
+// error if this Manager has no open client yet (Init/Connect has not run) —
+// callers that need this at IMS-runtime-start time can rely on worker
+// bootstrap always running Init first.
+//
+// If the underlying client is later replaced by a core recovery cycle, the
+// returned services become stale (calls fail with a connection-closed
+// error rather than hanging) — same failure mode a caller's own previously
+// separate connection would have hit on a modem-side reset, not a
+// regression. Callers that must survive a core recovery should re-lease
+// after detecting that failure; S1 does not add proactive invalidation.
+func (m *Manager) LeaseServices(ctx context.Context) (*LeasedServices, error) {
+	m.mu.RLock()
+	client := m.client
+	m.mu.RUnlock()
+	if client == nil {
+		return nil, errors.New("qmi manager: no open QMI client to lease services from")
+	}
+
+	wda, err := qmi.NewWDAServiceWithContext(ctx, client)
+	if err != nil {
+		return nil, fmt.Errorf("qmi manager: lease WDA client failed: %w", err)
+	}
+	wds, err := qmi.NewWDSServiceWithContext(ctx, client)
+	if err != nil {
+		_ = wda.Close()
+		return nil, fmt.Errorf("qmi manager: lease WDS client failed: %w", err)
+	}
+	nas, err := qmi.NewNASServiceWithContext(ctx, client)
+	if err != nil {
+		_ = wds.Close()
+		_ = wda.Close()
+		return nil, fmt.Errorf("qmi manager: lease NAS client failed: %w", err)
+	}
+	return &LeasedServices{WDA: wda, WDS: wds, NAS: nas}, nil
+}
+
 func (m *Manager) checkSIM() error {
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
