@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 )
@@ -15,6 +18,8 @@ import (
 // LinuxConfigurator implements NetworkConfigurator for Linux using netlink
 // LinuxConfigurator 使用 netlink 实现 Linux 的 NetworkConfigurator
 type LinuxConfigurator struct{}
+
+var qmapMuxCreateMu sync.Mutex
 
 func NewLinuxConfigurator() *LinuxConfigurator {
 	return &LinuxConfigurator{}
@@ -248,6 +253,12 @@ func (l *LinuxConfigurator) RestoreDNS() error {
 // 等同于: echo {muxID} > /sys/class/net/{masterIface}/qmi/add_mux
 // 返回值为创建出的虚拟网卡名，例如 "qmimux0"
 func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string, error) {
+	// qmi_wwan allocates qmimux names globally and by creation order, not by
+	// mux ID. Serialize creation in this process so the before/after snapshot
+	// below cannot mistake another worker's newly created mux for this one.
+	qmapMuxCreateMu.Lock()
+	defer qmapMuxCreateMu.Unlock()
+
 	addMuxPath := fmt.Sprintf("/sys/class/net/%s/qmi/add_mux", masterIface)
 
 	// 检查 sysfs 节点是否存在
@@ -255,7 +266,12 @@ func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string,
 		return "", fmt.Errorf("sysfs 节点 %s 不存在，内核驱动可能不支持 QMAP", addMuxPath)
 	}
 
-	// 写入 MuxID 触发内核创建虚拟网卡
+	before, err := qmapMuxInterfaces()
+	if err != nil {
+		return "", fmt.Errorf("读取现有 QMAP 网卡失败: %w", err)
+	}
+
+	// 写入 MuxID 触发内核创建虚拟网卡。
 	data := fmt.Sprintf("%d\n", muxID)
 	if err := os.WriteFile(addMuxPath, []byte(data), 0200); err != nil {
 		// 如果已经存在，可能返回 "device or resource busy" 之类的错误
@@ -267,13 +283,64 @@ func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string,
 		return "", fmt.Errorf("写入 %s 失败: %w", addMuxPath, err)
 	}
 
-	// 推导并验证虚拟网卡名
+	if ifname, err := waitForNewQMAPMuxInterface(before, 2*time.Second); err == nil {
+		return ifname, nil
+	}
+
+	// Some drivers expose a per-interface mux_id attribute. Keep that path as
+	// a fallback, but never use muxID-1 as the primary identity: on kernels
+	// without the attribute, mux 2 can legitimately be named qmimux0.
 	ifname := l.GetQMAPMuxIface(masterIface, muxID)
 	if ifname == "" {
 		return "", fmt.Errorf("MuxID %d 的虚拟网卡创建后未找到", muxID)
 	}
 
 	return ifname, nil
+}
+
+func qmapMuxInterfaces() (map[string]struct{}, error) {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil, err
+	}
+	interfaces := make(map[string]struct{})
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "qmimux") {
+			interfaces[entry.Name()] = struct{}{}
+		}
+	}
+	return interfaces, nil
+}
+
+func waitForNewQMAPMuxInterface(before map[string]struct{}, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		after, err := qmapMuxInterfaces()
+		if err != nil {
+			return "", err
+		}
+		if ifname, ok := newQMAPMuxInterface(before, after); ok {
+			return ifname, nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("等待新 QMAP 网卡超时")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func newQMAPMuxInterface(before, after map[string]struct{}) (string, bool) {
+	added := make([]string, 0, 1)
+	for ifname := range after {
+		if _, exists := before[ifname]; !exists {
+			added = append(added, ifname)
+		}
+	}
+	if len(added) != 1 {
+		return "", false
+	}
+	sort.Strings(added)
+	return added[0], true
 }
 
 // DelQMAPMux 销毁指定 MuxID 对应的虚拟网卡
