@@ -288,6 +288,8 @@ type Manager struct {
 	newWMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WMSService, error)
 	newVOICEService                   func(ctx context.Context, client *qmi.Client) (*qmi.VOICEService, error)
 	enableRawIPHook                   func(ctx context.Context) error
+	getDataFormatFn                   func(ctx context.Context) (*qmi.DataFormat, error)
+	setDataFormatFn                   func(ctx context.Context, f qmi.DataFormat) error
 	onWMSRebindReplayHook             func(reason string)
 	openClientAndAllocateServicesHook func(context.Context) error
 	checkSIMHook                      func() error
@@ -2586,6 +2588,39 @@ func (m *Manager) voiceIndicationRegistration() (qmi.VoiceIndicationRegistration
 	}, true
 }
 
+// dataFormatTargetForMux returns the WDA data format a device must be in for
+// the given MuxID: QMAP aggregation when muxed (muxID > 0), disabled
+// otherwise. Pure and side-effect-free so enableRawIP's target derivation is
+// testable without a modem.
+func dataFormatTargetForMux(muxID uint8) qmi.DataFormat {
+	target := qmi.DataFormat{
+		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
+		UlDataAggregation: uint32(qmi.DataFormatUlDataAggDisabled),
+		DlDataAggregation: uint32(qmi.DataFormatDlDataAggDisabled),
+		// EndpointType/InterfaceNumber intentionally left zero (omitted):
+		// Get Data Format cannot report endpoint info back (it's an
+		// INPUT-only TLV on Set Data Format, and numbered differently
+		// there besides -- see DataFormatDetails), so there is nothing
+		// this call could have discovered and forwarded here.
+	}
+	if muxID > 0 {
+		target.UlDataAggregation = qmi.DataAggregationQMAP
+		target.DlDataAggregation = qmi.DataAggregationQMAP
+	}
+	return target
+}
+
+// dataFormatMatches reports whether current already satisfies target on the
+// three fields enableRawIP cares about (link protocol and both aggregation
+// directions). Endpoint fields are deliberately excluded: Get Data Format
+// never reports them (see DataFormatDetails' doc comment), so current always
+// carries zero there regardless of what was actually set.
+func dataFormatMatches(current, target qmi.DataFormat) bool {
+	return current.LinkProtocol == target.LinkProtocol &&
+		current.UlDataAggregation == target.UlDataAggregation &&
+		current.DlDataAggregation == target.DlDataAggregation
+}
+
 // enableRawIP enables RawIP mode on both the modem (WDA) and the kernel interface / 启用RawIP模式：同时在Modem(WDA)和内核接口上启用
 func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
@@ -2624,41 +2659,48 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 		kernelEnabled = true // Treat as "done" for the purpose of the combined check / 将其视为“已完成”以进行组合检查
 	}
 
-	// Optimization: Check if already enabled in Modem (if WDA available) / 优化：检查Modem中是否已启用 (如果WDA可用)
+	// Target data format is derived from MuxID: a muxed connection (MuxID>0)
+	// requires QMAP aggregation on both directions, or bindMux fails
+	// (measured: EC25 0x0030, EM7511 0x0003); a native connection requires
+	// aggregation disabled, or an un-mux'd netdev receives QMAP-framed
+	// packets it cannot parse (this is what silently broke the default data
+	// connection in the incident this target-driven rewrite closes -- see
+	// ADR-0008). MuxID never changes for the lifetime of a Manager, so this
+	// target is the SAME on every call, unlike the old raw-IP-only check.
+	target := dataFormatTargetForMux(m.cfg.MuxID)
+
+	// Optimization: Check if already at target in Modem (if WDA available) / 优化：检查Modem中是否已处于目标状态 (如果WDA可用)
 	modemEnabled := false
 	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
 	defer cancel()
-	if currentFormat, err := m.wda.GetDataFormat(ctx); err == nil {
-		if currentFormat.LinkProtocol == qmi.LinkProtocolIP {
-			modemEnabled = true
-		}
+	getDataFormat := m.getDataFormatFn
+	if getDataFormat == nil {
+		getDataFormat = m.wda.GetDataFormat
+	}
+	if currentFormat, err := getDataFormat(ctx); err == nil {
+		modemEnabled = dataFormatMatches(*currentFormat, target)
 	} else {
 		m.log.WithError(err).Debug("Failed to get current data format, assuming mismatch")
 	}
 
 	if kernelEnabled && modemEnabled {
-		m.log.Info("Raw IP mode already enabled, skipping configuration")
+		m.log.Info("Raw IP mode already at target, skipping configuration")
 		return nil
 	}
 
-	// 2. Set Modem Data Format to Raw IP / 2. 将Modem数据格式设置为Raw IP
-	m.log.Info("Setting modem data format to Raw IP...")
-	format := qmi.DataFormat{
-		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
-		UlDataAggregation: uint32(qmi.DataFormatUlDataAggDisabled),
-		DlDataAggregation: uint32(qmi.DataFormatDlDataAggDisabled),
-		// EndpointType/InterfaceNumber intentionally left zero (omitted):
-		// Get Data Format cannot report endpoint info back (it's an
-		// INPUT-only TLV on Set Data Format, and numbered differently
-		// there besides -- see DataFormatDetails), so there is nothing
-		// this call could have discovered and forwarded here.
-	}
+	// 2. Set Modem Data Format to target / 2. 将Modem数据格式设置为目标状态
+	m.log.Infof("Setting modem data format to target (mux=%d)...", m.cfg.MuxID)
+	format := target
 	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
 	defer cancel()
-	if err := m.wda.SetDataFormat(ctx, format); err != nil {
-		m.log.WithError(err).Warn("Failed to set modem data format to Raw IP (might already be set or not supported), continuing to force kernel...")
+	setDataFormat := m.setDataFormatFn
+	if setDataFormat == nil {
+		setDataFormat = m.wda.SetDataFormat
+	}
+	if err := setDataFormat(ctx, format); err != nil {
+		m.log.WithError(err).Warn("Failed to set modem data format to target (might already be set or not supported), continuing to force kernel...")
 	} else {
-		m.log.Info("Modem data format set to Raw IP")
+		m.log.Infof("Modem data format set to target (mux=%d)", m.cfg.MuxID)
 	}
 
 	// 3. Enable Raw IP in kernel (Linux Only) / 3. 在内核中启用Raw IP (仅限Linux)

@@ -30,6 +30,13 @@ const (
 	DataFormatNdpSigEnabled     uint8 = 1 << 4 // New Data Path Signature / 新数据路径签名
 )
 
+// DataAggregationQMAP is QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAP. This is a
+// distinct enumeration from the DataFormatUlDataAgg{Enabled,Disabled} bit
+// flags above (those gate a different TLV bit entirely); this value goes
+// directly into DataFormat.UlDataAggregation / DlDataAggregation when a
+// connection is muxed.
+const DataAggregationQMAP uint32 = 0x05
+
 // WDAService implements the QMI WDA service / WDAService 实现 QMI WDA 服务
 type WDAService struct {
 	client   *Client
