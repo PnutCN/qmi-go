@@ -2,8 +2,10 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
@@ -63,6 +65,13 @@ func TestEnsureDataPlaneTopologyAttemptsMuxSetupWhenMuxed(t *testing.T) {
 		return &qmi.WDAService{}, nil
 	}
 	m.enableRawIPHook = func(context.Context) error { return nil }
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "nonexistent-test-iface-topology", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "", errors.New("add_mux unavailable") },
+	}
 
 	err := m.EnsureDataPlaneTopology(context.Background())
 	if err == nil {

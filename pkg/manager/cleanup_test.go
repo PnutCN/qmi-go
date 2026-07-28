@@ -2,9 +2,36 @@ package manager
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/iniwex5/qmi-go/pkg/netcfg"
 )
+
+type cleanupConfigurator struct{ deletedMaster string }
+
+func (*cleanupConfigurator) SetIPAddress(string, net.IP, int) error   { return nil }
+func (*cleanupConfigurator) SetIPv6Address(string, net.IP, int) error { return nil }
+func (*cleanupConfigurator) FlushAddresses(string) error              { return nil }
+func (*cleanupConfigurator) AddDefaultRoute(string, net.IP) error     { return nil }
+func (*cleanupConfigurator) AddDefaultRouteDirect(string, bool) error { return nil }
+func (*cleanupConfigurator) FlushRoutes(string) error                 { return nil }
+func (*cleanupConfigurator) BringUp(string) error                     { return nil }
+func (*cleanupConfigurator) BringDown(string) error                   { return nil }
+func (*cleanupConfigurator) SetMTU(string, int) error                 { return nil }
+func (*cleanupConfigurator) GetCurrentIP(string) (net.IP, error)      { return nil, nil }
+func (*cleanupConfigurator) IsUp(string) (bool, error)                { return false, nil }
+func (*cleanupConfigurator) UpdateDNS(string, string) error           { return nil }
+func (*cleanupConfigurator) RestoreDNS() error                        { return nil }
+func (*cleanupConfigurator) AddQMAPMux(string, uint8) (string, error) { return "", nil }
+func (c *cleanupConfigurator) DelQMAPMux(master string, _ uint8) error {
+	c.deletedMaster = master
+	return nil
+}
+func (*cleanupConfigurator) GetQMAPMuxIface(string, uint8) string                  { return "" }
+func (*cleanupConfigurator) EnableRawIP(string) error                              { return nil }
+func (*cleanupConfigurator) ReconcileResidualMux(string, []uint8) ([]uint8, error) { return nil, nil }
 
 func TestCleanupDoesNotUseFixedSleepWhenNoTasks(t *testing.T) {
 	m := newRecoveryTestManager()
@@ -16,6 +43,24 @@ func TestCleanupDoesNotUseFixedSleepWhenNoTasks(t *testing.T) {
 
 	if elapsed >= 90*time.Millisecond {
 		t.Fatalf("cleanup() elapsed = %s, want no fixed 100ms sleep", elapsed)
+	}
+}
+
+func TestCleanupDeletesDefaultMuxFromResolvedQMAPMaster(t *testing.T) {
+	original := netcfg.GetConfigurator()
+	cfg := &cleanupConfigurator{}
+	netcfg.SetConfigurator(cfg)
+	t.Cleanup(func() { netcfg.SetConfigurator(original) })
+
+	m := newRecoveryTestManager()
+	m.cfg = Config{Device: ModemDevice{NetInterface: "wwan0"}, MuxID: 1, Timeouts: TimeoutConfig{Stop: time.Second}}
+	m.muxIface = "qmimux7"
+	m.masterIface = "wwan0_q_q"
+
+	m.cleanup()
+
+	if cfg.deletedMaster != "wwan0_q_q" {
+		t.Fatalf("DelQMAPMux master = %q, want resolved QMAP master", cfg.deletedMaster)
 	}
 }
 

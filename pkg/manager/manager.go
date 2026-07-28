@@ -199,9 +199,11 @@ type Manager struct {
 	regNotify chan bool // For fast registration detection / 用于快速注册检测
 
 	// 多路拨号 (QMAP) / Multi-PDN
-	muxIface    string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
-	masterIface string // 当前物理主设备名；未 mux 时为空(CurrentMasterInterface 回落到 cfg.Device.NetInterface)，
-	// mux 后为重命名后的短名，仅供 sysfs add_mux/del_mux/raw_ip 使用
+	muxIface     string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
+	masterIface  string // 当前物理主设备名，仅供 sysfs add_mux/del_mux/raw_ip 使用
+	dataPlane    dataPlaneController
+	dataPlaneOps dataPlaneOps
+	pdnOps       pdnOps
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -1244,14 +1246,9 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 			keepMuxIDs = append(keepMuxIDs, m.cfg.MuxID)
 		}
 		// Clear any QMAP mux left allocated by a crashed previous process
-		// before enableRawIP runs. Uses cfg.Device.NetInterface, not
-		// CurrentMasterInterface(): this always runs before this device's
-		// own first-ever rename (Dial's MuxID>0 block, which only fires
-		// later), so the master is still guaranteed to be at its
-		// configured name here. A device left renamed by an earlier crash
-		// is a separate, out-of-scope recovery case -- every step after
-		// this one already fails loudly against a missing sysfs path
-		// rather than silently guessing at a renamed name.
+		// before enableRawIP runs. New topologies keep the configured
+		// physical-master name; discovery rejects an incompatible legacy
+		// topology rather than silently mutating the wrong sysfs node.
 		if deleted, err := netcfg.ReconcileResidualMux(m.cfg.Device.NetInterface, keepMuxIDs); err != nil {
 			m.log.WithError(err).Warn("清理残留 QMAP mux 失败，继续初始化")
 		} else if len(deleted) > 0 {
@@ -1271,59 +1268,11 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 	return nil
 }
 
-// EnsureDataPlaneTopology brings the device's QMAP/mux topology to match
-// cfg.MuxID (native if 0; muxed with mux 1 carrying default-data traffic
-// under the device's original name if >0), independent of whether the
-// default connection ever dials. Idempotent and safe to call repeatedly --
-// existing allocations/renames are left untouched.
-//
-// This exists because doConnect's own topology setup never runs for a
-// device whose default connection stays permanently disconnected (e.g.
-// NoDial plus a policy that never enables it) -- yet a sibling IMS PDN
-// (VoLTE) on the same device still needs QMAP established first. Callers
-// building that PDN must call this before leasing QMI services (see
-// LeaseServices) rather than assuming Connect() already ran; a caller
-// that skips this and leases anyway will find the shared client's data
-// format still at whatever it was before -- see the pdnDeps.qmapActive
-// precondition check on the vohive side (ADR-0008) that catches exactly
-// that.
+// EnsureDataPlaneTopology converges the configured default topology. New
+// callers should use ConvergeDataPlane so they receive its stable snapshot.
 func (m *Manager) EnsureDataPlaneTopology(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := m.ensureDataPlaneServices(ctx); err != nil {
-		return fmt.Errorf("qmi manager: 数据面服务分配失败: %w", err)
-	}
-	if m.cfg.MuxID == 0 {
-		return nil
-	}
-
-	m.mu.RLock()
-	masterIface := m.masterIface
-	m.mu.RUnlock()
-	if masterIface == "" {
-		masterIface = m.cfg.Device.NetInterface
-	}
-
-	if err := netcfg.EnableRawIP(masterIface); err != nil {
-		m.log.WithError(err).Warn("开启 Raw IP 模式失败")
-	}
-
-	prepared := prepareMuxedInterfaces(defaultMuxNetcfgOps(), m.log, m.cfg.Device.NetInterface, masterIface, m.cfg.MuxID)
-	if prepared.masterRenamed {
-		m.mu.Lock()
-		m.masterIface = prepared.masterIface
-		m.mu.Unlock()
-	}
-	if prepared.dataIface != "" {
-		m.mu.Lock()
-		m.muxIface = prepared.dataIface
-		m.mu.Unlock()
-	}
-	if prepared.dataIface == "" {
-		return errors.New("qmi manager: 创建默认数据 mux 失败")
-	}
-	return nil
+	_, err := m.ConvergeDataPlane(ctx, dataPlaneSpecFromConfig(m.cfg))
+	return err
 }
 
 func contextWithMaxTimeout(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
@@ -2807,106 +2756,6 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	return nil
 }
 
-// muxNetcfgOps groups the netcfg operations prepareMuxedInterfaces needs, so
-// the rename/creation sequencing can be tested without a real kernel or the
-// rest of Manager's dial machinery.
-type muxNetcfgOps struct {
-	bringDown       func(ifname string) error
-	renameInterface func(from, to string) error
-	addQMAPMux      func(masterIface string, muxID uint8) (string, error)
-	deriveMuxNames  func(original string) (masterName, dataName string, err error)
-}
-
-func defaultMuxNetcfgOps() muxNetcfgOps {
-	return muxNetcfgOps{
-		bringDown:       netcfg.BringDown,
-		renameInterface: netcfg.RenameInterface,
-		addQMAPMux:      netcfg.AddQMAPMux,
-		deriveMuxNames:  netcfg.DeriveMuxNames,
-	}
-}
-
-// preparedMuxInterfaces is the outcome of prepareMuxedInterfaces.
-type preparedMuxInterfaces struct {
-	masterIface   string // sysfs name to use for subsequent add_mux/del_mux/raw_ip ops
-	masterRenamed bool   // whether masterIface just changed this call
-	dataIface     string // netdev now carrying default-data traffic ("" if AddQMAPMux failed)
-}
-
-// prepareMuxedInterfaces renames the physical master off originalMaster the
-// first time a device is muxed (currentMaster == originalMaster) so the
-// default-data mux netdev can take over the original name, then creates mux
-// muxID and renames it back to originalMaster. currentMaster is passed
-// separately from originalMaster because on every call after the first, the
-// master already carries its renamed short name and must not be re-derived.
-//
-// Pure with respect to Manager state: it takes its netcfg dependencies as
-// ops and returns the outcome rather than mutating m.masterIface/m.muxIface
-// itself, so the rename/creation decision logic is testable without the
-// rest of doConnect's dial machinery.
-func prepareMuxedInterfaces(ops muxNetcfgOps, log Logger, originalMaster, currentMaster string, muxID uint8) preparedMuxInterfaces {
-	master := currentMaster
-
-	if master == originalMaster {
-		renamedMaster, dataName, err := ops.deriveMuxNames(master)
-		switch {
-		case err != nil:
-			log.WithError(err).Error("推导 mux 网卡命名失败，物理网卡名过长")
-		case dataName != master:
-			log.Errorf("命名推导不变量被打破: 数据网卡名 %s 应等于原始名 %s", dataName, master)
-		default:
-			// RenameInterface 通常要求接口先关闭。netcfg.EnableRawIP 在
-			// raw_ip 已是 Y 时会走快速跳过分支、不保证关闭接口(Task 29 已在
-			// Init 阶段设置过 raw_ip，这里大概率命中该分支)，因此显式关闭
-			// 一次而不是依赖它的副作用。
-			_ = ops.bringDown(master)
-			if rerr := ops.renameInterface(master, renamedMaster); rerr != nil {
-				log.WithError(rerr).Warn("重命名物理主设备失败，继续使用原名进行 sysfs 操作")
-			} else {
-				log.Infof("物理主设备已重命名: %s -> %s", originalMaster, renamedMaster)
-				master = renamedMaster
-			}
-		}
-	}
-
-	result := preparedMuxInterfaces{masterIface: master, masterRenamed: master != currentMaster}
-
-	// 创建 QMAP 虚拟网卡 (如果不存在)，并把默认数据连接的 mux 网卡改回设备
-	// 的原始名字——下游(路由/DNS/UCI/代理绑定)因此无需感知 native/muxed 的
-	// 切换。
-	muxIfname, err := ops.addQMAPMux(master, muxID)
-	if err != nil {
-		log.WithError(err).Errorf("创建 MUX ID=%d 虚拟网卡失败", muxID)
-		// 继续尝试，也许用户已手动创建
-		return result
-	}
-	if muxIfname != originalMaster {
-		if rerr := ops.renameInterface(muxIfname, originalMaster); rerr != nil {
-			log.WithError(rerr).Errorf("重命名默认数据 mux 网卡 %s -> %s 失败，数据面将使用内核分配名", muxIfname, originalMaster)
-		} else {
-			muxIfname = originalMaster
-		}
-	}
-	log.Infof("QMAP 虚拟网卡: %s (MuxID=%d)", muxIfname, muxID)
-	result.dataIface = muxIfname
-	return result
-}
-
-// CurrentMasterInterface returns the physical master netdev's current sysfs
-// name. Equals cfg.Device.NetInterface until this device is first muxed;
-// afterward it is the renamed short name (see the MuxID>0 Dial block).
-// cellularBearerSource implementations must call this live rather than
-// caching the value at construction, since the rename only happens once
-// Dial actually runs.
-func (m *Manager) CurrentMasterInterface() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.masterIface == "" {
-		return m.cfg.Device.NetInterface
-	}
-	return m.masterIface
-}
-
 // LeasedServices are QMI service handles for an external caller (e.g. a
 // second PDN such as a VoLTE IMS bearer) that needs to reach QMI without
 // opening a second connection to the modem's control device.
@@ -3047,6 +2896,9 @@ func (m *Manager) cleanup() {
 	m.stopScheduledTimers()
 	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
 	defer cancel()
+	// Secondary PDNs own independent WDS clients and muxes, but share this
+	// manager's transport. Release them before clearing the shared services.
+	m.closeManagedPDNSessions(cleanupCtx)
 
 	m.mu.Lock()
 	wds := m.wds
@@ -3067,7 +2919,10 @@ func (m *Manager) cleanup() {
 
 	muxIface := m.muxIface
 	muxID := m.cfg.MuxID
-	masterIface := m.cfg.Device.NetInterface
+	masterIface := m.masterIface
+	if masterIface == "" {
+		masterIface = m.cfg.Device.NetInterface
+	}
 
 	m.wds = nil
 	m.wdsV6 = nil
@@ -3085,6 +2940,7 @@ func (m *Manager) cleanup() {
 	m.handleV6 = 0
 	m.settings = nil
 	m.muxIface = ""
+	m.masterIface = ""
 	m.markControlNotReadyLocked("cleanup")
 	m.markCoreNotReadyLocked("cleanup", nil)
 	m.wmsTransportStatus = 0

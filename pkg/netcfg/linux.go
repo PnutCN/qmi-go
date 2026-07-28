@@ -487,18 +487,3 @@ func (l *LinuxConfigurator) EnableRawIP(ifname string) error {
 
 	return nil
 }
-
-// RenameInterface renames a netdev via netlink (equivalent to
-// `ip link set dev <from> name <to>`). qmi_wwan devices generally require
-// the interface to be administratively down for a rename to succeed;
-// callers own bringing it down first and back up afterward if needed.
-func (l *LinuxConfigurator) RenameInterface(from, to string) error {
-	link, err := netlink.LinkByName(from)
-	if err != nil {
-		return fmt.Errorf("netcfg: 查找网卡 %s 失败: %w", from, err)
-	}
-	if err := netlink.LinkSetName(link, to); err != nil {
-		return fmt.Errorf("netcfg: 重命名 %s -> %s 失败: %w", from, to, err)
-	}
-	return nil
-}

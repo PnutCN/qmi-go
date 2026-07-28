@@ -38,6 +38,9 @@ func main() {
 // IMS PDN up) on exactly the failure paths this probe cares most about.
 func run() error {
 	devicePath := flag.String("device", "/dev/cdc-wdm0", "QMI control device")
+	useProxy := flag.Bool("proxy", false, "use qmi-proxy instead of opening the QMI control device directly")
+	proxyPath := flag.String("proxy-path", "", "qmi-proxy socket path (default: qmi-proxy)")
+	proxyExecutable := flag.String("proxy-executable", "", "qmi-proxy executable used only when the socket is unavailable")
 	iface := flag.String("iface", "wwan0", "master WWAN interface")
 	apn := flag.String("apn", "ims", "APN to activate")
 	muxID := flag.Uint("mux", 1, "QMAP mux ID for the IMS PDN")
@@ -65,7 +68,12 @@ func run() error {
 	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
+	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{
+		UseProxy:           *useProxy,
+		ProxyPath:          *proxyPath,
+		ProxyExecutable:    *proxyExecutable,
+		ProxyFallbackToRaw: false,
+	})
 	if err != nil {
 		return fmt.Errorf("open QMI client: %w", err)
 	}
@@ -221,6 +229,7 @@ func run() error {
 	}
 
 	fmt.Printf("IPv4=%v IPv6=%v MTU=%d\n", settings.IPv4Address, settings.IPv6Address, settings.MTU)
+	fmt.Printf("DNSv4=%v,%v DNSv6=%v,%v\n", settings.IPv4DNS1, settings.IPv4DNS2, settings.IPv6DNS1, settings.IPv6DNS2)
 	fmt.Printf("IMCN flag: %v\n", settings.IMCN)
 	fmt.Printf("P-CSCF via PCO: %v\n", settings.PCSCFUsingPCO)
 	fmt.Printf("P-CSCF addresses: %v\n", settings.PCSCFv4)

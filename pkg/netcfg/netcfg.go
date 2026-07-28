@@ -102,11 +102,6 @@ func EnableRawIP(ifname string) error {
 	return GetConfigurator().EnableRawIP(ifname)
 }
 
-// RenameInterface 重命名网卡
-func RenameInterface(from, to string) error {
-	return GetConfigurator().RenameInterface(from, to)
-}
-
 // ReconcileResidualMux 清理 masterIface 下的残留 QMAP mux
 func ReconcileResidualMux(masterIface string, keepMuxIDs []uint8) ([]uint8, error) {
 	return GetConfigurator().ReconcileResidualMux(masterIface, keepMuxIDs)
