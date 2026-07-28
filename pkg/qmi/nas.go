@@ -140,15 +140,26 @@ type NetworkScanResult struct {
 
 // SignalInfo contains detailed signal strength information / SignalInfo 包含详细的信号强度信息
 type SignalInfo struct {
-	// LTE specific
-	LTERSRP  int16 // dBm
-	LTERSRQ  int16 // dB
-	LTERSSNR int16 // dB * 10
+	// LTE and NR5G are nil when the response has no corresponding signal TLV.
+	// Measurements use qmicli's native protocol units.
+	LTE  *LTESignalInfo
+	NR5G *NR5GSignalInfo
+}
 
-	// 5G specific
-	NR5GRSRP int16 // dBm
-	NR5GRSRQ int16 // dB
-	NR5GSINR int16 // dB
+// LTESignalInfo mirrors NAS Get Signal Info units used by libqmi: RSRP is
+// dBm, RSRQ is dB, and SNR is 0.1 dB.
+type LTESignalInfo struct {
+	RSRP *int16
+	RSRQ *int16
+	SNR  *int16
+}
+
+// NR5GSignalInfo mirrors NAS Get Signal Info units used by libqmi: RSRP is
+// dBm, RSRQ is dB, and SNR is 0.1 dB.
+type NR5GSignalInfo struct {
+	RSRP *int16
+	RSRQ *int16
+	SNR  *int16
 }
 
 // SysInfo contains system information / SysInfo 包含系统信息
@@ -320,19 +331,20 @@ type NR5GCellLocationInfo struct {
 	TAC            uint32
 	GlobalCellID   uint64
 	PhysicalCellID uint16
-	RSRQ           int16
-	RSRP           int16
-	SNR            int16
-	ARFCN          uint32
-	HasARFCN       bool
+	// Signal measurements use 0.1 dB units. nil represents QMI 0x8000.
+	RSRQ  *int16
+	RSRP  *int16
+	SNR   *int16
+	ARFCN *uint32
 }
 
 // CellLocationInfo combines serving-cell details from different RAT families.
 type CellLocationInfo struct {
-	GERAN *GERANCellLocationInfo
-	UMTS  *UMTSCellLocationInfo
-	LTE   *LTECellLocationInfo
-	NR5G  *NR5GCellLocationInfo
+	GERAN             *GERANCellLocationInfo
+	UMTS              *UMTSCellLocationInfo
+	LTE               *LTECellLocationInfo
+	NR5G              *NR5GCellLocationInfo
+	ObservedNR5GARFCN *uint32
 }
 
 // activeBandToLTEBand maps the QMI NAS "active_band" enum value (as reported
@@ -357,6 +369,34 @@ var activeBandToLTEBand = map[uint16]uint16{
 func LTEBandNumberFromActiveBand(active uint16) (band uint16, ok bool) {
 	band, ok = activeBandToLTEBand[active]
 	return band, ok
+}
+
+// activeBandToNR5GBand maps QMI NAS ActiveBand values to 3GPP NR band
+// numbers. These enum values are non-contiguous; keep the mapping aligned
+// with libqmi's QmiNasActiveBand definition.
+var activeBandToNR5GBand = map[uint16]uint16{
+	250: 1, 251: 2, 252: 3, 253: 5, 254: 7, 255: 8,
+	256: 20, 257: 28, 258: 38, 259: 41, 260: 50, 261: 51,
+	262: 66, 263: 70, 264: 71, 265: 74, 266: 75, 267: 76,
+	268: 77, 269: 78, 270: 79, 271: 80, 272: 81, 273: 82,
+	274: 83, 275: 84, 276: 85, 277: 257, 278: 258, 279: 259,
+	280: 260, 281: 261, 282: 12, 283: 25, 284: 34, 285: 39,
+	286: 40, 287: 65, 288: 86, 289: 48, 290: 14, 291: 13,
+	292: 18, 293: 26, 294: 30, 295: 29, 296: 53, 297: 46,
+	298: 91, 299: 92, 300: 93, 301: 94,
+}
+
+// NR5GBandNumberFromActiveBand converts a QMI NAS NR active-band enum into
+// its 3GPP NR band number.
+func NR5GBandNumberFromActiveBand(active uint16) (band uint16, ok bool) {
+	band, ok = activeBandToNR5GBand[active]
+	return band, ok
+}
+
+// IsNR5GRadioInterface accepts the standard QMI 5GNR value and the legacy
+// value emitted by some modem firmware.
+func IsNR5GRadioInterface(radioInterface uint8) bool {
+	return radioInterface == 0x0C || radioInterface == 0x0A
 }
 
 func GetLTEDuplexModeFromBandInfo(info *RFBandInfo) string {
@@ -1151,28 +1191,32 @@ func parseSignalInfoPacket(packet *Packet) (*SignalInfo, error) {
 	info := &SignalInfo{}
 
 	if tlv := FindTLV(packet.TLVs, 0x14); tlv != nil && len(tlv.Value) >= 6 {
-		info.LTERSRQ = int16(int8(tlv.Value[1]))
-		info.LTERSRP = int16(binary.LittleEndian.Uint16(tlv.Value[2:4]))
-		info.LTERSSNR = int16(binary.LittleEndian.Uint16(tlv.Value[4:6]))
+		rsrq := int16(int8(tlv.Value[1]))
+		rsrp := int16(binary.LittleEndian.Uint16(tlv.Value[2:4]))
+		snr := int16(binary.LittleEndian.Uint16(tlv.Value[4:6]))
+		info.LTE = &LTESignalInfo{RSRQ: &rsrq, RSRP: &rsrp, SNR: &snr}
 	}
 
 	if tlv := FindTLV(packet.TLVs, 0x17); tlv != nil && len(tlv.Value) >= 4 {
-		info.NR5GRSRP = int16(binary.LittleEndian.Uint16(tlv.Value[0:2]))
-		info.NR5GSINR = roundTenthsToInteger(int16(binary.LittleEndian.Uint16(tlv.Value[2:4])))
+		info.NR5G = &NR5GSignalInfo{}
+		if rsrp := int16(binary.LittleEndian.Uint16(tlv.Value[0:2])); rsrp != -32768 {
+			info.NR5G.RSRP = &rsrp
+		}
+		if sinr := int16(binary.LittleEndian.Uint16(tlv.Value[2:4])); sinr != -32768 {
+			info.NR5G.SNR = &sinr
+		}
 	}
 
 	if tlv := FindTLV(packet.TLVs, 0x18); tlv != nil && len(tlv.Value) >= 2 {
-		info.NR5GRSRQ = int16(binary.LittleEndian.Uint16(tlv.Value[0:2]))
+		if info.NR5G == nil {
+			info.NR5G = &NR5GSignalInfo{}
+		}
+		if rsrq := int16(binary.LittleEndian.Uint16(tlv.Value[0:2])); rsrq != -32768 {
+			info.NR5G.RSRQ = &rsrq
+		}
 	}
 
 	return info, nil
-}
-
-func roundTenthsToInteger(value int16) int16 {
-	if value < 0 {
-		return int16((int32(value) - 5) / 10)
-	}
-	return int16((int32(value) + 5) / 10)
 }
 
 func ParseSignalInfoIndication(packet *Packet) (*SignalInfo, error) {
@@ -1451,6 +1495,7 @@ func parseCellLocationInfoPacket(resp *Packet, checkResult bool) (*CellLocationI
 	}
 
 	info := &CellLocationInfo{}
+	hasNR5GLocationTLV := false
 
 	if tlv := FindTLV(resp.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 18 {
 		mcc, mnc := decodeBCDPLMN(tlv.Value[4:7])
@@ -1572,31 +1617,42 @@ func parseCellLocationInfoPacket(resp *Packet, checkResult bool) (*CellLocationI
 	}
 
 	if tlv := FindTLV(resp.TLVs, 0x2E); tlv != nil && len(tlv.Value) >= 4 {
-		if info.NR5G == nil {
-			info.NR5G = &NR5GCellLocationInfo{}
-		}
-		info.NR5G.ARFCN = binary.LittleEndian.Uint32(tlv.Value[0:4])
-		info.NR5G.HasARFCN = true
+		hasNR5GLocationTLV = true
+		arfcn := binary.LittleEndian.Uint32(tlv.Value[0:4])
+		info.ObservedNR5GARFCN = &arfcn
 	}
 
 	if tlv := FindTLV(resp.TLVs, 0x2F); tlv != nil && len(tlv.Value) >= 20 {
+		hasNR5GLocationTLV = true
 		mcc, mnc := decodeBCDPLMN(tlv.Value[0:3])
-		if info.NR5G == nil {
-			info.NR5G = &NR5GCellLocationInfo{}
+		nr := &NR5GCellLocationInfo{
+			MCC:            mcc,
+			MNC:            mnc,
+			TAC:            decodeUint24(tlv.Value[3:6]),
+			GlobalCellID:   binary.LittleEndian.Uint64(tlv.Value[6:14]),
+			PhysicalCellID: binary.LittleEndian.Uint16(tlv.Value[14:16]),
 		}
-		info.NR5G.MCC = mcc
-		info.NR5G.MNC = mnc
-		info.NR5G.TAC = decodeUint24(tlv.Value[3:6])
-		info.NR5G.GlobalCellID = binary.LittleEndian.Uint64(tlv.Value[6:14])
-		info.NR5G.PhysicalCellID = binary.LittleEndian.Uint16(tlv.Value[14:16])
-		info.NR5G.RSRQ = int16(binary.LittleEndian.Uint16(tlv.Value[16:18]))
-		info.NR5G.RSRP = int16(binary.LittleEndian.Uint16(tlv.Value[18:20]))
+		if rsrq := int16(binary.LittleEndian.Uint16(tlv.Value[16:18])); rsrq != -32768 {
+			nr.RSRQ = &rsrq
+		}
+		if rsrp := int16(binary.LittleEndian.Uint16(tlv.Value[18:20])); rsrp != -32768 {
+			nr.RSRP = &rsrp
+		}
 		if len(tlv.Value) >= 22 {
-			info.NR5G.SNR = int16(binary.LittleEndian.Uint16(tlv.Value[20:22]))
+			if snr := int16(binary.LittleEndian.Uint16(tlv.Value[20:22])); snr != -32768 {
+				nr.SNR = &snr
+			}
+		}
+		if nr.GlobalCellID != 0 {
+			info.NR5G = nr
 		}
 	}
+	if info.NR5G != nil && info.ObservedNR5GARFCN != nil {
+		arfcn := *info.ObservedNR5GARFCN
+		info.NR5G.ARFCN = &arfcn
+	}
 
-	if info.GERAN == nil && info.UMTS == nil && info.LTE == nil && info.NR5G == nil {
+	if info.GERAN == nil && info.UMTS == nil && info.LTE == nil && info.NR5G == nil && !hasNR5GLocationTLV {
 		return nil, fmt.Errorf("no cell location TLVs in response")
 	}
 

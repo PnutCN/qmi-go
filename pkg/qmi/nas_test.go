@@ -399,8 +399,60 @@ func TestParseSignalInfoPacketNR5G(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseSignalInfoPacket returned error: %v", err)
 	}
-	if info.NR5GRSRP != -95 || info.NR5GRSRQ != -11 || info.NR5GSINR != 12 {
+	if info.NR5G == nil || info.NR5G.RSRP == nil || *info.NR5G.RSRP != -95 || info.NR5G.RSRQ == nil || *info.NR5G.RSRQ != -11 || info.NR5G.SNR == nil || *info.NR5G.SNR != 123 {
 		t.Fatalf("unexpected NR5G signal info: %+v", info)
+	}
+}
+
+func TestParseSignalInfoPacketLTEUsesDedicatedSignalObject(t *testing.T) {
+	packet := &Packet{TLVs: []TLV{
+		{Type: 0x14, Value: []byte{0x00, 0xF7, 0x38, 0xFF, 0x7B, 0x00}},
+	}}
+
+	info, err := parseSignalInfoPacket(packet)
+	if err != nil {
+		t.Fatalf("parseSignalInfoPacket returned error: %v", err)
+	}
+	if info.LTE == nil || info.LTE.RSRQ == nil || *info.LTE.RSRQ != -9 || info.LTE.RSRP == nil || *info.LTE.RSRP != -200 || info.LTE.SNR == nil || *info.LTE.SNR != 123 {
+		t.Fatalf("unexpected LTE signal info: %+v", info)
+	}
+}
+
+func TestNR5GBandNumberFromActiveBand(t *testing.T) {
+	cases := []struct {
+		active uint16
+		want   uint16
+	}{
+		{250, 1},
+		{269, 78},
+		{301, 94},
+	}
+	for _, tc := range cases {
+		got, ok := NR5GBandNumberFromActiveBand(tc.active)
+		if !ok || got != tc.want {
+			t.Fatalf("NR5GBandNumberFromActiveBand(%d) = (%d, %v), want (%d, true)", tc.active, got, ok, tc.want)
+		}
+	}
+	if _, ok := NR5GBandNumberFromActiveBand(999); ok {
+		t.Fatal("unknown NR active-band class was accepted")
+	}
+	if !IsNR5GRadioInterface(0x0A) || !IsNR5GRadioInterface(0x0C) || IsNR5GRadioInterface(0x08) {
+		t.Fatal("unexpected NR5G radio-interface classification")
+	}
+}
+
+func TestParseSignalInfoPacketNR5GUnavailableMeasurementsAreNotExposed(t *testing.T) {
+	packet := &Packet{TLVs: []TLV{
+		{Type: 0x17, Value: []byte{0x00, 0x80, 0x00, 0x80}},
+		{Type: 0x18, Value: []byte{0x00, 0x80}},
+	}}
+
+	info, err := parseSignalInfoPacket(packet)
+	if err != nil {
+		t.Fatalf("parseSignalInfoPacket returned error: %v", err)
+	}
+	if info.NR5G == nil || info.NR5G.RSRP != nil || info.NR5G.RSRQ != nil || info.NR5G.SNR != nil {
+		t.Fatalf("unavailable NR5G measurements leaked: %+v", info)
 	}
 }
 
@@ -522,7 +574,7 @@ func TestParseCellLocationInfoResponse(t *testing.T) {
 	if !info.LTE.HasTimingAdvance || info.LTE.TimingAdvance != 42 {
 		t.Fatalf("unexpected LTE timing advance: %+v", info.LTE)
 	}
-	if info.NR5G == nil || !info.NR5G.HasARFCN || info.NR5G.ARFCN != 635334 {
+	if info.NR5G == nil || info.NR5G.ARFCN == nil || *info.NR5G.ARFCN != 635334 {
 		t.Fatalf("unexpected NR ARFCN: %+v", info.NR5G)
 	}
 	if info.NR5G.TAC != 258 || info.NR5G.GlobalCellID != 0x1122334455667788 || info.NR5G.PhysicalCellID != 321 {
@@ -590,6 +642,7 @@ func TestParseCellLocationInfoResponseNR5GMeasurementsRemainRawTenths(t *testing
 	nr := make([]byte, 22)
 	rsrq, rsrp, snr := int16(-110), int16(-950), int16(123)
 	copy(nr[0:3], []byte{0x13, 0x00, 0x62})
+	binary.LittleEndian.PutUint64(nr[6:14], 0x1122334455667788)
 	binary.LittleEndian.PutUint16(nr[16:18], uint16(rsrq))
 	binary.LittleEndian.PutUint16(nr[18:20], uint16(rsrp))
 	binary.LittleEndian.PutUint16(nr[20:22], uint16(snr))
@@ -600,8 +653,58 @@ func TestParseCellLocationInfoResponseNR5GMeasurementsRemainRawTenths(t *testing
 	if err != nil {
 		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
 	}
-	if info.NR5G == nil || info.NR5G.RSRQ != -110 || info.NR5G.RSRP != -950 || info.NR5G.SNR != 123 {
+	if info.NR5G == nil || info.NR5G.RSRQ == nil || *info.NR5G.RSRQ != -110 || info.NR5G.RSRP == nil || *info.NR5G.RSRP != -950 || info.NR5G.SNR == nil || *info.NR5G.SNR != 123 || info.NR5G.PhysicalCellID != 0 {
 		t.Fatalf("unexpected raw NR5G measurements: %+v", info.NR5G)
+	}
+}
+
+func TestParseCellLocationInfoResponseNR5GUnavailableMeasurementsAreNil(t *testing.T) {
+	nr := make([]byte, 22)
+	copy(nr[0:3], []byte{0x13, 0x00, 0x62})
+	binary.LittleEndian.PutUint64(nr[6:14], 0x1122334455667788)
+	for offset := 16; offset <= 20; offset += 2 {
+		binary.LittleEndian.PutUint16(nr[offset:offset+2], uint16(0x8000))
+	}
+
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x2F, Value: nr},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.NR5G == nil || info.NR5G.RSRQ != nil || info.NR5G.RSRP != nil || info.NR5G.SNR != nil {
+		t.Fatalf("unavailable NR5G measurements leaked: %+v", info.NR5G)
+	}
+}
+
+func TestParseCellLocationInfoResponseNR5GARFCNOnlyIsNotServingCell(t *testing.T) {
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x2E, Value: []byte{0xFE, 0x73, 0x06, 0x00}},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.NR5G != nil {
+		t.Fatalf("ARFCN-only response created NR5G serving cell: %+v", info.NR5G)
+	}
+	if info.ObservedNR5GARFCN == nil || *info.ObservedNR5GARFCN != 422910 {
+		t.Fatalf("unexpected observed NR5G ARFCN: %+v", info)
+	}
+}
+
+func TestParseCellLocationInfoResponseNR5GZeroGlobalCellIDIsNotServingCell(t *testing.T) {
+	nr := make([]byte, 22)
+	copy(nr[0:3], []byte{0x13, 0x00, 0x62})
+	binary.LittleEndian.PutUint16(nr[14:16], 0) // PCI 0 is valid when NCI is valid.
+
+	info, err := parseCellLocationInfoResponse(&Packet{TLVs: []TLV{
+		successResultTLV(), {Type: 0x2F, Value: nr},
+	}})
+	if err != nil {
+		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
+	}
+	if info.NR5G != nil {
+		t.Fatalf("zero Global Cell ID created NR5G serving cell: %+v", info.NR5G)
 	}
 }
 

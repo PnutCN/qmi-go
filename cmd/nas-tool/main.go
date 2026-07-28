@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/iniwex5/qmi-go/pkg/qmi"
@@ -110,13 +111,27 @@ func runSignalInfo(ctx context.Context, nas *qmi.NASService) {
 		log.Printf("GetSignalInfo failed: %v", err)
 		return
 	}
-	fmt.Printf("LTE RSRP: %d\n", info.LTERSRP)
-	fmt.Printf("LTE RSRQ: %d\n", info.LTERSRQ)
-	fmt.Printf("LTE RSSNR: %d\n", info.LTERSSNR)
-	fmt.Printf("NR5G RSRP: %d\n", info.NR5GRSRP)
-	fmt.Printf("NR5G RSRQ: %d\n", info.NR5GRSRQ)
-	fmt.Printf("NR5G SINR: %d\n", info.NR5GSINR)
+	if info.LTE != nil {
+		fmt.Printf("LTE RSRP: %s\n", formatOptionalDB(info.LTE.RSRP, 1))
+		fmt.Printf("LTE RSRQ: %s\n", formatOptionalDB(info.LTE.RSRQ, 1))
+		fmt.Printf("LTE SNR: %s\n", formatOptionalDB(info.LTE.SNR, 10))
+	}
+	if info.NR5G != nil {
+		fmt.Printf("NR5G RSRP: %s\n", formatOptionalDB(info.NR5G.RSRP, 1))
+		fmt.Printf("NR5G RSRQ: %s\n", formatOptionalDB(info.NR5G.RSRQ, 1))
+		fmt.Printf("NR5G SNR: %s\n", formatOptionalDB(info.NR5G.SNR, 10))
+	}
 	fmt.Println()
+}
+
+func formatOptionalDB(value *int16, scale float64) string {
+	if value == nil {
+		return "n/a"
+	}
+	if scale == 1 {
+		return strconv.FormatInt(int64(*value), 10)
+	}
+	return fmt.Sprintf("%.1f", float64(*value)/scale)
 }
 
 func runSysInfo(ctx context.Context, nas *qmi.NASService) {
@@ -169,7 +184,7 @@ func formatCellLocationInfo(info *qmi.CellLocationInfo) string {
 		}
 	}
 	if info.NR5G != nil {
-		fmt.Fprintf(&output, "NR5G: PLMN=%s-%s PCI=%d RSRP: %.1f dBm RSRQ: %.1f dB SNR: %.1f dB\n", info.NR5G.MCC, info.NR5G.MNC, info.NR5G.PhysicalCellID, float64(info.NR5G.RSRP)/10, float64(info.NR5G.RSRQ)/10, float64(info.NR5G.SNR)/10)
+		fmt.Fprintf(&output, "NR5G: PLMN=%s-%s PCI=%d RSRP: %s dBm RSRQ: %s dB SNR: %s dB\n", info.NR5G.MCC, info.NR5G.MNC, info.NR5G.PhysicalCellID, formatOptionalDB(info.NR5G.RSRP, 10), formatOptionalDB(info.NR5G.RSRQ, 10), formatOptionalDB(info.NR5G.SNR, 10))
 	}
 	output.WriteByte('\n')
 	return output.String()

@@ -226,7 +226,7 @@ func TestHandleIndicationNASSignalInfoChanged(t *testing.T) {
 	})
 
 	info, ts, valid := m.snapshot.NASSignalInfo()
-	if !valid || info == nil || info.LTERSRQ != -9 || info.LTERSRP != -200 || info.NR5GRSRP != -95 || info.NR5GRSRQ != -11 || info.NR5GSINR != 12 || ts.IsZero() {
+	if !valid || info == nil || info.LTE == nil || info.LTE.RSRQ == nil || *info.LTE.RSRQ != -9 || info.LTE.RSRP == nil || *info.LTE.RSRP != -200 || info.LTE.SNR == nil || *info.LTE.SNR != 50 || info.NR5G == nil || info.NR5G.RSRP == nil || *info.NR5G.RSRP != -95 || info.NR5G.RSRQ == nil || *info.NR5G.RSRQ != -11 || info.NR5G.SNR == nil || *info.NR5G.SNR != 123 || ts.IsZero() {
 		t.Fatalf("unexpected nas signal snapshot: valid=%v ts=%v info=%+v", valid, ts, info)
 	}
 }
