@@ -651,10 +651,10 @@ func (m *Manager) Connect() error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.state == StateConnecting && (m.handleV4 != 0 || m.handleV6 != 0) {
+	if m.state == StateConnecting {
 		m.desiredConnection = true
 		m.mu.Unlock()
-		return fmt.Errorf("connection already in progress")
+		return nil
 	}
 	m.desiredConnection = true
 	m.mu.Unlock()
@@ -3549,9 +3549,9 @@ func (m *Manager) doConnect() error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.state == StateConnecting && m.handleV4 != 0 {
+	if m.state == StateConnecting {
 		m.mu.Unlock()
-		return fmt.Errorf("connection already in progress")
+		return nil
 	}
 	m.state = StateConnecting
 	m.mu.Unlock()

@@ -309,8 +309,9 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 		}
 	}
 
-	// Initial sync (non-fatal, helps clear modem state) / 初始同步 (非致命，有助于清除modem状态)
-	if opts.SyncOnOpen {
+	// CTL SYNC releases client IDs allocated on the endpoint, so it must not run
+	// through qmi-proxy where the endpoint is shared with other processes.
+	if c.opts.SyncOnOpen && (!c.opts.UseProxy || c.opts.UseQRTR) {
 		syncCtx := ctx
 		if syncCtx == nil {
 			syncCtx = context.Background()

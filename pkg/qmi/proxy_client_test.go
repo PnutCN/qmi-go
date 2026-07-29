@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
+func TestClientProxyOpenDoesNotSendInitialSync(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-test0"
 
 	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
@@ -35,26 +35,76 @@ func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
 			return err
 		}
 
-		syncReq, err := readQMIFrameFromConn(conn)
-		if err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			return err
 		}
-		if err := assertCTLRequest(syncReq, 0x0027); err != nil {
+		buf := make([]byte, 1)
+		if _, err := conn.Read(buf); err == nil {
+			return fmt.Errorf("unexpected QMI request after proxy open")
+		} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 			return err
 		}
-		return writeCTLSuccess(conn, syncReq)
+		return nil
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{UseProxy: true})
+	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+		UseProxy:           true,
+		SyncOnOpen:         true,
+		QueryVersionOnOpen: false,
+		ReadDeadline:       5 * time.Millisecond,
+	})
 	if err != nil {
 		t.Fatalf("NewClientWithOptions() error = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 	if err := client.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
+}
+
+func TestClientDirectOpenStillSendsInitialSync(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-direct-test0"
+
+	errCh := make(chan error, 1)
+	restoreRaw := replaceRawTransportForTest(t, func(path string) (qmiTransport, error) {
+		if path != devicePath {
+			t.Fatalf("raw path=%q, want %q", path, devicePath)
+		}
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer serverConn.Close()
+			syncReq, err := readQMIFrameFromConn(serverConn)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := assertCTLRequest(syncReq, CTLSync); err != nil {
+				errCh <- err
+				return
+			}
+			errCh <- writeCTLSuccess(serverConn, syncReq)
+		}()
+		return clientConn, nil
+	})
+	defer restoreRaw()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+		SyncOnOpen:         true,
+		QueryVersionOnOpen: false,
+		ReadDeadline:       5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions() error = %v", err)
+	}
+	defer client.Close()
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
