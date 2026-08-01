@@ -578,6 +578,9 @@ type RuntimeSettings struct {
 	// PCSCFUsingPCO reports whether the network signalled P-CSCF discovery via PCO.
 	// PCSCFUsingPCO 表示网络是否通过 PCO 信令 P-CSCF 发现。
 	PCSCFUsingPCO bool
+	// HasPCSCFUsingPCO distinguishes an explicit "no PCO delivery" report from
+	// a modem that never sent TLV 0x22 at all.
+	HasPCSCFUsingPCO bool
 	// PCSCFv4 holds the IPv4 P-CSCF addresses delivered by the network.
 	// PCSCFv4 保存网络下发的 IPv4 P-CSCF 地址。
 	PCSCFv4 []net.IP
@@ -734,6 +737,7 @@ func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 
 	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFUsingPCO); tlv != nil && len(tlv.Value) >= 1 {
 		settings.PCSCFUsingPCO = tlv.Value[0] != 0
+		settings.HasPCSCFUsingPCO = true
 	}
 	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFServerAddrList); tlv != nil && len(tlv.Value) >= 1 {
 		count := int(tlv.Value[0])

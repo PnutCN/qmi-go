@@ -562,6 +562,29 @@ func TestParseRuntimeSettingsPCSCFUsingPCOAndIMCNZeroValues(t *testing.T) {
 	})
 }
 
+func TestParseRuntimeSettingsRecordsPCSCFUsingPCOPresence(t *testing.T) {
+	tests := []struct {
+		name    string
+		tlvs    []TLV
+		want    bool
+		wantHas bool
+	}{
+		{name: "absent", tlvs: nil, want: false, wantHas: false},
+		{name: "explicit false", tlvs: []TLV{{Type: TLVWDSPCSCFUsingPCO, Value: []byte{0x00}}}, want: false, wantHas: true},
+		{name: "explicit true", tlvs: []TLV{{Type: TLVWDSPCSCFUsingPCO, Value: []byte{0x01}}}, want: true, wantHas: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := parseRuntimeSettings(&Packet{TLVs: append([]TLV{successResultTLV()}, tt.tlvs...)})
+			if settings.PCSCFUsingPCO != tt.want || settings.HasPCSCFUsingPCO != tt.wantHas {
+				t.Fatalf("PCSCFUsingPCO=%v Has=%v, want %v/%v",
+					settings.PCSCFUsingPCO, settings.HasPCSCFUsingPCO, tt.want, tt.wantHas)
+			}
+		})
+	}
+}
+
 func TestParsePacketServiceStatusIndication(t *testing.T) {
 	packet := &Packet{
 		TLVs: []TLV{
