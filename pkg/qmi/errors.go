@@ -58,6 +58,8 @@ const (
 	QMIErrInvalidRegisterAction  uint16 = 0x0020 // Invalid register action / 无效驻网动作
 	QMIErrInvalidQmiCmd          uint16 = 0x0047 // Invalid QMI command / 不支持的QMI命令
 	QMIErrNotSupported           uint16 = 0x005E // Not supported / 不支持
+	QMIErrExtendedInternal       uint16 = 0x0051 // Extended internal error / 扩展内部错误
+	QMIErrIncompatibleState      uint16 = 0x005A // Operation unavailable in the modem's current state / 当前模组状态下该操作不可用
 	QMIErrOpDeviceUnsupported    uint16 = 0x0034 // Operation not supported by device (EC20 对 WMS 0x004A 的常见回应)
 	QMIErrCardCallControlRefFail uint16 = 0x0030 // Card APDU call control reference failed (卡片执行 EnableProfile+refresh 触发内部 RESET 时的预期返回码)
 )

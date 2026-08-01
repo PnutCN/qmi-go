@@ -15,6 +15,10 @@ const (
 	WDSGetDataBearerTechnology        uint16 = 0x0037
 	WDSGetCurrentDataBearerTechnology uint16 = 0x0044
 	WDSSetAutoconnectSettings         uint16 = 0x0051
+	// WDSBindDataPort binds a WDS client to a fixed modem data port, the
+	// embedded/BAM-DMUX counterpart of WDSBindMuxDataPort's QMAP mux binding.
+	// Its single input TLV 0x01 is a guint16 SIO port (see WDSSIOPort*).
+	WDSBindDataPort uint16 = 0x0089
 	/* Defined in frame.go / 在 frame.go 中定义
 	WDSGetCurrentChannelRate uint16 = 0x0023
 	WDSGetPktStatistics      uint16 = 0x0024
@@ -76,6 +80,11 @@ const (
 	RuntimeMaskDomainName  uint32 = 1 << 14
 	RuntimeMaskIPFamily    uint32 = 1 << 15
 	RuntimeMaskIMCN        uint32 = 1 << 16
+	// Bits 17 and 18 complete libqmi's QmiWdsRequestedSettings. Extended
+	// technology is TLV 0x2D, which modems return unprompted today; operator
+	// reserved PCO is 0x2F and is not returned unless requested.
+	RuntimeMaskExtendedTechnology  uint32 = 1 << 17
+	RuntimeMaskOperatorReservedPCO uint32 = 1 << 18
 )
 
 // ============================================================================
@@ -177,6 +186,26 @@ func (e *StartNetworkError) Error() string {
 func (e *StartNetworkError) Unwrap() error {
 	return e.Err
 }
+
+// Call type for Start Network Interface TLV 0x35 (libqmi QmiWdsCallType).
+// It tells the modem whether the call belongs to the modem itself or to a
+// tethered host, which is part of the call configuration the modem matches
+// against when deciding whether a request duplicates an existing call --
+// see CallEndReason.IsInterfaceInUseConfigMatch.
+const (
+	WDSCallTypeLaptop   uint8 = 0
+	WDSCallTypeEmbedded uint8 = 1
+)
+
+// SIO ports for WDSBindDataPort (libqmi QmiSioPort). The A2 MUX range is the
+// BAM-DMUX data path used by embedded and PCIe modems, where the kernel
+// driver pre-creates one netdev per port instead of the host adding QMAP
+// muxes. RMNET0..RMNET7 are contiguous from 0x0e04.
+const (
+	WDSSIOPortNone          uint16 = 0x0000
+	WDSSIOPortA2MuxRMNET0   uint16 = 0x0e04
+	WDSSIOPortA2MuxRMNETMax uint16 = 0x0e0b
+)
 
 // MuxBinding info for QMAP / QMAP 的 Mux 绑定信息
 type MuxBinding struct {
