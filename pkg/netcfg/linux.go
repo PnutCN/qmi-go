@@ -4,6 +4,7 @@
 package netcfg
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -22,6 +23,14 @@ import (
 type LinuxConfigurator struct{}
 
 var qmapMuxCreateMu sync.Mutex
+
+var (
+	netlinkLinkByName = netlink.LinkByName
+	netlinkAddrList   = netlink.AddrList
+	netlinkAddrDel    = netlink.AddrDel
+	netlinkRouteList  = netlink.RouteList
+	netlinkRouteDel   = netlink.RouteDel
+)
 
 // sysClassNetRoot is the base of the sysfs netdev tree. A package variable
 // (not a hardcoded literal) so tests can point it at a fake tree instead of
@@ -75,21 +84,24 @@ func (l *LinuxConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen i
 }
 
 func (l *LinuxConfigurator) FlushAddresses(ifname string) error {
-	link, err := netlink.LinkByName(ifname)
+	link, err := netlinkLinkByName(ifname)
 	if err != nil {
-		return nil // Interface gone
+		return fmt.Errorf("netcfg: lookup interface %s for address flush: %w", ifname, err)
 	}
 
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	addrs, err := netlinkAddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
-		return nil
+		return fmt.Errorf("netcfg: list addresses on %s: %w", ifname, err)
 	}
 
+	var result error
 	for _, addr := range addrs {
-		// Ignore errors during cleanup
-		_ = netlink.AddrDel(link, &addr)
+		addr := addr
+		if err := netlinkAddrDel(link, &addr); err != nil {
+			result = errors.Join(result, fmt.Errorf("netcfg: delete address from %s: %w", ifname, err))
+		}
 	}
-	return nil
+	return result
 }
 
 func (l *LinuxConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
@@ -148,20 +160,24 @@ func (l *LinuxConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) erro
 }
 
 func (l *LinuxConfigurator) FlushRoutes(ifname string) error {
-	link, err := netlink.LinkByName(ifname)
+	link, err := netlinkLinkByName(ifname)
 	if err != nil {
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+	routes, err := netlinkRouteList(link, netlink.FAMILY_ALL)
 	if err != nil {
 		return fmt.Errorf("failed to list routes: %w", err)
 	}
 
+	var result error
 	for _, route := range routes {
-		_ = netlink.RouteDel(&route)
+		route := route
+		if err := netlinkRouteDel(&route); err != nil {
+			result = errors.Join(result, fmt.Errorf("netcfg: delete route from %s: %w", ifname, err))
+		}
 	}
-	return nil
+	return result
 }
 
 func (l *LinuxConfigurator) BringUp(ifname string) error {

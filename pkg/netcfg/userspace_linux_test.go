@@ -5,6 +5,7 @@ package netcfg
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -44,10 +45,28 @@ func TestDisableIPv6AutoconfigurationToleratesMissingSettings(t *testing.T) {
 	}
 }
 
+func TestValidateUserspaceInterfaceNameRejectsUnsafeInterfaceNames(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../etc", "a/b"} {
+		if _, err := validateUserspaceInterfaceName(name); err == nil {
+			t.Fatalf("validateUserspaceInterfaceName(%q) = nil, want error", name)
+		}
+	}
+}
+
+func TestValidateUserspaceInterfaceNameAcceptsSimpleName(t *testing.T) {
+	got, err := validateUserspaceInterfaceName(" qmimux0 ")
+	if err != nil {
+		t.Fatalf("validateUserspaceInterfaceName() error = %v", err)
+	}
+	if got != "qmimux0" {
+		t.Fatalf("validateUserspaceInterfaceName() = %q, want %q", got, "qmimux0")
+	}
+}
+
 func TestPrepareUserspaceOnlyRejectsUnsafeInterfaceNames(t *testing.T) {
-	for _, name := range []string{"", "../etc", "a/b"} {
-		if err := PrepareUserspaceOnly(name); err == nil {
-			t.Fatalf("PrepareUserspaceOnly(%q) = nil, want error", name)
+	for _, name := range []string{"", ".", "..", "../etc", "a/b"} {
+		if err := PrepareUserspaceOnly(name); err == nil || !strings.Contains(err.Error(), "invalid interface name") {
+			t.Fatalf("PrepareUserspaceOnly(%q) error = %v, want invalid interface name", name, err)
 		}
 	}
 }

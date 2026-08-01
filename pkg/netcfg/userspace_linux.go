@@ -16,9 +16,10 @@ var ipv6InterfaceSysctlRoot = "/proc/sys/net/ipv6/conf"
 // PrepareUserspaceOnly keeps the kernel from claiming an interface whose IP
 // layer is owned by a userspace netstack.
 func PrepareUserspaceOnly(ifname string) error {
-	ifname = strings.TrimSpace(ifname)
-	if ifname == "" || filepath.Base(ifname) != ifname {
-		return fmt.Errorf("netcfg: invalid interface name %q", ifname)
+	var err error
+	ifname, err = validateUserspaceInterfaceName(ifname)
+	if err != nil {
+		return err
 	}
 	if err := disableIPv6AutoconfigurationAt(ipv6InterfaceSysctlRoot, ifname); err != nil {
 		return err
@@ -29,6 +30,14 @@ func PrepareUserspaceOnly(ifname string) error {
 		configurator.FlushRoutes(ifname),
 		configurator.FlushAddresses(ifname),
 	)
+}
+
+func validateUserspaceInterfaceName(ifname string) (string, error) {
+	ifname = strings.TrimSpace(ifname)
+	if ifname == "" || ifname == "." || ifname == ".." || filepath.Base(ifname) != ifname {
+		return "", fmt.Errorf("netcfg: invalid interface name %q", ifname)
+	}
+	return ifname, nil
 }
 
 func disableIPv6AutoconfigurationAt(root, ifname string) error {
