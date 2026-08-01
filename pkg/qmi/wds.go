@@ -593,6 +593,12 @@ type RuntimeSettings struct {
 	// IMCN reports whether this bearer is the IMS-dedicated PDN.
 	// IMCN 表示该承载是否为 IMS 专用 PDN。
 	IMCN bool
+	// ResponseTLVs is the raw Get Current Settings response, including TLVs
+	// this package does not decode. Modems return fields libqmi never
+	// defined -- the IPv6 P-CSCF list in 0x2E was one of them -- and dropping
+	// them here makes such a field undiscoverable without a bespoke tool.
+	// ResponseTLVs 保留 Get Current Settings 的原始响应（含本包未解码的 TLV）。
+	ResponseTLVs []TLV
 }
 
 func parsePacketServiceStatusPacket(packet *Packet, checkResult bool) (ConnectionStatus, error) {
@@ -683,7 +689,7 @@ func (w *WDSService) GetRuntimeSettings(ctx context.Context, ipFamily uint8) (*R
 // RuntimeSettings 值。它只做纯粹的 TLV 解析；结果码检查和请求构造仍留在
 // GetRuntimeSettings 中。
 func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
-	settings := &RuntimeSettings{}
+	settings := &RuntimeSettings{ResponseTLVs: cloneTLVs(resp.TLVs)}
 
 	// Parse IPv4 settings / 解析IPv4设置
 	if tlv := FindTLV(resp.TLVs, TLVWDSIPv4Address); tlv != nil && len(tlv.Value) >= 4 {
@@ -769,6 +775,19 @@ func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 	}
 
 	return settings
+}
+
+// cloneTLVs deep-copies a TLV slice. TLV.Value aliases the response buffer,
+// which the caller is free to reuse once parsing returns.
+func cloneTLVs(in []TLV) []TLV {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]TLV, 0, len(in))
+	for _, tlv := range in {
+		out = append(out, TLV{Type: tlv.Type, Value: append([]byte(nil), tlv.Value...)})
+	}
+	return out
 }
 
 // RegisterEventReport registers for WDS indications / RegisterEventReport注册WDS指示

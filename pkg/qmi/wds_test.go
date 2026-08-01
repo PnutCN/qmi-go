@@ -496,6 +496,34 @@ func TestParseRuntimeSettingsStillParsesIPv4AndMTU(t *testing.T) {
 	}
 }
 
+// An undecoded TLV must still reach the caller: the IPv6 P-CSCF list sat in
+// 0x2E undiscovered precisely because unknown TLVs were dropped here.
+func TestParseRuntimeSettingsKeepsRawResponseTLVs(t *testing.T) {
+	unknown := TLV{Type: 0x7F, Value: []byte{0xDE, 0xAD}}
+	settings := parseRuntimeSettings(&Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: TLVWDSMtu, Value: []byte{0xDC, 0x05, 0x00, 0x00}},
+		unknown,
+	}})
+
+	if settings.MTU != 1500 {
+		t.Fatalf("MTU = %d, want 1500", settings.MTU)
+	}
+	got := FindTLV(settings.ResponseTLVs, 0x7F)
+	if got == nil {
+		t.Fatal("undecoded TLV 0x7F was dropped")
+	}
+	if len(got.Value) != 2 || got.Value[0] != 0xDE || got.Value[1] != 0xAD {
+		t.Fatalf("TLV 0x7F = %v, want [222 173]", got.Value)
+	}
+
+	// The copy must not alias the response buffer, which the caller may reuse.
+	unknown.Value[0] = 0x00
+	if FindTLV(settings.ResponseTLVs, 0x7F).Value[0] != 0xDE {
+		t.Fatal("ResponseTLVs aliases the response buffer")
+	}
+}
+
 // TestParseRuntimeSettingsPCSCFUsingPCOAndIMCNZeroValues covers the false
 // paths for the two boolean flags, which were previously only exercised with
 // 0x01: an explicit 0x00 byte must parse as false, and the flags must also
