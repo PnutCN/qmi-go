@@ -285,6 +285,46 @@ func TestStartNetworkInterfaceProfileIndex(t *testing.T) {
 	}
 }
 
+// TLV 0x35 is part of the call configuration the modem compares when it
+// refuses a request as duplicating an existing call, so it must be absent
+// unless the caller explicitly asked for a call type -- an unrequested 0
+// would silently declare every call a laptop call.
+func TestStartNetworkInterfaceCallTypeTLV(t *testing.T) {
+	tests := []struct {
+		name        string
+		callType    uint8
+		hasCallType bool
+		wantPresent bool
+		wantValue   byte
+	}{
+		{name: "absent when not requested", hasCallType: false, wantPresent: false},
+		{name: "laptop is sent even though it is zero", callType: WDSCallTypeLaptop, hasCallType: true, wantPresent: true, wantValue: 0},
+		{name: "embedded", callType: WDSCallTypeEmbedded, hasCallType: true, wantPresent: true, wantValue: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlvs := buildStartNetworkTLVs("ims", "", "", 0, IpFamilyV6, 2, 0, tt.callType, tt.hasCallType)
+			tlv := FindTLV(tlvs, 0x35)
+			if !tt.wantPresent {
+				if tlv != nil {
+					t.Fatalf("TLV 0x35 present with value %v, want absent", tlv.Value)
+				}
+				return
+			}
+			if tlv == nil {
+				t.Fatal("TLV 0x35 absent, want present")
+			}
+			if len(tlv.Value) != 1 || tlv.Value[0] != tt.wantValue {
+				t.Fatalf("TLV 0x35 = %v, want [%d]", tlv.Value, tt.wantValue)
+			}
+			if profile := FindTLV(tlvs, 0x31); profile == nil || profile.Value[0] != 2 {
+				t.Fatalf("profile index TLV lost: %v", profile)
+			}
+		})
+	}
+}
+
 // TestParseRuntimeSettingsPCSCFIPv6List pins the decoding of TLV 0x2E against
 // the exact bytes an EM9190 returned on a China Unicom IMS bearer, and against
 // the malformed shapes a walker over attacker- or firmware-supplied lengths

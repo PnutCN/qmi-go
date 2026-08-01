@@ -92,9 +92,13 @@ const (
 // ============================================================================
 
 type WDSService struct {
-	client               *Client
-	clientID             uint8
-	ProfileIndex         uint8
+	client       *Client
+	clientID     uint8
+	ProfileIndex uint8
+	// CallType is WDS TLV 0x35. HasCallType gates it because
+	// WDSCallTypeLaptop is 0, so the zero value cannot mean "unset".
+	CallType             uint8
+	HasCallType          bool
 	TechnologyPreference uint16 // Bitmask: 0x8000=3GPP, 0x4000=3GPP2
 }
 
@@ -150,6 +154,11 @@ const (
 // index alike. The collision is on the PDN configuration, not the data
 // endpoint, so binding a different mux cannot work around it and retrying
 // cannot clear it -- the modem's IMS stack has to release the APN first.
+//
+// Re-checked on August 1, 2026 on profile 2 / IPv6 with TLV 0x35 explicitly
+// set to WDSCallTypeEmbedded: the modem still returned internal call end
+// reason 241. On this firmware, call type is not enough to distinguish a host
+// IMS PDN from the modem's own held IMS call.
 func (r *CallEndReason) IsInterfaceInUseConfigMatch() bool {
 	return r != nil &&
 		r.Type == CallEndReasonTypeInternal &&
@@ -400,6 +409,35 @@ func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, user
 		// Non-fatal, continue / 非致命，继续
 	}
 
+	tlvs := buildStartNetworkTLVs(apn, username, password, authType, ipFamily, w.ProfileIndex, w.TechnologyPreference, w.CallType, w.HasCallType)
+
+	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSStartNetworkInterface, tlvs)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := resp.CheckResult(); err != nil {
+		var reason *CallEndReason
+		if verboseTLV := FindTLV(resp.TLVs, 0x11); verboseTLV != nil && len(verboseTLV.Value) >= 4 {
+			reason = &CallEndReason{
+				Type: binary.LittleEndian.Uint16(verboseTLV.Value[0:2]),
+				Code: binary.LittleEndian.Uint16(verboseTLV.Value[2:4]),
+			}
+		}
+		return 0, &StartNetworkError{Err: err, Reason: reason}
+	}
+
+	// Get handle from TLV 0x01 / 从TLV 0x01获取句柄
+	handleTLV := FindTLV(resp.TLVs, 0x01)
+	if handleTLV == nil || len(handleTLV.Value) < 4 {
+		return 0, fmt.Errorf("no handle in response")
+	}
+
+	handle := binary.LittleEndian.Uint32(handleTLV.Value)
+	return handle, nil
+}
+
+func buildStartNetworkTLVs(apn, username, password string, authType, ipFamily, profileIndex uint8, technologyPreference uint16, callType uint8, hasCallType bool) []TLV {
 	var tlvs []TLV
 
 	// TLV 0x14: APN name / TLV 0x14: APN名称
@@ -426,41 +464,24 @@ func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, user
 	tlvs = append(tlvs, NewTLVUint8(0x19, ipFamily))
 
 	// TLV 0x31: 3GPP Profile Index / 3GPP Profile 索引 (Optional)
-	if w.ProfileIndex > 0 {
-		tlvs = append(tlvs, NewTLVUint8(0x31, w.ProfileIndex))
+	if profileIndex > 0 {
+		tlvs = append(tlvs, NewTLVUint8(0x31, profileIndex))
 	}
 
 	// TLV 0x34: Technology Preference / 技术偏好 (Optional)
-	if w.TechnologyPreference > 0 {
+	if technologyPreference > 0 {
 		buf := make([]byte, 2)
-		binary.LittleEndian.PutUint16(buf, w.TechnologyPreference)
+		binary.LittleEndian.PutUint16(buf, technologyPreference)
 		tlvs = append(tlvs, TLV{Type: 0x34, Value: buf})
 	}
-
-	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSStartNetworkInterface, tlvs)
-	if err != nil {
-		return 0, err
+	// TLV 0x35 tells the modem whether this call belongs to the modem itself
+	// or to a tethered host. It is part of the configuration the modem
+	// compares when refusing a duplicate call, so declaring it can be what
+	// separates a host IMS PDN from the modem's own.
+	if hasCallType {
+		tlvs = append(tlvs, NewTLVUint8(0x35, callType))
 	}
-
-	if err := resp.CheckResult(); err != nil {
-		var reason *CallEndReason
-		if verboseTLV := FindTLV(resp.TLVs, 0x11); verboseTLV != nil && len(verboseTLV.Value) >= 4 {
-			reason = &CallEndReason{
-				Type: binary.LittleEndian.Uint16(verboseTLV.Value[0:2]),
-				Code: binary.LittleEndian.Uint16(verboseTLV.Value[2:4]),
-			}
-		}
-		return 0, &StartNetworkError{Err: err, Reason: reason}
-	}
-
-	// Get handle from TLV 0x01 / 从TLV 0x01获取句柄
-	handleTLV := FindTLV(resp.TLVs, 0x01)
-	if handleTLV == nil || len(handleTLV.Value) < 4 {
-		return 0, fmt.Errorf("no handle in response")
-	}
-
-	handle := binary.LittleEndian.Uint32(handleTLV.Value)
-	return handle, nil
+	return tlvs
 }
 
 // StopNetworkInterface terminates a data call / StopNetworkInterface终止数据呼叫
