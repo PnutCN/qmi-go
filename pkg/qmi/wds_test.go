@@ -1,8 +1,11 @@
 package qmi
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
+	"net"
+	"reflect"
 	"testing"
 )
 
@@ -235,6 +238,138 @@ func TestParseRuntimeSettingsTruncatedPCSCFListIsIgnored(t *testing.T) {
 	}
 }
 
+func TestStartNetworkInterfaceProfileIndex(t *testing.T) {
+	tests := []struct {
+		name         string
+		profileIndex uint8
+		wantProfile  []byte
+	}{
+		{name: "zero omits profile TLV", profileIndex: 0, wantProfile: nil},
+		{name: "nonzero includes profile TLV", profileIndex: 7, wantProfile: []byte{7}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newUIMUnitTestClient()
+			stop := serveUIMUnitTestRequests(t, client, func(req *Packet) *Packet {
+				switch req.MessageID {
+				case WDSSetClientIPFamilyPref:
+					return &Packet{TLVs: []TLV{successResultTLV()}}
+				case WDSStartNetworkInterface:
+					tlv := FindTLV(req.TLVs, 0x31)
+					if tt.wantProfile == nil {
+						if legacy := FindTLV(req.TLVs, 0x30); legacy != nil {
+							t.Fatalf("legacy profile TLV = %+v, want absent", legacy)
+						}
+						if tlv != nil {
+							t.Fatalf("3GPP profile TLV = %+v, want absent", tlv)
+						}
+					} else if tlv == nil || !sameBytes(tlv.Value, tt.wantProfile) {
+						t.Fatalf("3GPP profile TLV = %+v, want %v", tlv, tt.wantProfile)
+					} else if legacy := FindTLV(req.TLVs, 0x30); legacy != nil {
+						t.Fatalf("legacy profile TLV = %+v, want absent", legacy)
+					}
+					return &Packet{TLVs: []TLV{successResultTLV(), wdsTLVUint32(0x01, 42)}}
+				default:
+					t.Fatalf("unexpected message ID 0x%04x", req.MessageID)
+					return nil
+				}
+			})
+			defer stop()
+
+			wds := &WDSService{client: client, clientID: 1, ProfileIndex: tt.profileIndex}
+			if _, err := wds.StartNetworkInterface(context.Background(), "ims", "", "", 0, IpFamilyV6); err != nil {
+				t.Fatalf("StartNetworkInterface() error = %v", err)
+			}
+		})
+	}
+}
+
+// TestParseRuntimeSettingsPCSCFIPv6List pins the decoding of TLV 0x2E against
+// the exact bytes an EM9190 returned on a China Unicom IMS bearer, and against
+// the malformed shapes a walker over attacker- or firmware-supplied lengths
+// has to survive.
+//
+// This replaces an earlier test that asserted 0x2E must be ignored. That
+// assertion was written without hardware evidence; a dump of every TLV the
+// modem returns then showed 0x2E carrying exactly the P-CSCF addresses the
+// same bearer reports via AT+CGCONTRDP, so ignoring it was throwing away the
+// only source of an IPv6 P-CSCF that QMI has.
+func TestParseRuntimeSettingsPCSCFIPv6List(t *testing.T) {
+	ip := func(s string) []byte { return net.ParseIP(s).To16() }
+
+	tests := []struct {
+		name  string
+		value []byte
+		want  []string
+	}{
+		{
+			name: "two addresses, as measured on an EM9190",
+			value: concatBytes([]byte{0x02},
+				ip("2408:8141:e001:2000::50"), ip("2408:8141:e001:2000::60")),
+			want: []string{"2408:8141:e001:2000::50", "2408:8141:e001:2000::60"},
+		},
+		{
+			name:  "empty list: the shape sent when the network delivered no P-CSCF",
+			value: []byte{0x00},
+			want:  nil,
+		},
+		{
+			name:  "count overstates the entries actually present",
+			value: concatBytes([]byte{0x03}, ip("2408:8141:e001:2000::50")),
+			want:  []string{"2408:8141:e001:2000::50"},
+		},
+		{
+			name:  "trailing entry is truncated mid-address",
+			value: concatBytes([]byte{0x02}, ip("2408:8141:e001:2000::50"), []byte{0x24, 0x08}),
+			want:  []string{"2408:8141:e001:2000::50"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := parseRuntimeSettings(&Packet{TLVs: []TLV{
+				successResultTLV(),
+				{Type: TLVWDSPCSCFServerAddrListV6, Value: tt.value},
+			}})
+			var got []string
+			for _, addr := range settings.PCSCFv6 {
+				got = append(got, addr.String())
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("PCSCFv6 = %v, want %v", got, tt.want)
+			}
+			if len(settings.PCSCFv4) != 0 {
+				t.Fatalf("IPv6 list must not leak into PCSCFv4: %v", settings.PCSCFv4)
+			}
+		})
+	}
+}
+
+// The two address lists are separate TLVs and must stay in separate fields:
+// a bearer reporting one must never populate the other.
+func TestParseRuntimeSettingsKeepsPCSCFFamiliesSeparate(t *testing.T) {
+	settings := parseRuntimeSettings(&Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: TLVWDSPCSCFServerAddrList, Value: []byte{0x01, 0x04, 0x03, 0x02, 0x0A}},
+		{Type: TLVWDSPCSCFServerAddrListV6, Value: append([]byte{0x01}, net.ParseIP("2408:8141:e001:2000::50").To16()...)},
+	}})
+	if len(settings.PCSCFv4) != 1 || settings.PCSCFv4[0].String() != "10.2.3.4" {
+		t.Fatalf("PCSCFv4 = %v, want [10.2.3.4]", settings.PCSCFv4)
+	}
+	if len(settings.PCSCFv6) != 1 || settings.PCSCFv6[0].String() != "2408:8141:e001:2000::50" {
+		t.Fatalf("PCSCFv6 = %v, want [2408:8141:e001:2000::50]", settings.PCSCFv6)
+	}
+}
+
+func concatBytes(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
 // TestParseRuntimeSettingsPCSCFDomainListTruncation pins the safety of the
 // TLVWDSPCSCFDomainList walker against malformed input: an overstated entry
 // count, a string length that runs past the end of the TLV body, and a
@@ -372,5 +507,38 @@ func TestParsePacketServiceStatusIndication(t *testing.T) {
 	}
 	if status != StatusAuthenticating {
 		t.Fatalf("unexpected packet service status indication: %v", status)
+	}
+}
+
+// Call end reason codes are only meaningful together with their type: 241
+// under the internal type means the modem holds a matching call, while the
+// same number under another type is unrelated. These predicates must key on
+// both, or a 3GPP reason would be misread as a local modem condition.
+func TestCallEndReasonPredicatesKeyOnTypeAndCode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		reason       *CallEndReason
+		wantInUse    bool
+		wantIPFamily bool
+	}{
+		{"nil", nil, false, false},
+		{"interface in use", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, true, false},
+		{"ipv4 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv4CallDisallowed}, false, true},
+		{"ipv6 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv6CallDisallowed}, false, true},
+		// Measured on an EM9190: the same IPv4-on-an-IPv6-IMS-APN request that
+		// an EC25 refuses with 208 comes back as 231 here.
+		{"ip version mismatch", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalIPVersionMismatch}, false, true},
+		{"same codes under 3gpp type", &CallEndReason{Type: 6, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, false, false},
+		{"3gpp regular deactivation", &CallEndReason{Type: 6, Code: 36}, false, false},
+		{"unknown internal code", &CallEndReason{Type: CallEndReasonTypeInternal, Code: 1}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.reason.IsInterfaceInUseConfigMatch(); got != tc.wantInUse {
+				t.Fatalf("IsInterfaceInUseConfigMatch() = %v, want %v", got, tc.wantInUse)
+			}
+			if got := tc.reason.IsIPFamilyDisallowed(); got != tc.wantIPFamily {
+				t.Fatalf("IsIPFamilyDisallowed() = %v, want %v", got, tc.wantIPFamily)
+			}
+		})
 	}
 }

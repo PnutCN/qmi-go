@@ -136,6 +136,28 @@ func TestOpenPDNBringsPhysicalMasterUpBeforeCreatingMux(t *testing.T) {
 	}
 }
 
+func TestOpenPDNPassesProfileIndexToStart(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	var got PDNRequest
+	m.pdnOps.start = func(_ context.Context, _ *qmi.WDSService, req PDNRequest) (uint32, error) {
+		got = req
+		return 42, nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, ProfileIndex: 7,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if got.ProfileIndex != 7 {
+		t.Fatalf("start request ProfileIndex = %d, want 7", got.ProfileIndex)
+	}
+}
+
 func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 	return pdnOps{
 		bringUpMaster: func(string) error { return nil },

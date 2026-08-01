@@ -23,6 +23,7 @@ type PDNRequest struct {
 	APN          string
 	MuxID        uint8
 	IPFamily     uint8
+	ProfileIndex uint8
 	EndpointType uint32
 	InterfaceID  uint32
 	ClientType   uint32
@@ -65,6 +66,7 @@ func defaultPDNOps() pdnOps {
 			return wds.BindMuxDataPort(ctx, binding)
 		},
 		start: func(ctx context.Context, wds *qmi.WDSService, req PDNRequest) (uint32, error) {
+			wds.ProfileIndex = req.ProfileIndex
 			return wds.StartNetworkInterface(ctx, req.APN, "", "", 0, req.IPFamily)
 		},
 		settings: func(ctx context.Context, wds *qmi.WDSService, family uint8) (*qmi.RuntimeSettings, error) {

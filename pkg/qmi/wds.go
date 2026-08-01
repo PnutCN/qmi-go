@@ -46,14 +46,15 @@ const (
 	TLVWDSIPv6DelegatedPrefix uint8 = 0x57
 
 	// P-CSCF / IMCN TLVs in WDS Get Current Settings.
-	// libqmi data/qmi-service-wds.json: 0x22/0x23/0x24 carry P-CSCF discovery,
-	// 0x2C flags the bearer as IMS-dedicated. There is no IPv6 P-CSCF address
-	// TLV in the WDS service at all — IPv6 P-CSCF must come from the domain
-	// name list (0x24) or from carrier configuration.
-	TLVWDSPCSCFUsingPCO       uint8 = 0x22
-	TLVWDSPCSCFServerAddrList uint8 = 0x23
-	TLVWDSPCSCFDomainList     uint8 = 0x24
-	TLVWDSIMCNFlag            uint8 = 0x2C
+	// libqmi data/qmi-service-wds.json: 0x22/0x23/0x24 carry P-CSCF discovery
+	// and 0x2C flags the bearer as IMS-dedicated. 0x2E carries the IPv6
+	// address list; libqmi has no definition for it, so see
+	// TLVWDSPCSCFServerAddrListV6 for where its wire format comes from.
+	TLVWDSPCSCFUsingPCO         uint8 = 0x22
+	TLVWDSPCSCFServerAddrList   uint8 = 0x23
+	TLVWDSPCSCFDomainList       uint8 = 0x24
+	TLVWDSIMCNFlag              uint8 = 0x2C
+	TLVWDSPCSCFServerAddrListV6 uint8 = 0x2E
 )
 
 // Runtime settings mask bits / 运行时设置掩码位
@@ -109,6 +110,50 @@ func (e *OutOfCallError) Error() string {
 type CallEndReason struct {
 	Type uint16
 	Code uint16
+}
+
+// Verbose call end reason types and codes, from libqmi's
+// QmiWdsVerboseCallEndReasonType / QmiWdsVerboseCallEndReason*
+// (src/libqmi-glib/qmi-enums-wds.h). Only the values callers act on are
+// named; everything else stays an opaque number in the error string.
+//
+// Type matters as much as code: the code space is per-type, so 36 under
+// CallEndReasonTypeInternal and 36 under type 6 (3GPP, where it means
+// regular deactivation) are unrelated. Always compare both.
+const (
+	// CallEndReasonTypeInternal marks reasons produced inside the modem,
+	// before or instead of anything the network said.
+	CallEndReasonTypeInternal uint16 = 2
+
+	CallEndReasonInternalPDNIPv4CallDisallowed     uint16 = 208
+	CallEndReasonInternalPDNIPv6CallDisallowed     uint16 = 210
+	CallEndReasonInternalIPVersionMismatch         uint16 = 231
+	CallEndReasonInternalInterfaceInUseConfigMatch uint16 = 241
+)
+
+// IsInterfaceInUseConfigMatch reports that the modem already holds a call
+// whose configuration matches this request, so the request never reached the
+// network at all.
+//
+// Measured on an EC25 whose own IMS stack was registered and holding the
+// "ims" APN: a host WDS client is refused this way on the default data
+// endpoint AND on every QMAP mux alike, and by APN string or by 3GPP profile
+// index alike. The collision is on the PDN configuration, not the data
+// endpoint, so binding a different mux cannot work around it and retrying
+// cannot clear it -- the modem's IMS stack has to release the APN first.
+func (r *CallEndReason) IsInterfaceInUseConfigMatch() bool {
+	return r != nil &&
+		r.Type == CallEndReasonTypeInternal &&
+		r.Code == CallEndReasonInternalInterfaceInUseConfigMatch
+}
+
+func (r *CallEndReason) IsIPFamilyDisallowed() bool {
+	if r == nil || r.Type != CallEndReasonTypeInternal {
+		return false
+	}
+	return r.Code == CallEndReasonInternalPDNIPv4CallDisallowed ||
+		r.Code == CallEndReasonInternalPDNIPv6CallDisallowed ||
+		r.Code == CallEndReasonInternalIPVersionMismatch
 }
 
 type StartNetworkError struct {
@@ -351,9 +396,9 @@ func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, user
 	// TLV 0x19: IP family preference / TLV 0x19: IP族偏好
 	tlvs = append(tlvs, NewTLVUint8(0x19, ipFamily))
 
-	// TLV 0x30: Profile Index / Profile 索引 (Optional)
+	// TLV 0x31: 3GPP Profile Index / 3GPP Profile 索引 (Optional)
 	if w.ProfileIndex > 0 {
-		tlvs = append(tlvs, NewTLVUint8(0x30, w.ProfileIndex))
+		tlvs = append(tlvs, NewTLVUint8(0x31, w.ProfileIndex))
 	}
 
 	// TLV 0x34: Technology Preference / 技术偏好 (Optional)
@@ -486,6 +531,12 @@ type RuntimeSettings struct {
 	// PCSCFv4 holds the IPv4 P-CSCF addresses delivered by the network.
 	// PCSCFv4 保存网络下发的 IPv4 P-CSCF 地址。
 	PCSCFv4 []net.IP
+	// PCSCFv6 holds the IPv6 P-CSCF addresses delivered by the network
+	// (TLV 0x2E). Only one family arrives per bearer: an IPv6 IMS PDN
+	// populates this and leaves PCSCFv4 empty.
+	// PCSCFv6 保存网络下发的 IPv6 P-CSCF 地址（TLV 0x2E）。每条承载只会下发
+	// 一个地址族：IPv6 的 IMS PDN 填充本字段，PCSCFv4 为空。
+	PCSCFv6 []net.IP
 	// PCSCFDomains holds P-CSCF FQDNs, which must be resolved by the caller.
 	// PCSCFDomains 保存 P-CSCF 域名，需由调用方自行解析。
 	PCSCFDomains []string
@@ -634,6 +685,18 @@ func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 		for i := 0; i < count && (i+1)*4 <= len(body); i++ {
 			v := body[i*4 : i*4+4]
 			settings.PCSCFv4 = append(settings.PCSCFv4, net.IPv4(v[3], v[2], v[1], v[0]))
+		}
+	}
+	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFServerAddrListV6); tlv != nil && len(tlv.Value) >= 1 {
+		// Elements are in network byte order, unlike the little-endian words
+		// of the IPv4 list above -- confirmed against the addresses the same
+		// bearer reports via AT+CGCONTRDP. Each is copied out because net.IP
+		// aliases the slice it is built from, and tlv.Value belongs to the
+		// response buffer.
+		count := int(tlv.Value[0])
+		body := tlv.Value[1:]
+		for i := 0; i < count && (i+1)*16 <= len(body); i++ {
+			settings.PCSCFv6 = append(settings.PCSCFv6, net.IP(append([]byte(nil), body[i*16:(i+1)*16]...)))
 		}
 	}
 	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFDomainList); tlv != nil && len(tlv.Value) >= 1 {
