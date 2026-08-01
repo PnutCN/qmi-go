@@ -181,6 +181,52 @@ func TestOpenPDNPassesCallTypeToStart(t *testing.T) {
 	}
 }
 
+func TestOpenPDNIsolatesUserspaceInterfaceBeforeBringUp(t *testing.T) {
+	var order []string
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.prepareUserspace = func(iface string) error {
+		order = append(order, "prepare:"+iface)
+		return nil
+	}
+	m.pdnOps.bringUp = func(iface string) error {
+		order = append(order, "bringUp:"+iface)
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, UserspaceOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	want := []string{"prepare:qmimux1", "bringUp:qmimux1"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+}
+
+func TestOpenPDNSkipsIsolationUnlessUserspaceOnly(t *testing.T) {
+	called := false
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.prepareUserspace = func(string) error {
+		called = true
+		return nil
+	}
+
+	if _, err := m.OpenPDN(context.Background(), PDNRequest{APN: "internet", MuxID: 2, IPFamily: qmi.IpFamilyV4}); err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if called {
+		t.Fatal("interface was isolated without UserspaceOnly")
+	}
+}
+
 func TestDefaultStartAppliesCallTypeToWDSService(t *testing.T) {
 	embedded := qmi.WDSCallTypeEmbedded
 	ops := defaultPDNOps()

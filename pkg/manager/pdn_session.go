@@ -30,6 +30,9 @@ type PDNRequest struct {
 	EndpointType uint32
 	InterfaceID  uint32
 	ClientType   uint32
+	// UserspaceOnly marks a PDN whose IP layer lives in a userspace netstack,
+	// so the kernel must not autoconfigure the interface from carrier RAs.
+	UserspaceOnly bool
 }
 
 type PDNSnapshot struct {
@@ -46,17 +49,18 @@ type PDNSession interface {
 }
 
 type pdnOps struct {
-	bringUpMaster func(string) error
-	addMux        func(master string, muxID uint8) (string, error)
-	deleteMux     func(master string, muxID uint8) error
-	leaseWDS      func(context.Context, *qmi.Client) (*qmi.WDSService, error)
-	bind          func(context.Context, *qmi.WDSService, qmi.MuxBinding) error
-	start         func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error)
-	settings      func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error)
-	bringUp       func(string) error
-	bringDown     func(string) error
-	stop          func(context.Context, *qmi.WDSService, uint32) error
-	releaseWDS    func(*qmi.WDSService) error
+	bringUpMaster    func(string) error
+	addMux           func(master string, muxID uint8) (string, error)
+	deleteMux        func(master string, muxID uint8) error
+	leaseWDS         func(context.Context, *qmi.Client) (*qmi.WDSService, error)
+	bind             func(context.Context, *qmi.WDSService, qmi.MuxBinding) error
+	start            func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error)
+	settings         func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error)
+	prepareUserspace func(string) error
+	bringUp          func(string) error
+	bringDown        func(string) error
+	stop             func(context.Context, *qmi.WDSService, uint32) error
+	releaseWDS       func(*qmi.WDSService) error
 }
 
 func defaultPDNOps() pdnOps {
@@ -78,8 +82,9 @@ func defaultPDNOps() pdnOps {
 		settings: func(ctx context.Context, wds *qmi.WDSService, family uint8) (*qmi.RuntimeSettings, error) {
 			return wds.GetRuntimeSettings(ctx, family)
 		},
-		bringUp:   netcfg.BringUp,
-		bringDown: netcfg.BringDown,
+		prepareUserspace: netcfg.PrepareUserspaceOnly,
+		bringUp:          netcfg.BringUp,
+		bringDown:        netcfg.BringDown,
 		stop: func(ctx context.Context, wds *qmi.WDSService, handle uint32) error {
 			return wds.StopNetworkInterface(ctx, handle)
 		},
@@ -110,6 +115,9 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 	}
 	if ops.settings == nil {
 		ops.settings = defaults.settings
+	}
+	if ops.prepareUserspace == nil {
+		ops.prepareUserspace = defaults.prepareUserspace
 	}
 	if ops.bringUp == nil {
 		ops.bringUp = defaults.bringUp
@@ -217,6 +225,11 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	}
 	if settings == nil {
 		return nil, errors.New("qmi manager: PDN settings are empty")
+	}
+	if req.UserspaceOnly {
+		if err := ops.prepareUserspace(iface); err != nil {
+			return nil, fmt.Errorf("qmi manager: isolate userspace-only PDN interface: %w", err)
+		}
 	}
 	if err := ops.bringUp(iface); err != nil {
 		return nil, fmt.Errorf("qmi manager: bring PDN interface up: %w", err)
