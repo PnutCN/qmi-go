@@ -43,6 +43,12 @@ func TestDisableIPv6AutoconfigurationToleratesMissingSettings(t *testing.T) {
 	if err := disableIPv6AutoconfigurationAt(root, "qmimux0"); err != nil {
 		t.Fatalf("missing sysctls must be tolerated, got %v", err)
 	}
+	for _, name := range []string{"accept_ra", "accept_ra_defrtr", "autoconf"} {
+		path := filepath.Join(root, "qmimux0", name)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s unexpectedly exists after tolerant write, stat err = %v", path, err)
+		}
+	}
 }
 
 func TestValidateUserspaceInterfaceNameRejectsUnsafeInterfaceNames(t *testing.T) {

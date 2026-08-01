@@ -155,10 +155,11 @@ const (
 // endpoint, so binding a different mux cannot work around it and retrying
 // cannot clear it -- the modem's IMS stack has to release the APN first.
 //
-// Re-checked on August 1, 2026 on profile 2 / IPv6 with TLV 0x35 explicitly
-// set to WDSCallTypeEmbedded: the modem still returned internal call end
-// reason 241. On this firmware, call type is not enough to distinguish a host
-// IMS PDN from the modem's own held IMS call.
+// Re-checked on the Sierra Wireless EM9190 on August 1, 2026 with profile 2
+// / IPv6 in both host-visible variants of TLV 0x35: omitting the TLV entirely
+// and sending WDSCallTypeEmbedded (1) both returned the same internal call
+// end reason (type 2, code 241). On that hardware/firmware, TLV 0x35 does not
+// distinguish a host IMS PDN from the modem's own held IMS call either.
 func (r *CallEndReason) IsInterfaceInUseConfigMatch() bool {
 	return r != nil &&
 		r.Type == CallEndReasonTypeInternal &&

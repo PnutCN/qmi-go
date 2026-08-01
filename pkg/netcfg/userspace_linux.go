@@ -44,10 +44,20 @@ func disableIPv6AutoconfigurationAt(root, ifname string) error {
 	var result error
 	for _, setting := range []string{"accept_ra", "accept_ra_defrtr", "autoconf"} {
 		path := filepath.Join(root, ifname, setting)
-		if err := os.WriteFile(path, []byte("0\n"), 0); err != nil {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
+			result = errors.Join(result, fmt.Errorf("netcfg: disable IPv6 %s on %s: %w", setting, ifname, err))
+			continue
+		}
+
+		writeErr := error(nil)
+		if _, err := f.WriteString("0\n"); err != nil {
+			writeErr = err
+		}
+		if err := errors.Join(writeErr, f.Close()); err != nil {
 			result = errors.Join(result, fmt.Errorf("netcfg: disable IPv6 %s on %s: %w", setting, ifname, err))
 		}
 	}

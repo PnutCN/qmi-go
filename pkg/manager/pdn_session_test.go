@@ -273,6 +273,74 @@ func TestDefaultStartAppliesCallTypeToWDSService(t *testing.T) {
 	}
 }
 
+func TestDefaultStartClearsCallTypeWhenRequestOmitsIt(t *testing.T) {
+	embedded := qmi.WDSCallTypeEmbedded
+	ops := defaultPDNOps()
+	client := newUIMReadinessTestClient(t)
+	startRequests := 0
+	serveUIMReadinessTestRequests(t, client, func(req *qmi.Packet) (*qmi.Packet, error) {
+		switch req.MessageID {
+		case qmi.WDSSetClientIPFamilyPref:
+			return &qmi.Packet{TLVs: []qmi.TLV{{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}}}}, nil
+		case qmi.WDSStartNetworkInterface:
+			startRequests++
+			switch startRequests {
+			case 1:
+				if tlv := qmi.FindTLV(req.TLVs, 0x31); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != 2 {
+					t.Fatalf("first profile TLV = %v, want [2]", tlv)
+				}
+				if tlv := qmi.FindTLV(req.TLVs, 0x35); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != qmi.WDSCallTypeEmbedded {
+					t.Fatalf("first call type TLV = %v, want [%d]", tlv, qmi.WDSCallTypeEmbedded)
+				}
+			case 2:
+				if tlv := qmi.FindTLV(req.TLVs, 0x31); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != 3 {
+					t.Fatalf("second profile TLV = %v, want [3]", tlv)
+				}
+				if tlv := qmi.FindTLV(req.TLVs, 0x35); tlv != nil {
+					t.Fatalf("second call type TLV = %v, want absent", tlv)
+				}
+			default:
+				t.Fatalf("unexpected start request #%d", startRequests)
+			}
+			return &qmi.Packet{TLVs: []qmi.TLV{
+				{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}},
+				{Type: 0x01, Value: []byte{byte(0x29 + startRequests), 0x00, 0x00, 0x00}},
+			}}, nil
+		default:
+			t.Fatalf("unexpected QMI message 0x%04x", req.MessageID)
+			return nil, nil
+		}
+	})
+
+	wds := &qmi.WDSService{}
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("client"), reflect.ValueOf(client))
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("clientID"), reflect.ValueOf(uint8(1)))
+
+	if _, err := ops.start(context.Background(), wds, PDNRequest{
+		APN: "ims", IPFamily: qmi.IpFamilyV6, ProfileIndex: 2, CallType: &embedded,
+	}); err != nil {
+		t.Fatalf("first default start error = %v", err)
+	}
+	if _, err := ops.start(context.Background(), wds, PDNRequest{
+		APN: "ims", IPFamily: qmi.IpFamilyV6, ProfileIndex: 3,
+	}); err != nil {
+		t.Fatalf("second default start error = %v", err)
+	}
+
+	if startRequests != 2 {
+		t.Fatalf("start requests = %d, want 2", startRequests)
+	}
+	if wds.HasCallType {
+		t.Fatalf("service HasCallType = true after nil request, want false")
+	}
+	if wds.CallType != 0 {
+		t.Fatalf("service CallType = %d after nil request, want 0", wds.CallType)
+	}
+	if wds.ProfileIndex != 3 {
+		t.Fatalf("service profile index = %d after second request, want 3", wds.ProfileIndex)
+	}
+}
+
 func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 	return pdnOps{
 		bringUpMaster: func(string) error { return nil },

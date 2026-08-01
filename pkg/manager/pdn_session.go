@@ -76,6 +76,8 @@ func defaultPDNOps() pdnOps {
 			wds.ProfileIndex = req.ProfileIndex
 			if req.CallType != nil {
 				wds.CallType, wds.HasCallType = *req.CallType, true
+			} else {
+				wds.CallType, wds.HasCallType = 0, false
 			}
 			return wds.StartNetworkInterface(ctx, req.APN, "", "", 0, req.IPFamily)
 		},
