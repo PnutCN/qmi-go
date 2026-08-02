@@ -28,8 +28,11 @@ type PDNRequest struct {
 	// off entirely, which is not the same as sending WDSCallTypeLaptop.
 	CallType     *uint8
 	EndpointType uint32
-	InterfaceID  uint32
-	ClientType   uint32
+	// InterfaceID is the USB interface number of the modem's data endpoint.
+	// Zero means "discover it from the kernel": zero is never a usable value
+	// for Bind Mux Data Port, so it is free to mean unset.
+	InterfaceID uint32
+	ClientType  uint32
 	// UserspaceOnly marks a PDN whose IP layer lives in a userspace netstack,
 	// so the kernel must not autoconfigure the interface from carrier RAs.
 	UserspaceOnly bool
@@ -56,6 +59,7 @@ type pdnOps struct {
 	bind             func(context.Context, *qmi.WDSService, qmi.MuxBinding) error
 	start            func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error)
 	settings         func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error)
+	discoverEndpoint func(string) (uint32, error)
 	prepareUserspace func(string) error
 	bringUp          func(string) error
 	bringDown        func(string) error
@@ -84,6 +88,7 @@ func defaultPDNOps() pdnOps {
 		settings: func(ctx context.Context, wds *qmi.WDSService, family uint8) (*qmi.RuntimeSettings, error) {
 			return wds.GetRuntimeSettings(ctx, family)
 		},
+		discoverEndpoint: netcfg.DiscoverDataEndpointInterface,
 		prepareUserspace: netcfg.PrepareUserspaceOnly,
 		bringUp:          netcfg.BringUp,
 		bringDown:        netcfg.BringDown,
@@ -117,6 +122,9 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 	}
 	if ops.settings == nil {
 		ops.settings = defaults.settings
+	}
+	if ops.discoverEndpoint == nil {
+		ops.discoverEndpoint = defaults.discoverEndpoint
 	}
 	if ops.prepareUserspace == nil {
 		ops.prepareUserspace = defaults.prepareUserspace
@@ -212,7 +220,15 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	if err != nil {
 		return nil, fmt.Errorf("qmi manager: lease PDN WDS: %w", err)
 	}
-	binding := qmi.MuxBinding{EpType: req.EndpointType, EpIfID: req.InterfaceID, MuxID: req.MuxID, ClientType: req.ClientType}
+	endpointIfID := req.InterfaceID
+	if endpointIfID == 0 {
+		discovered, err := ops.discoverEndpoint(master)
+		if err != nil {
+			return nil, fmt.Errorf("qmi manager: discover data endpoint for %s (set ims.volte.ep_if_id to override): %w", master, err)
+		}
+		endpointIfID = discovered
+	}
+	binding := qmi.MuxBinding{EpType: req.EndpointType, EpIfID: endpointIfID, MuxID: req.MuxID, ClientType: req.ClientType}
 	if err := ops.bind(ctx, wds, binding); err != nil {
 		return nil, fmt.Errorf("qmi manager: bind PDN mux: %w", err)
 	}

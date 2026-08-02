@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
@@ -42,6 +44,7 @@ func TestOpenPDNRollsBackInReverseOrderWhenSettingsFail(t *testing.T) {
 			events = append(events, "settings")
 			return nil, errors.New("settings failed")
 		},
+		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
 		stop: func(context.Context, *qmi.WDSService, uint32) error {
 			events = append(events, "stop")
 			return nil
@@ -341,6 +344,95 @@ func TestDefaultStartClearsCallTypeWhenRequestOmitsIt(t *testing.T) {
 	}
 }
 
+// A configured endpoint must win: a modem that needs a hand-picked value
+// stays serviceable, and discovery must not silently override an operator.
+func TestOpenPDNKeepsConfiguredEndpointInterface(t *testing.T) {
+	discovered := false
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(string) (uint32, error) {
+		discovered = true
+		return 8, nil
+	}
+	var got qmi.MuxBinding
+	m.pdnOps.bind = func(_ context.Context, _ *qmi.WDSService, binding qmi.MuxBinding) error {
+		got = binding
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, EndpointType: 2, InterfaceID: 4,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if discovered {
+		t.Fatal("discovery ran despite a configured InterfaceID")
+	}
+	if got.EpIfID != 4 {
+		t.Fatalf("EpIfID = %d, want the configured 4", got.EpIfID)
+	}
+}
+
+// Unset means ask the kernel. Measured on an EM9190, whose endpoint is 8
+// while the shipped default was 4 -- binding with the wrong number fails with
+// an internal QMI error that says nothing about endpoints.
+func TestOpenPDNDiscoversEndpointInterfaceWhenUnset(t *testing.T) {
+	var askedFor string
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(iface string) (uint32, error) {
+		askedFor = iface
+		return 8, nil
+	}
+	var got qmi.MuxBinding
+	m.pdnOps.bind = func(_ context.Context, _ *qmi.WDSService, binding qmi.MuxBinding) error {
+		got = binding
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, EndpointType: 2,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	// The mux netdev has no USB device of its own; only the master does.
+	if askedFor != "wwan0" {
+		t.Fatalf("discovery asked about %q, want the master interface", askedFor)
+	}
+	if got.EpIfID != 8 {
+		t.Fatalf("EpIfID = %d, want the discovered 8", got.EpIfID)
+	}
+}
+
+// A discovery failure must name the config key that fixes it, because the
+// QMI error it would otherwise produce (internal, on bind) explains nothing.
+func TestOpenPDNSurfacesEndpointDiscoveryFailure(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(string) (uint32, error) {
+		return 0, netcfg.ErrDataEndpointUnavailable
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6})
+	if err == nil {
+		t.Fatal("OpenPDN() = nil error, want the discovery failure surfaced")
+	}
+	if !errors.Is(err, netcfg.ErrDataEndpointUnavailable) {
+		t.Fatalf("err = %v, want it to wrap ErrDataEndpointUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "ep_if_id") {
+		t.Fatalf("err = %v, want it to name the config key that fixes it", err)
+	}
+}
+
 func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 	return pdnOps{
 		bringUpMaster: func(string) error { return nil },
@@ -352,9 +444,10 @@ func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 		settings: func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error) {
 			return &qmi.RuntimeSettings{}, nil
 		},
-		bringUp:    func(string) error { return nil },
-		bringDown:  func(string) error { return nil },
-		stop:       func(context.Context, *qmi.WDSService, uint32) error { return nil },
-		releaseWDS: func(*qmi.WDSService) error { return nil },
+		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
+		bringUp:          func(string) error { return nil },
+		bringDown:        func(string) error { return nil },
+		stop:             func(context.Context, *qmi.WDSService, uint32) error { return nil },
+		releaseWDS:       func(*qmi.WDSService) error { return nil },
 	}
 }
