@@ -390,7 +390,19 @@ func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
 // /sys/class/net/qmimuxN/qmap/mux_id 这一个真实来源，没有回退猜测；找不到就
 // 如实返回空串，调用方据此判断"确实不存在"而不是被一个猜错的名字误导。
 func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string {
-	entries, err := os.ReadDir(sysClassNetRoot)
+	return getQMAPMuxIfaceAt(sysClassNetRoot, masterIface, muxID)
+}
+
+// getQMAPMuxIfaceAt is GetQMAPMuxIface's testable core: root is injectable so
+// tests can point it at a fake sysfs tree instead of the real kernel.
+//
+// masterIface scopes the search via muxBelongsToMaster (the same "lower_*"
+// signal ReconcileResidualMux and DiscoverQMAPTopology use). Without it, a
+// second physical QMI device on the host sharing the same mux_id -- a real
+// case, since mux 1 is the default data connection on every device -- could
+// make this return the wrong device's netdev name.
+func getQMAPMuxIfaceAt(root, masterIface string, muxID uint8) string {
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return ""
 	}
@@ -400,14 +412,11 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 		if !strings.HasPrefix(name, "qmimux") {
 			continue
 		}
-		muxIDPath := filepath.Join(sysClassNetRoot, name, "qmap/mux_id")
-		if data, err := os.ReadFile(muxIDPath); err == nil {
-			val := strings.TrimSpace(string(data))
-			expected := fmt.Sprintf("0x%x", muxID)
-			expectedDec := fmt.Sprintf("%d", muxID)
-			if val == expected || val == expectedDec {
-				return name
-			}
+		if !muxBelongsToMaster(root, name, masterIface) {
+			continue
+		}
+		if id, ok := readQMAPMuxID(root, name); ok && id == muxID {
+			return name
 		}
 	}
 
@@ -440,8 +449,7 @@ func (l *LinuxConfigurator) ReconcileResidualMux(masterIface string, keepMuxIDs 
 		if !strings.HasPrefix(name, "qmimux") {
 			continue
 		}
-		lowerPath := filepath.Join(sysClassNetRoot, name, "lower_"+masterIface)
-		if _, err := os.Stat(lowerPath); os.IsNotExist(err) {
+		if !muxBelongsToMaster(sysClassNetRoot, name, masterIface) {
 			continue // 属于别的主设备
 		}
 		muxIDPath := filepath.Join(sysClassNetRoot, name, "qmap/mux_id")
