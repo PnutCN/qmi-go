@@ -145,6 +145,150 @@ func TestParseCurrentBearerTechnologyResponse(t *testing.T) {
 	}
 }
 
+// TestParseProfileListHandlesVariableLengthNames is the regression test for
+// a real corruption measured on a Quectel EC20F: a fixed 3-byte-per-entry
+// assumption read a nonempty profile name's trailing bytes as the next
+// entry's type/index, producing garbage (Type=112 was observed for what
+// should have been Type=0).
+func TestParseProfileListHandlesVariableLengthNames(t *testing.T) {
+	value := []byte{
+		3,       // count
+		0, 1, 0, // profile 0: type=0 index=1 name=""
+		0, 2, 4, 't', 'e', 's', 't', // profile 1: type=0 index=2 name="test"
+		0, 3, 0, // profile 2: type=0 index=3 name=""
+	}
+	got := parseProfileList([]TLV{{Type: 0x01, Value: value}})
+	want := []ProfileInfo{
+		{Type: 0, Index: 1, Name: ""},
+		{Type: 0, Index: 2, Name: "test"},
+		{Type: 0, Index: 3, Name: ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseProfileList() = %+v, want %+v", got, want)
+	}
+}
+
+func TestParseProfileListEmptyWhenTLVAbsent(t *testing.T) {
+	if got := parseProfileList(nil); got != nil {
+		t.Fatalf("parseProfileList(nil TLVs) = %+v, want nil", got)
+	}
+}
+
+func TestParseProfileListStopsOnTruncatedEntry(t *testing.T) {
+	value := []byte{
+		2,       // count claims 2 entries
+		0, 1, 5, // profile 0 claims a 5-byte name but the buffer ends here
+	}
+	got := parseProfileList([]TLV{{Type: 0x01, Value: value}})
+	if len(got) != 0 {
+		t.Fatalf("parseProfileList() = %+v, want empty (truncated name must not be read past the buffer)", got)
+	}
+}
+
+func TestPickIMSProfileIndexPrefersIMCNFlagOverAPNMatch(t *testing.T) {
+	profiles := []ProfileInfo{{Type: 0, Index: 1}, {Type: 0, Index: 2}}
+	settings := map[uint8]ProfileSettings{
+		1: {APN: "ims", HasIMCNFlag: false},                  // APN matches but no IMCN flag
+		2: {APN: "other", HasIMCNFlag: true, IMCNFlag: true}, // IMCN flag set, different APN
+	}
+	index, found := pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return settings[p.Index], nil
+	}, "ims")
+	if !found || index != 2 {
+		t.Fatalf("index=%d found=%v, want index=2 (IMCN flag must win over APN match)", index, found)
+	}
+}
+
+// TestPickIMSProfileIndexFallsBackToAPNMatch is the regression test for the
+// real-world case that made the IMCN-flag-only version useless: measured on
+// a Quectel EC20F, every profile's IMCN flag read back false, including the
+// carrier-provisioned "ims" one. Without the APN fallback, discovery would
+// report "not found" even though the correct profile is unambiguous from
+// its own APN.
+func TestPickIMSProfileIndexFallsBackToAPNMatch(t *testing.T) {
+	profiles := []ProfileInfo{{Type: 0, Index: 1}, {Type: 0, Index: 2}, {Type: 0, Index: 3}}
+	settings := map[uint8]ProfileSettings{
+		1: {APN: ""},
+		2: {APN: "ims"},
+		3: {APN: "SOS"},
+	}
+	index, found := pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return settings[p.Index], nil
+	}, "ims")
+	if !found || index != 2 {
+		t.Fatalf("index=%d found=%v, want index=2 via APN fallback", index, found)
+	}
+}
+
+func TestPickIMSProfileIndexAPNMatchIsCaseInsensitiveAndTrimmed(t *testing.T) {
+	profiles := []ProfileInfo{{Type: 0, Index: 5}}
+	settings := map[uint8]ProfileSettings{5: {APN: "  IMS  "}}
+	index, found := pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return settings[p.Index], nil
+	}, "ims")
+	if !found || index != 5 {
+		t.Fatalf("index=%d found=%v, want index=5 (case/whitespace-insensitive match)", index, found)
+	}
+}
+
+func TestPickIMSProfileIndexNotFoundWhenNoSignalMatches(t *testing.T) {
+	profiles := []ProfileInfo{{Type: 0, Index: 1}, {Type: 0, Index: 2}}
+	settings := map[uint8]ProfileSettings{
+		1: {APN: ""},
+		2: {APN: "internet"},
+	}
+	if index, found := pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return settings[p.Index], nil
+	}, "ims"); found {
+		t.Fatalf("index=%d found=true, want not found", index)
+	}
+}
+
+func TestPickIMSProfileIndexSkipsSettingsErrorsAndKeepsLooking(t *testing.T) {
+	profiles := []ProfileInfo{{Type: 0, Index: 1}, {Type: 0, Index: 2}}
+	index, found := pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		if p.Index == 1 {
+			return ProfileSettings{}, errors.New("read failed")
+		}
+		return ProfileSettings{APN: "ims"}, nil
+	}, "ims")
+	if !found || index != 2 {
+		t.Fatalf("index=%d found=%v, want index=2 (a settings error on one profile must not abort discovery)", index, found)
+	}
+}
+
+func TestParseProfileSettingsExtractsIMCNFlagAndOtherFields(t *testing.T) {
+	tlvs := []TLV{
+		successResultTLV(),
+		{Type: 0x10, Value: []byte("ims")},
+		{Type: 0x11, Value: []byte{WDSPDPTypeIPv6}},
+		{Type: 0x14, Value: []byte("ims")},
+		{Type: 0x22, Value: []byte{0x01}},
+	}
+	ps := parseProfileSettings(tlvs)
+	if ps.Name != "ims" || ps.APN != "ims" {
+		t.Fatalf("unexpected name/apn: %+v", ps)
+	}
+	if !ps.HasPDPType || ps.PDPType != WDSPDPTypeIPv6 {
+		t.Fatalf("unexpected pdp type: %+v", ps)
+	}
+	if !ps.HasIMCNFlag || !ps.IMCNFlag {
+		t.Fatalf("expected IMCN flag set to true: %+v", ps)
+	}
+}
+
+func TestParseProfileSettingsIMCNFlagFalseAndAbsent(t *testing.T) {
+	falseFlag := parseProfileSettings([]TLV{successResultTLV(), {Type: 0x22, Value: []byte{0x00}}})
+	if !falseFlag.HasIMCNFlag || falseFlag.IMCNFlag {
+		t.Fatalf("expected IMCN flag present and false: %+v", falseFlag)
+	}
+
+	absent := parseProfileSettings([]TLV{successResultTLV()})
+	if absent.HasIMCNFlag {
+		t.Fatalf("expected IMCN flag absent: %+v", absent)
+	}
+}
+
 func TestParseCreateProfileResponse(t *testing.T) {
 	resp := &Packet{
 		TLVs: []TLV{

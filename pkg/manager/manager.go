@@ -2646,6 +2646,55 @@ func dataFormatMatches(current, target qmi.DataFormat) bool {
 		current.DlDataAggregation == target.DlDataAggregation
 }
 
+// modemDataFormatMatches reports whether the modem's current WDA data format
+// already satisfies target, without mutating anything.
+func (m *Manager) modemDataFormatMatches(ctx context.Context, target qmi.DataFormat) (bool, error) {
+	if m.wda == nil {
+		return false, fmt.Errorf("WDA service not available")
+	}
+	getCtx, cancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.StatusCheck)
+	defer cancel()
+	getDataFormat := m.getDataFormatFn
+	if getDataFormat == nil {
+		getDataFormat = m.wda.GetDataFormat
+	}
+	currentFormat, err := getDataFormat(getCtx)
+	if err != nil {
+		return false, err
+	}
+	return dataFormatMatches(*currentFormat, target), nil
+}
+
+// ensureModemDataFormat makes the modem's own WDA data format (link protocol
+// + UL/DL aggregation) match target, reading the current value first so an
+// already-correct modem is left untouched.
+//
+// This is the only place that mutates the modem's aggregation protocol.
+// Both enableRawIP (initial Manager setup, based on the MuxID known when the
+// Manager was constructed) and ConvergeDataPlane (runtime policy changes,
+// e.g. a device discovered with IMS disabled that only learns it needs VoLTE
+// after its card policy resolves) funnel through it, so the kernel-side mux
+// topology decision and the modem-side QMAP framing decision can never drift
+// apart. Before this, only enableRawIP touched the modem's data format, and
+// it never re-ran after the Manager's initial MuxID turned out to be wrong
+// (see the WDSBindMuxDataPort INVALID_ARGUMENT incident this closes) --
+// exactly the class of bug ADR-0008 exists to prevent.
+func (m *Manager) ensureModemDataFormat(ctx context.Context, target qmi.DataFormat) error {
+	if m.wda == nil {
+		return fmt.Errorf("WDA service not available")
+	}
+	if matches, err := m.modemDataFormatMatches(ctx, target); err == nil && matches {
+		return nil
+	}
+	setCtx, cancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.StatusCheck)
+	defer cancel()
+	setDataFormat := m.setDataFormatFn
+	if setDataFormat == nil {
+		setDataFormat = m.wda.SetDataFormat
+	}
+	return setDataFormat(setCtx, target)
+}
+
 // enableRawIP enables RawIP mode on both the modem (WDA) and the kernel interface / 启用RawIP模式：同时在Modem(WDA)和内核接口上启用
 func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
@@ -2695,17 +2744,9 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	target := dataFormatTargetForMux(m.cfg.MuxID)
 
 	// Optimization: Check if already at target in Modem (if WDA available) / 优化：检查Modem中是否已处于目标状态 (如果WDA可用)
-	modemEnabled := false
-	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	getDataFormat := m.getDataFormatFn
-	if getDataFormat == nil {
-		getDataFormat = m.wda.GetDataFormat
-	}
-	if currentFormat, err := getDataFormat(ctx); err == nil {
-		modemEnabled = dataFormatMatches(*currentFormat, target)
-	} else {
-		m.log.WithError(err).Debug("Failed to get current data format, assuming mismatch")
+	modemEnabled, checkErr := m.modemDataFormatMatches(parent, target)
+	if checkErr != nil {
+		m.log.WithError(checkErr).Debug("Failed to get current data format, assuming mismatch")
 	}
 
 	if kernelEnabled && modemEnabled {
@@ -2715,14 +2756,7 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 
 	// 2. Set Modem Data Format to target / 2. 将Modem数据格式设置为目标状态
 	m.log.Infof("Setting modem data format to target (mux=%d)...", m.cfg.MuxID)
-	format := target
-	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	setDataFormat := m.setDataFormatFn
-	if setDataFormat == nil {
-		setDataFormat = m.wda.SetDataFormat
-	}
-	if err := setDataFormat(ctx, format); err != nil {
+	if err := m.ensureModemDataFormat(parent, target); err != nil {
 		m.log.WithError(err).Warn("Failed to set modem data format to target (might already be set or not supported), continuing to force kernel...")
 	} else {
 		m.log.Infof("Modem data format set to target (mux=%d)", m.cfg.MuxID)

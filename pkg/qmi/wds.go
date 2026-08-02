@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 )
 
 const (
@@ -848,100 +849,73 @@ func (s *WDSService) BindMuxDataPort(ctx context.Context, binding MuxBinding) er
 }
 
 // GetProfileList retrieves the list of profiles / GetProfileList 获取 Profile 列表
+//
+// Per the WDS Get Profile List (0x002A) definition, the input is TLV 0x10
+// (Profile Type, guint8) and the output TLV 0x01 (Profile List) is a
+// guint8-count-prefixed array of variable-length entries: Profile Type
+// (guint8) + Profile Index (guint8) + Profile Name (guint8-length-prefixed
+// string). An earlier version of this function guessed at both the input
+// TLV and a fixed 3-byte entry size, which corrupted every entry after the
+// first non-empty name (measured on a Quectel EC20F: type/index bytes of
+// entry N+1 came back as the tail of entry N's name).
 func (s *WDSService) GetProfileList(ctx context.Context, profileType uint8) ([]ProfileInfo, error) {
-	attempts := [][]TLV{
-		nil,
-		{NewTLVUint8(0x11, profileType)},
-		{NewTLVUint8(0x01, profileType)},
+	tlvs := []TLV{NewTLVUint8(0x10, profileType)}
+	resp, err := s.client.SendRequest(ctx, ServiceWDS, s.clientID, WDSGetProfileList, tlvs)
+	if err != nil {
+		return nil, err
+	}
+	if err := resp.CheckResult(); err != nil {
+		return nil, err
 	}
 
-	var lastErr error
-	for _, tlvs := range attempts {
-		resp, err := s.client.SendRequest(ctx, ServiceWDS, s.clientID, WDSGetProfileList, tlvs)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if err := resp.CheckResult(); err != nil {
-			lastErr = err
-			continue
-		}
+	return parseProfileList(resp.TLVs), nil
+}
 
-		if tlv := FindTLV(resp.TLVs, 0x01); tlv != nil && len(tlv.Value) >= 1 {
-			count := int(tlv.Value[0])
-			profiles := make([]ProfileInfo, 0, count)
-
-			if len(tlv.Value) >= 1+count*3 {
-				offset := 1
-				for i := 0; i < count; i++ {
-					if offset+3 > len(tlv.Value) {
-						break
-					}
-					pType := tlv.Value[offset]
-					pIndex := tlv.Value[offset+1]
-					profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex})
-					offset += 3
-				}
-				return profiles, nil
-			}
-
-			if len(tlv.Value) >= 1+count*2 {
-				offset := 1
-				for i := 0; i < count; i++ {
-					if offset+2 > len(tlv.Value) {
-						break
-					}
-					pType := tlv.Value[offset]
-					pIndex := tlv.Value[offset+1]
-					profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex})
-					offset += 2
-				}
-				return profiles, nil
-			}
-
-			return profiles, nil
-		}
-
-		if tlv := FindTLV(resp.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 1 {
-			count := int(tlv.Value[0])
-			offset := 1
-			profiles := make([]ProfileInfo, 0, count)
-			for i := 0; i < count && offset < len(tlv.Value); i++ {
-				if offset+3 > len(tlv.Value) {
-					break
-				}
-				pType := tlv.Value[offset]
-				pIndex := tlv.Value[offset+1]
-				pNameLen := int(tlv.Value[offset+2])
-				offset += 3
-
-				pName := ""
-				if offset+pNameLen <= len(tlv.Value) {
-					pName = string(tlv.Value[offset : offset+pNameLen])
-					offset += pNameLen
-				} else {
-					// 防止出现半截断数据导致后续遍历全乱，直接截断退出
-					break
-				}
-
-				profiles = append(profiles, ProfileInfo{
-					Type:  pType,
-					Index: pIndex,
-					Name:  pName,
-				})
-			}
-			return profiles, nil
-		}
-
-		return nil, nil
+func parseProfileList(tlvs []TLV) []ProfileInfo {
+	tlv := FindTLV(tlvs, 0x01)
+	if tlv == nil || len(tlv.Value) < 1 {
+		return nil
 	}
-	return nil, lastErr
+	count := int(tlv.Value[0])
+	offset := 1
+	profiles := make([]ProfileInfo, 0, count)
+	for i := 0; i < count; i++ {
+		if offset+3 > len(tlv.Value) {
+			break
+		}
+		pType := tlv.Value[offset]
+		pIndex := tlv.Value[offset+1]
+		pNameLen := int(tlv.Value[offset+2])
+		offset += 3
+		if offset+pNameLen > len(tlv.Value) {
+			// Truncated data: stop rather than read past the buffer or
+			// misinterpret the remainder as further entries.
+			break
+		}
+		pName := string(tlv.Value[offset : offset+pNameLen])
+		offset += pNameLen
+		profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex, Name: pName})
+	}
+	return profiles
+}
+
+// ProfileSettings holds the subset of a WDS Get Profile Settings (0x002B)
+// response this package parses. IMCNFlag is TLV 0x22 -- the same field the
+// modem uses to mark a profile as IM CN subsystem (IMS) dedicated -- so it
+// is what auto-discovery below matches against instead of guessing from the
+// APN string (every profile on a carrier commonly shares the same "ims"
+// APN name; only the IMCN flag actually distinguishes them).
+type ProfileSettings struct {
+	Name        string
+	APN         string
+	PDPType     uint8
+	HasPDPType  bool
+	IMCNFlag    bool
+	HasIMCNFlag bool
 }
 
 // GetProfileSettings retrieves settings for a specific profile / GetProfileSettings 获取特定 Profile 的设置
-// Note: This returns raw TLVs or a map as profile structure is very complex
-// simplified here to just return "success" if it exists for now, or implement basic APN reading
-func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profileIndex uint8) (string, error) {
+func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profileIndex uint8) (ProfileSettings, error) {
 	bufId := make([]byte, 2)
 	bufId[0] = profileType
 	bufId[1] = profileIndex
@@ -964,13 +938,86 @@ func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profil
 			continue
 		}
 
-		if tlv := FindTLV(resp.TLVs, 0x14); tlv != nil {
-			return string(tlv.Value), nil
-		}
-
-		return "", nil
+		return parseProfileSettings(resp.TLVs), nil
 	}
-	return "", lastErr
+	return ProfileSettings{}, lastErr
+}
+
+func parseProfileSettings(tlvs []TLV) ProfileSettings {
+	var ps ProfileSettings
+	if tlv := FindTLV(tlvs, 0x10); tlv != nil {
+		ps.Name = string(tlv.Value)
+	}
+	if tlv := FindTLV(tlvs, 0x11); tlv != nil && len(tlv.Value) >= 1 {
+		ps.PDPType = tlv.Value[0]
+		ps.HasPDPType = true
+	}
+	if tlv := FindTLV(tlvs, 0x14); tlv != nil {
+		ps.APN = string(tlv.Value)
+	}
+	if tlv := FindTLV(tlvs, 0x22); tlv != nil && len(tlv.Value) >= 1 {
+		ps.IMCNFlag = tlv.Value[0] != 0
+		ps.HasIMCNFlag = true
+	}
+	return ps
+}
+
+// DiscoverIMSProfileIndex finds the profile that should be used for the IMS
+// PDN, so callers never have to guess or hardcode a profile index. It walks
+// Get Profile List and reads each profile's settings via Get Profile
+// Settings, preferring a profile the modem itself marked IM CN subsystem
+// (IMS) dedicated (IMCN flag), and falling back to an exact APN match
+// against apnHint when none is marked.
+//
+// The IMCN-flag fallback exists because the flag turned out not to be a
+// reliable signal in practice: measured on a Quectel EC20F with a real "ims"
+// APN profile provisioned by the carrier, every profile's IMCN flag read
+// back false, including the "ims" one -- the flag is part of the QMI spec,
+// but nothing requires a carrier's OTA profile provisioning to actually set
+// it. APN matching degrades gracefully to what every profile already has:
+// its own configured APN string.
+//
+// found is false, with a nil error, when every profile was read successfully
+// but none matched either signal -- a legitimate "no dedicated IMS profile
+// on this SIM" outcome, not a failure. A non-nil error means discovery
+// itself could not complete (e.g. Get Profile List failed); callers should
+// treat that the same as "not found" rather than blocking on it, since an
+// unreadable profile list is not evidence that no IMS profile exists.
+func (s *WDSService) DiscoverIMSProfileIndex(ctx context.Context, profileType uint8, apnHint string) (index uint8, found bool, err error) {
+	profiles, err := s.GetProfileList(ctx, profileType)
+	if err != nil {
+		return 0, false, err
+	}
+	index, found = pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return s.GetProfileSettings(ctx, p.Type, p.Index)
+	}, apnHint)
+	return index, found, nil
+}
+
+// pickIMSProfileIndex applies DiscoverIMSProfileIndex's selection rule
+// (IMCN flag first, exact APN match against apnHint second) to an
+// already-listed set of profiles. Split out from DiscoverIMSProfileIndex so
+// the decision logic is testable without a QMI transport: settingsFor is
+// the only QMI-touching piece, injected as a plain function.
+func pickIMSProfileIndex(profiles []ProfileInfo, settingsFor func(ProfileInfo) (ProfileSettings, error), apnHint string) (index uint8, found bool) {
+	apnHint = strings.TrimSpace(apnHint)
+	apnMatch, hasAPNMatch := uint8(0), false
+	for _, p := range profiles {
+		ps, err := settingsFor(p)
+		if err != nil {
+			continue
+		}
+		if ps.HasIMCNFlag && ps.IMCNFlag {
+			return p.Index, true
+		}
+		if !hasAPNMatch && apnHint != "" && strings.EqualFold(strings.TrimSpace(ps.APN), apnHint) {
+			apnMatch, hasAPNMatch = p.Index, true
+		}
+	}
+	if hasAPNMatch {
+		return apnMatch, true
+	}
+	return 0, false
 }
 
 // GetChannelRates returns the current and maximum channel rates.

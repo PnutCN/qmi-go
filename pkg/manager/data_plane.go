@@ -102,6 +102,19 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: allocate data-plane services: %w", err)
 	}
 
+	// The modem's own WDA aggregation protocol must track spec too, not just
+	// the kernel-side mux topology below: a device discovered with IMS
+	// disabled has its Manager built (and its data format decided) around
+	// MuxID=0, and only learns it needs QMAP once the card policy resolves
+	// to VoLTE -- long after enableRawIP's one-time startup check already
+	// ran and left the modem in native mode. Without this, the kernel mux
+	// interface for spec.DefaultMuxID gets created successfully but every
+	// WDSBindMuxDataPort against it fails with INVALID_ARGUMENT, because the
+	// modem was never told to start framing packets as QMAP.
+	if err := m.ensureModemDataFormat(ctx, dataFormatTargetForMux(spec.DefaultMuxID)); err != nil {
+		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: ensure modem data format: %w", err)
+	}
+
 	originalMaster := m.cfg.Device.NetInterface
 	if originalMaster == "" {
 		return DataPlaneSnapshot{}, errors.New("qmi manager: missing data-plane interface")

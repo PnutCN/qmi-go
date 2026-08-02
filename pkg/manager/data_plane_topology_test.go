@@ -34,6 +34,10 @@ func TestEnsureDataPlaneTopologySkipsMuxWorkWhenNative(t *testing.T) {
 		return &qmi.WDAService{}, nil
 	}
 	m.enableRawIPHook = func(context.Context) error { return nil }
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(0)
+		return &got, nil
+	}
 
 	if err := m.EnsureDataPlaneTopology(context.Background()); err != nil {
 		t.Fatalf("EnsureDataPlaneTopology() error = %v", err)
@@ -65,6 +69,10 @@ func TestEnsureDataPlaneTopologyAttemptsMuxSetupWhenMuxed(t *testing.T) {
 		return &qmi.WDAService{}, nil
 	}
 	m.enableRawIPHook = func(context.Context) error { return nil }
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
 	m.dataPlaneOps = dataPlaneOps{
 		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
 			return netcfg.QMAPTopology{MasterInterface: "nonexistent-test-iface-topology", MuxInterfaces: map[uint8]string{}}, nil
@@ -100,6 +108,10 @@ func TestEnsureDataPlaneTopologyIsIdempotent(t *testing.T) {
 		return &qmi.WDAService{}, nil
 	}
 	m.enableRawIPHook = func(context.Context) error { return nil }
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(0)
+		return &got, nil
+	}
 
 	if err := m.EnsureDataPlaneTopology(context.Background()); err != nil {
 		t.Fatalf("first call: EnsureDataPlaneTopology() error = %v", err)
