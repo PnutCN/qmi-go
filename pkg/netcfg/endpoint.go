@@ -25,6 +25,9 @@ type dataEndpointDiscoverer interface {
 // EM9190 use interface 8 while Quectel EC25 uses 4, so a fixed default binds
 // the mux successfully on some hardware and fails with an internal QMI error
 // on the rest.
+// Hardware verification on the Sierra EM9190 confirmed discovery returned 8,
+// the QMAP bind passed, and the later start failed only with the known
+// interface-in-use call end reason type 2, code 241.
 func DiscoverDataEndpointInterface(ifname string) (uint32, error) {
 	discoverer, ok := GetConfigurator().(dataEndpointDiscoverer)
 	if !ok {
