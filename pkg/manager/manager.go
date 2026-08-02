@@ -2179,7 +2179,7 @@ func (m *Manager) RotateIP() error {
 	}
 
 	// Flush old addresses to avoid duplicates / 清除旧地址以避免重复
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	m.flushDefaultDataAddresses()
 
 	// 3. Reconnect / 3. 重新连接
 	handle, err := m.wds.StartNetworkInterface(ctx,
@@ -2234,6 +2234,16 @@ func (m *Manager) RotateIP() error {
 
 // rotateViaRadioReset performs IP rotation by resetting the radio / rotateViaRadioReset 通过重置射频执行 IP 轮换
 func (m *Manager) rotateViaRadioReset() error {
+	// A radio power cycle is device-wide: it destroys any secondary PDN
+	// riding the same radio (the VoLTE IMS bearer). This is a separate
+	// implementation from RadioReset(), so guarding that one is not enough --
+	// "redial produced the same IP" is the normal escalation for rotation, so
+	// this path is reached by ordinary user action.
+	if m.hasActiveManagedPDN() {
+		m.log.Warn("IP 轮换需要射频复位，但存在活跃的次级 PDN(如 VoLTE IMS 承载)，拒绝复位")
+		return ErrRotateBlockedBySecondaryPDN
+	}
+
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
 	defer cancel()
 
@@ -2253,7 +2263,7 @@ func (m *Manager) rotateViaRadioReset() error {
 	}
 
 	// Flush old addresses / 2. 清除旧地址
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	m.flushDefaultDataAddresses()
 
 	// 2. Radio off / 3. 关闭射频
 	if err := m.withDMSRecovery("rotateViaRadioReset.RadioPowerCycle", func(dms *qmi.DMSService) error {
@@ -3908,15 +3918,34 @@ func (m *Manager) resolvedNetcfgOps() netcfgOps {
 	return ops
 }
 
+// defaultDataInterface returns the netdev the default data connection owns:
+// the mux under QMAP, the physical interface under Native.
+func (m *Manager) defaultDataInterface() string {
+	topology, _ := m.defaultDataPlaneTarget()
+	if target := topology.DefaultInterface; target != "" {
+		return target
+	}
+	return m.cfg.Device.NetInterface
+}
+
+// flushDefaultDataAddresses drops the addresses on the default connection's
+// own netdev, without touching its link state or the physical master.
+//
+// Under QMAP the default connection's address lives on the mux, so flushing
+// the physical master (as this code used to) left a dead address on the mux
+// forever after a carrier-side disconnect, and cleared nothing useful.
+func (m *Manager) flushDefaultDataAddresses() {
+	target := m.defaultDataInterface()
+	if err := m.resolvedNetcfgOps().flushAddresses(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡地址失败")
+	}
+}
+
 // teardownDefaultDataInterface clears only the default connection's netdev.
 // Under QMAP the published default interface is a mux, while Native publishes
 // the physical interface and has no sibling PDN to protect.
 func (m *Manager) teardownDefaultDataInterface() {
-	topology, _ := m.defaultDataPlaneTarget()
-	target := topology.DefaultInterface
-	if target == "" {
-		target = m.cfg.Device.NetInterface
-	}
+	target := m.defaultDataInterface()
 	ops := m.resolvedNetcfgOps()
 	if err := ops.flushAddresses(target); err != nil {
 		m.log.WithError(err).Debug("清理默认数据网卡地址失败")
@@ -4045,7 +4074,7 @@ func (m *Manager) doStatusCheck(full bool) {
 		if currentState == StateConnected {
 			m.log.Warn("Connection lost!")
 			m.handleV4 = 0
-			netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+			m.flushDefaultDataAddresses()
 			m.setState(StateDisconnected)
 			m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
 

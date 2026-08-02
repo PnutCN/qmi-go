@@ -17,6 +17,11 @@ var (
 	// Callers may classify this as an APN/network rejection; topology and
 	// host-link failures must retain their own error category.
 	ErrPDNStart = errors.New("qmi manager: start PDN network")
+	// ErrRotateBlockedBySecondaryPDN reports that IP rotation needed to
+	// escalate to a radio reset, but a secondary PDN (e.g. the VoLTE IMS
+	// bearer) is live on the same radio. Retrying cannot clear it: the caller
+	// must release that PDN first, or accept the current IP.
+	ErrRotateBlockedBySecondaryPDN = errors.New("qmi manager: IP rotation requires a radio reset, blocked by an active secondary PDN")
 )
 
 type PDNRequest struct {

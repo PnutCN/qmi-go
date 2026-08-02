@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
@@ -204,3 +205,36 @@ func TestCurrentDataPlaneSnapshotUsesDefaultInterfaceNotSecondaryPDN(t *testing.
 }
 
 var _ = qmi.MuxBinding{}
+
+// TestRotateViaRadioResetRefusesWhileSecondaryPDNActive 是 IP 轮换路径的隔离
+// 回归测试。rotateViaRadioReset 是独立于 RadioReset() 的第二份射频 off/on
+// 实现，历史上没有任何守卫：用户在 UI 或 Telegram 上点一次"换 IP"，只要
+// 重拨后 IP 没变就会升级到射频复位，当场摧毁 VoLTE IMS 承载。
+func TestRotateViaRadioResetRefusesWhileSecondaryPDNActive(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.dataPlane.sessions = map[uint64]*managedPDNSession{
+		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+	}
+
+	err := m.rotateViaRadioReset()
+	if !errors.Is(err, ErrRotateBlockedBySecondaryPDN) {
+		t.Fatalf("rotateViaRadioReset() error = %v, want ErrRotateBlockedBySecondaryPDN", err)
+	}
+}
+
+// TestFlushDefaultDataAddressesTargetsPublishedInterface：清地址必须落在
+// 已发布的默认数据网卡上。QMAP 下默认连接的地址在 qmimux0，历史代码却在
+// 物理主网卡上 flush —— 结果掉线后 qmimux0 上的死 IP 永远不被清除。
+func TestFlushDefaultDataAddressesTargetsPublishedInterface(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	var flushed []string
+	m.netcfgOps = netcfgOps{
+		flushAddresses: func(n string) error { flushed = append(flushed, n); return nil },
+	}
+
+	m.flushDefaultDataAddresses()
+
+	if len(flushed) != 1 || flushed[0] != "qmimux0" {
+		t.Fatalf("flushed = %v, want [qmimux0]（不是物理主网卡）", flushed)
+	}
+}
