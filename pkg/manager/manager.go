@@ -209,6 +209,7 @@ type Manager struct {
 	dataPlane    dataPlaneController
 	dataPlaneOps dataPlaneOps
 	pdnOps       pdnOps
+	netcfgOps    netcfgOps
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -3906,6 +3907,50 @@ func (m *Manager) configureNetwork() error {
 	return nil
 }
 
+// netcfgOps injects the host network mutations used when tearing down the
+// default connection, making the physical-master invariant testable without
+// requiring root privileges.
+type netcfgOps struct {
+	flushAddresses func(string) error
+	flushRoutes    func(string) error
+	bringDown      func(string) error
+}
+
+func (m *Manager) resolvedNetcfgOps() netcfgOps {
+	ops := m.netcfgOps
+	if ops.flushAddresses == nil {
+		ops.flushAddresses = netcfg.FlushAddresses
+	}
+	if ops.flushRoutes == nil {
+		ops.flushRoutes = netcfg.FlushRoutes
+	}
+	if ops.bringDown == nil {
+		ops.bringDown = netcfg.BringDown
+	}
+	return ops
+}
+
+// teardownDefaultDataInterface clears only the default connection's netdev.
+// Under QMAP the published default interface is a mux, while Native publishes
+// the physical interface and has no sibling PDN to protect.
+func (m *Manager) teardownDefaultDataInterface() {
+	topology, _ := m.defaultDataPlaneTarget()
+	target := topology.DefaultInterface
+	if target == "" {
+		target = m.cfg.Device.NetInterface
+	}
+	ops := m.resolvedNetcfgOps()
+	if err := ops.flushAddresses(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡地址失败")
+	}
+	if err := ops.flushRoutes(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡路由失败")
+	}
+	if err := ops.bringDown(target); err != nil {
+		m.log.WithError(err).Debug("关闭默认数据网卡失败")
+	}
+}
+
 func (m *Manager) doDisconnect() {
 	m.log.Info("Disconnecting...")
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
@@ -3921,9 +3966,7 @@ func (m *Manager) doDisconnect() {
 
 	}
 
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
-	netcfg.FlushRoutes(m.cfg.Device.NetInterface)
-	netcfg.BringDown(m.cfg.Device.NetInterface)
+	m.teardownDefaultDataInterface()
 
 	m.mu.Lock()
 	m.settings = nil

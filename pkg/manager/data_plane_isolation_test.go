@@ -79,4 +79,53 @@ func TestDefaultMuxBindingFailsWhenEndpointUndiscoverable(t *testing.T) {
 	}
 }
 
+// TestDisconnectNeverBringsDownPhysicalMaster is the key QMAP isolation
+// invariant: the physical master carries every mux and must remain up.
+func TestDisconnectNeverBringsDownPhysicalMaster(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	var flushed, downed []string
+	m.netcfgOps = netcfgOps{
+		flushAddresses: func(name string) error { flushed = append(flushed, name); return nil },
+		flushRoutes:    func(string) error { return nil },
+		bringDown:      func(name string) error { downed = append(downed, name); return nil },
+	}
+
+	m.teardownDefaultDataInterface()
+
+	for _, name := range downed {
+		if name == "wwp0s20u1i4" {
+			t.Fatalf("BringDown called on physical master %q", name)
+		}
+	}
+	if len(downed) != 1 || downed[0] != "qmimux0" {
+		t.Fatalf("downed = %v, want only qmimux0", downed)
+	}
+	if len(flushed) != 1 || flushed[0] != "qmimux0" {
+		t.Fatalf("flushed = %v, want only qmimux0", flushed)
+	}
+}
+
+// TestDisconnectUsesPhysicalInterfaceWhenNative preserves the valid Native
+// behavior: there is no sibling mux, so the physical interface is the target.
+func TestDisconnectUsesPhysicalInterfaceWhenNative(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.dataPlane.snapshot = DataPlaneSnapshot{
+		Generation:       2,
+		Mode:             DataPlaneModeNative,
+		DefaultInterface: "wwp0s20u1i4",
+	}
+	var downed []string
+	m.netcfgOps = netcfgOps{
+		flushAddresses: func(string) error { return nil },
+		flushRoutes:    func(string) error { return nil },
+		bringDown:      func(name string) error { downed = append(downed, name); return nil },
+	}
+
+	m.teardownDefaultDataInterface()
+
+	if len(downed) != 1 || downed[0] != "wwp0s20u1i4" {
+		t.Fatalf("downed = %v, want the Native physical interface", downed)
+	}
+}
+
 var _ = qmi.MuxBinding{}
