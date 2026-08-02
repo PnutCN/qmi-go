@@ -618,16 +618,30 @@ func buildCloseLogicalChannelTLVs(slot uint8, channel uint8) []TLV {
 	}
 }
 
+// buildSendAPDUTLVs assembles the TLVs for QMI_UIM_SEND_APDU.
+//
+// The Channel ID TLV (0x10) is OPTIONAL, and that matters: omitting it selects the
+// basic channel, whereas sending it with value 0 is rejected outright. Observed on a
+// Quectel EC25 (2026-08-02) while sending an ENVELOPE (SMS-PP DOWNLOAD, ETSI
+// TS 131.111 §7.1.1) — a card-level command that has to go over the basic channel:
+//
+//	service=0x000b msg=0x003b result=0x0001 error=0x0030 (QMI_ERR_INVALID_ARGUMENT)
+//
+// This stayed hidden because every caller so far (eSIM profile management, SIM auth)
+// opens a logical channel first, so channel was always > 0.
 func buildSendAPDUTLVs(slot uint8, channel uint8, command []byte) []TLV {
 	length := len(command)
 	value := make([]byte, 2+len(command))
 	binary.LittleEndian.PutUint16(value[0:2], uint16(length))
 	copy(value[2:], command)
-	return []TLV{
-		{Type: 0x10, Value: []byte{channel}},
-		{Type: 0x02, Value: value},
-		{Type: 0x01, Value: []byte{slot}},
+	tlvs := make([]TLV, 0, 3)
+	if channel != 0 {
+		tlvs = append(tlvs, TLV{Type: 0x10, Value: []byte{channel}})
 	}
+	return append(tlvs,
+		TLV{Type: 0x02, Value: value},
+		TLV{Type: 0x01, Value: []byte{slot}},
+	)
 }
 
 func uimBoolToByte(v bool) byte {
