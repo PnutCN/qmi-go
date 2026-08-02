@@ -60,6 +60,20 @@ func (m *Manager) declaredDataPlaneSpec() DataPlaneSpec {
 	return m.cfg.DataPlane
 }
 
+// CurrentDataPlaneSnapshot returns the last published default-data topology.
+// Secondary managed PDN sessions are intentionally not exposed here: callers
+// such as public-IP probing must follow the default connection, never an IMS
+// mux created through OpenPDN.
+func (m *Manager) CurrentDataPlaneSnapshot() (DataPlaneSnapshot, bool) {
+	if m == nil {
+		return DataPlaneSnapshot{}, false
+	}
+	m.dataPlane.mu.Lock()
+	snapshot := m.dataPlane.snapshot
+	m.dataPlane.mu.Unlock()
+	return snapshot, snapshot.Generation != 0
+}
+
 type dataPlaneOps struct {
 	discoverQMAPTopology func(configuredMaster string) (netcfg.QMAPTopology, error)
 	enableRawIP          func(string) error

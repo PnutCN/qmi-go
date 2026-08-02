@@ -185,4 +185,22 @@ func TestActiveMuxIDsIncludesDeclaredDefaultBeforePublish(t *testing.T) {
 	}
 }
 
+// TestCurrentDataPlaneSnapshotUsesDefaultInterfaceNotSecondaryPDN ensures
+// consumers such as public-IP probing see the default mux only. An active IMS
+// session on mux 2 must never become the probe interface.
+func TestCurrentDataPlaneSnapshotUsesDefaultInterfaceNotSecondaryPDN(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.dataPlane.sessions = map[uint64]*managedPDNSession{
+		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+	}
+
+	snapshot, ok := m.CurrentDataPlaneSnapshot()
+	if !ok {
+		t.Fatal("CurrentDataPlaneSnapshot() reported no published topology")
+	}
+	if snapshot.DefaultInterface != "qmimux0" || snapshot.DefaultMuxID != 1 {
+		t.Fatalf("snapshot = %+v, want default mux qmimux0/1", snapshot)
+	}
+}
+
 var _ = qmi.MuxBinding{}
