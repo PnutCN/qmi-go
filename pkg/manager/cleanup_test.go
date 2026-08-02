@@ -7,9 +7,14 @@ import (
 	"time"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
+	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
-type cleanupConfigurator struct{ deletedMaster string }
+type cleanupConfigurator struct {
+	reconciledMaster string
+	reconciledKeep   []uint8
+	events           *[]string
+}
 
 func (*cleanupConfigurator) SetIPAddress(string, net.IP, int) error   { return nil }
 func (*cleanupConfigurator) SetIPv6Address(string, net.IP, int) error { return nil }
@@ -25,13 +30,17 @@ func (*cleanupConfigurator) IsUp(string) (bool, error)                { return f
 func (*cleanupConfigurator) UpdateDNS(string, string) error           { return nil }
 func (*cleanupConfigurator) RestoreDNS() error                        { return nil }
 func (*cleanupConfigurator) AddQMAPMux(string, uint8) (string, error) { return "", nil }
-func (c *cleanupConfigurator) DelQMAPMux(master string, _ uint8) error {
-	c.deletedMaster = master
-	return nil
+func (*cleanupConfigurator) DelQMAPMux(string, uint8) error           { return nil }
+func (*cleanupConfigurator) GetQMAPMuxIface(string, uint8) string     { return "" }
+func (*cleanupConfigurator) EnableRawIP(string) error                 { return nil }
+func (c *cleanupConfigurator) ReconcileResidualMux(master string, keep []uint8) ([]uint8, error) {
+	c.reconciledMaster = master
+	c.reconciledKeep = append([]uint8(nil), keep...)
+	if c.events != nil {
+		*c.events = append(*c.events, "reconcile-residual-mux")
+	}
+	return nil, nil
 }
-func (*cleanupConfigurator) GetQMAPMuxIface(string, uint8) string                  { return "" }
-func (*cleanupConfigurator) EnableRawIP(string) error                              { return nil }
-func (*cleanupConfigurator) ReconcileResidualMux(string, []uint8) ([]uint8, error) { return nil, nil }
 
 func TestCleanupDoesNotUseFixedSleepWhenNoTasks(t *testing.T) {
 	m := newRecoveryTestManager()
@@ -69,8 +78,66 @@ func TestCleanupDeletesDefaultMuxFromResolvedQMAPMaster(t *testing.T) {
 
 	m.cleanup()
 
-	if cfg.deletedMaster != "wwan0_q_q" {
-		t.Fatalf("DelQMAPMux master = %q, want resolved QMAP master", cfg.deletedMaster)
+	if cfg.reconciledMaster != "wwan0_q_q" {
+		t.Fatalf("ReconcileResidualMux master = %q, want resolved QMAP master", cfg.reconciledMaster)
+	}
+	if cfg.reconciledKeep != nil {
+		t.Fatalf("ReconcileResidualMux keep = %v, want nil to remove every QMAP mux", cfg.reconciledKeep)
+	}
+}
+
+func TestCleanupReconcilesAllResidualMuxesAfterSecondaryPDNs(t *testing.T) {
+	original := netcfg.GetConfigurator()
+	events := make([]string, 0, 5)
+	cfg := &cleanupConfigurator{events: &events}
+	netcfg.SetConfigurator(cfg)
+	t.Cleanup(func() { netcfg.SetConfigurator(original) })
+
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:    ModemDevice{NetInterface: "wwan0"},
+		DataPlane: DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
+		Timeouts:  TimeoutConfig{Stop: time.Second},
+	}
+	m.dataPlane.snapshot = DataPlaneSnapshot{
+		Generation:       1,
+		Mode:             DataPlaneModeQMAP,
+		DefaultInterface: "qmimux7",
+		DefaultMuxID:     1,
+	}
+	m.dataPlane.sessions = map[uint64]*managedPDNSession{
+		1: {
+			manager:  m,
+			snapshot: PDNSnapshot{ID: 1, Generation: 1, InterfaceName: "qmimux8", Handle: 1},
+			master:   "wwan0_q_q",
+			muxID:    2,
+		},
+	}
+	m.pdnOps = pdnOps{
+		bringDown: func(string) error { return nil },
+		stop: func(context.Context, *qmi.WDSService, uint32) error {
+			events = append(events, "secondary-pdn-stop")
+			return nil
+		},
+		releaseWDS: func(*qmi.WDSService) error { return nil },
+		deleteMux: func(string, uint8) error {
+			events = append(events, "secondary-pdn-mux-delete")
+			return nil
+		},
+	}
+	m.muxIface = "qmimux7"
+	m.masterIface = "wwan0_q_q"
+
+	m.cleanup()
+
+	if cfg.reconciledMaster != "wwan0_q_q" {
+		t.Fatalf("ReconcileResidualMux master = %q, want resolved QMAP master", cfg.reconciledMaster)
+	}
+	if cfg.reconciledKeep != nil {
+		t.Fatalf("ReconcileResidualMux keep = %v, want nil to remove every QMAP mux", cfg.reconciledKeep)
+	}
+	if len(events) < 3 || events[len(events)-1] != "reconcile-residual-mux" {
+		t.Fatalf("cleanup events = %v, want secondary PDN cleanup before residual mux cleanup", events)
 	}
 }
 

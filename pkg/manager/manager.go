@@ -2907,7 +2907,6 @@ func (m *Manager) cleanup() {
 	// Secondary PDNs own independent WDS clients and muxes, but share this
 	// manager's transport. Release them before clearing the shared services.
 	m.closeManagedPDNSessions(cleanupCtx)
-	topology, _ := m.defaultDataPlaneTarget()
 	m.dataPlane.mu.Lock()
 	m.dataPlane.snapshot = DataPlaneSnapshot{}
 	m.dataPlane.masterInterface = ""
@@ -2931,7 +2930,6 @@ func (m *Manager) cleanup() {
 	ifname := m.cfg.Device.NetInterface
 
 	muxIface := m.muxIface
-	muxID := topology.DefaultMuxID
 	masterIface := m.masterIface
 	if masterIface == "" {
 		masterIface = m.cfg.Device.NetInterface
@@ -2977,15 +2975,22 @@ func (m *Manager) cleanup() {
 
 	cleanupTasks := make([]cleanupTask, 0, 4)
 
-	if muxIface != "" && muxID > 0 {
+	if muxIface != "" || masterIface != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "qmap",
 			run: func(context.Context) error {
-				return errors.Join(
-					netcfg.FlushAddresses(muxIface),
-					netcfg.BringDown(muxIface),
-					netcfg.DelQMAPMux(masterIface, muxID),
-				)
+				var err error
+				if muxIface != "" {
+					err = errors.Join(
+						netcfg.FlushAddresses(muxIface),
+						netcfg.BringDown(muxIface),
+					)
+				}
+				if masterIface != "" {
+					_, reconcileErr := netcfg.ReconcileResidualMux(masterIface, nil)
+					err = errors.Join(err, reconcileErr)
+				}
+				return err
 			},
 		})
 	}
