@@ -3599,7 +3599,7 @@ func (m *Manager) doConnect() error {
 	defer cancelDial()
 
 	// EnsureDataPlaneTopology allocates WDA/WDS(V6), cleans up crash-residual
-	// mux state, and (when MuxID>0) brings the device to QMAP with mux 1
+	// mux state, and brings the declared topology to a stable snapshot
 	// established and renamed -- everything doConnect used to do inline
 	// here. Extracted so a sibling IMS PDN (VoLTE) that needs this same
 	// topology can call it too, independent of whether this default
@@ -3617,27 +3617,26 @@ func (m *Manager) doConnect() error {
 	}
 
 	// ========== 多路拨号 (QMAP) 绑定 ==========
-	if m.cfg.MuxID > 0 {
-		m.mu.RLock()
-		masterIface := m.masterIface
-		m.mu.RUnlock()
-		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
-			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
-
-		// 绑定 WDS Client 到 Mux Data Port
-		binding := qmi.MuxBinding{
-			EpType:     0x02, // HSUSB
-			EpIfID:     0x04, // 默认 Interface ID
-			MuxID:      m.cfg.MuxID,
-			ClientType: 1, // Tethered
+	topology, masterIface := m.defaultDataPlaneTarget()
+	if topology.Mode == DataPlaneModeQMAP && topology.DefaultMuxID > 0 {
+		binding, err := m.defaultMuxBinding()
+		if err != nil {
+			// In QMAP mode, dialing without a mux binding can produce an IP
+			// address with no usable traffic and corrupt a sibling mux stream.
+			m.log.WithError(err).Error("默认数据连接无法确定 QMAP 绑定端点，放弃本次拨号")
+			m.handleDialFailure(err)
+			return err
 		}
+		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s, 端点=%d",
+			binding.MuxID, m.cfg.ProfileIndex, masterIface, binding.EpIfID)
+
 		if m.wds != nil {
 			ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
 			if err := m.wds.BindMuxDataPort(ctx, binding); err != nil {
 				m.log.WithError(err).Error("WDS IPv4 BindMuxDataPort 失败")
 				// 非致命，继续
 			} else {
-				m.log.Infof("WDS IPv4 已绑定 MuxID=%d", m.cfg.MuxID)
+				m.log.Infof("WDS IPv4 已绑定 MuxID=%d", binding.MuxID)
 			}
 			cancel()
 		}
@@ -3648,7 +3647,7 @@ func (m *Manager) doConnect() error {
 			if err := m.wdsV6.BindMuxDataPort(ctx, binding); err != nil {
 				m.log.WithError(err).Warn("WDS IPv6 BindMuxDataPort 失败")
 			} else {
-				m.log.Infof("WDS IPv6 已绑定 MuxID=%d", m.cfg.MuxID)
+				m.log.Infof("WDS IPv6 已绑定 MuxID=%d", binding.MuxID)
 			}
 			cancel()
 		}
@@ -3738,19 +3737,49 @@ func (m *Manager) doConnect() error {
 	return nil
 }
 
-func (m *Manager) configureNetwork() error {
-	// 多路拨号模式下，IP/DNS/Route 配置在虚拟网卡上
-	ifname := m.cfg.Device.NetInterface
-	m.mu.RLock()
-	if m.muxIface != "" {
-		ifname = m.muxIface
+// defaultDataPlaneTarget returns the published topology snapshot and physical
+// master. Consumers must use this runtime result instead of Config.
+func (m *Manager) defaultDataPlaneTarget() (DataPlaneSnapshot, string) {
+	m.dataPlane.mu.Lock()
+	defer m.dataPlane.mu.Unlock()
+	return m.dataPlane.snapshot, m.dataPlane.masterInterface
+}
+
+// defaultMuxBinding builds the default QMAP binding using the endpoint
+// discovered from the physical master rather than a modem-specific constant.
+func (m *Manager) defaultMuxBinding() (qmi.MuxBinding, error) {
+	snapshot, master := m.defaultDataPlaneTarget()
+	if master == "" {
+		master = m.cfg.Device.NetInterface
 	}
-	m.mu.RUnlock()
+	endpointIfID, err := m.resolvedPDNOps().discoverEndpoint(master)
+	if err != nil {
+		return qmi.MuxBinding{}, fmt.Errorf("qmi manager: discover data endpoint for %s: %w", master, err)
+	}
+	return qmi.MuxBinding{
+		EpType:     0x02, // HSUSB
+		EpIfID:     endpointIfID,
+		MuxID:      snapshot.DefaultMuxID,
+		ClientType: 1, // Tethered
+	}, nil
+}
+
+func (m *Manager) configureNetwork() error {
+	// Configure IP/DNS/routes on the interface published by topology
+	// convergence. Under QMAP the physical master only carries the muxes.
+	topology, master := m.defaultDataPlaneTarget()
+	ifname := topology.DefaultInterface
+	if ifname == "" {
+		ifname = m.cfg.Device.NetInterface
+	}
+	if master == "" {
+		master = m.cfg.Device.NetInterface
+	}
 	m.log.Infof("Configuring network interface %s...", ifname)
 
 	// 多路拨号时也要确保物理网卡是 up 的
-	if m.muxIface != "" && ifname != m.cfg.Device.NetInterface {
-		if err := netcfg.BringUp(m.cfg.Device.NetInterface); err != nil {
+	if topology.Mode == DataPlaneModeQMAP && ifname != master {
+		if err := netcfg.BringUp(master); err != nil {
 			m.log.WithError(err).Warn("Failed to bring master interface up")
 		}
 	}
