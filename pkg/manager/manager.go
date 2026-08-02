@@ -178,6 +178,12 @@ type Manager struct {
 	coreReadyLastErr  string
 	coreReadySince    time.Time
 	desiredConnection bool
+	// connectedDataPlaneGeneration is the DataPlaneSnapshot.Generation the
+	// default connection was last dialed against. A QMAP mux binding can
+	// only be set before StartNetworkInterface, so an already-established
+	// connection cannot be migrated to a new mux in place -- see
+	// redialIfDataPlaneGenerationChanged.
+	connectedDataPlaneGeneration uint64
 
 	// Event handling
 	// Event handling / 事件处理
@@ -3714,6 +3720,9 @@ func (m *Manager) doConnect() error {
 	}
 
 	m.setState(StateConnected)
+	m.mu.Lock()
+	m.connectedDataPlaneGeneration = topology.Generation
+	m.mu.Unlock()
 	m.retryCount = 0
 	m.log.Info("Connection established successfully!")
 
@@ -3977,6 +3986,7 @@ func (m *Manager) doDisconnect() {
 
 	m.mu.Lock()
 	m.settings = nil
+	m.connectedDataPlaneGeneration = 0
 	m.mu.Unlock()
 
 	m.setState(StateDisconnected)

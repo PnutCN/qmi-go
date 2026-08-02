@@ -106,7 +106,51 @@ func (m *Manager) resolvedDataPlaneOps() dataPlaneOps {
 // ConvergeDataPlane serializes QMAP discovery and mutation, then publishes a
 // stable default-interface snapshot. It never exposes the physical master,
 // whose name can change during QMAP setup.
+//
+// If the default connection is already dialed against an older generation of
+// the topology, this also triggers a redial onto the new one -- see
+// redialIfDataPlaneGenerationChanged.
 func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (DataPlaneSnapshot, error) {
+	snapshot, err := m.convergeDataPlaneLocked(ctx, spec)
+	if err == nil {
+		// Must run after m.dataPlane.mu is released (convergeDataPlaneLocked's
+		// defer has already unlocked it here): a redial disconnects and
+		// re-enqueues a connect, and doConnect itself needs m.dataPlane.mu to
+		// read the snapshot it dials against.
+		m.redialIfDataPlaneGenerationChanged(snapshot)
+	}
+	return snapshot, err
+}
+
+// redialIfDataPlaneGenerationChanged forces the default connection to redial
+// when it is connected but was dialed against a different topology
+// generation than the one just published.
+//
+// A QMAP mux binding can only be set before StartNetworkInterface, so an
+// already-established connection cannot be migrated to a new mux in place.
+// This happens on a degrade-then-recover cycle (Native -> QMAP once the
+// modem/kernel can support it again) or a topology rediscovery picking a
+// different master -- both real, not hypothetical: measured with two
+// physical QMI devices present, the second device's connection kept running
+// on the physical interface after the shared Manager recovered QMAP, and
+// received framed packets it could not parse.
+func (m *Manager) redialIfDataPlaneGenerationChanged(snapshot DataPlaneSnapshot) {
+	if snapshot.Generation == 0 {
+		return
+	}
+	m.mu.Lock()
+	connected := m.state == StateConnected
+	oldGeneration := m.connectedDataPlaneGeneration
+	m.mu.Unlock()
+	if !connected || oldGeneration == 0 || oldGeneration == snapshot.Generation {
+		return
+	}
+	m.log.Warnf("默认数据面拓扑已变化(generation %d -> %d)，重新拨号以对齐新拓扑", oldGeneration, snapshot.Generation)
+	m.doDisconnect()
+	m.eventCh <- eventStart
+}
+
+func (m *Manager) convergeDataPlaneLocked(ctx context.Context, spec DataPlaneSpec) (DataPlaneSnapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -197,11 +241,20 @@ func (m *Manager) activeMuxIDsLocked() []uint8 {
 
 // convergeNativeLocked brings the device to native framing and returns the
 // snapshot to publish. Callers must hold m.dataPlane.mu.
+//
+// Deliberately does NOT set m.dataPlane.masterInterface: that field means
+// "the QMAP master has been discovered", and Native has no master/mux
+// concept. Setting it here let a later QMAP attempt skip topology
+// rediscovery entirely (masterInterface != "" short-circuits
+// convergeQMAPLocked's discovery), turning a degrade-then-recover cycle into
+// a half-applied QMAP state -- measured: the modem switched to QMAP framing
+// while the already-dialed default connection stayed bound to the physical
+// interface, corrupting its traffic. See redialIfDataPlaneGenerationChanged
+// for the other half of this fix.
 func (m *Manager) convergeNativeLocked(ctx context.Context, master string) (DataPlaneSnapshot, error) {
 	if err := m.ensureModemDataFormat(ctx, dataFormatTargetForMux(0)); err != nil {
 		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: ensure modem data format (native): %w", err)
 	}
-	m.dataPlane.masterInterface = master
 	m.mu.Lock()
 	m.masterIface = master
 	m.muxIface = ""

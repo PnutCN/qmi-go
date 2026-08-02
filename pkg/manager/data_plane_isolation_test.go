@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -204,7 +205,120 @@ func TestCurrentDataPlaneSnapshotUsesDefaultInterfaceNotSecondaryPDN(t *testing.
 	}
 }
 
-var _ = qmi.MuxBinding{}
+// TestConvergeDataPlaneRedialsDefaultConnectionOnGenerationChange is the
+// regression test for Fix B: a QMAP mux binding can only be set before
+// StartNetworkInterface, so an already-dialed default connection cannot be
+// migrated to a new mux in place. Measured on a host with a second physical
+// QMI device present: after a degrade-then-recover cycle (Native -> QMAP),
+// the already-connected default connection stayed bound to the physical
+// interface while the modem switched to QMAP framing -- corrupting its
+// traffic. The connection must be forced to redial whenever the topology it
+// was dialed against goes stale.
+func TestConvergeDataPlaneRedialsDefaultConnectionOnGenerationChange(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.wda = &qmi.WDAService{}
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "wwp0s20u1i4", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "qmimux0", nil },
+	}
+	m.netcfgOps = netcfgOps{
+		flushAddresses: func(string) error { return nil },
+		flushRoutes:    func(string) error { return nil },
+		bringDown:      func(string) error { return nil },
+	}
+
+	// Start from a degraded Native snapshot, already dialed and connected.
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeNative, DefaultInterface: "wwp0s20u1i4"}
+	m.mu.Lock()
+	m.state = StateConnected
+	m.connectedDataPlaneGeneration = 1
+	m.mu.Unlock()
+
+	// Recovery: declare QMAP again. This must actually converge (the
+	// published mode differs from the declaration) and produce a new
+	// generation.
+	got, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1})
+	if err != nil {
+		t.Fatalf("ConvergeDataPlane() error = %v", err)
+	}
+	if got.Generation == 1 {
+		t.Fatalf("Generation = %d, want a new generation to be published on recovery", got.Generation)
+	}
+
+	m.mu.RLock()
+	state := m.state
+	m.mu.RUnlock()
+	if state != StateDisconnected {
+		t.Fatalf("state = %v, want StateDisconnected (a stale connection must be redialed)", state)
+	}
+	select {
+	case evt := <-m.eventCh:
+		if evt != eventStart {
+			t.Fatalf("event = %v, want eventStart to trigger the redial", evt)
+		}
+	default:
+		t.Fatal("expected eventStart to be enqueued to redial onto the new topology")
+	}
+}
+
+// TestConvergeDataPlaneDoesNotRedialWhenDisconnected: no live connection to
+// protect, so no redial should be attempted.
+func TestConvergeDataPlaneDoesNotRedialWhenDisconnected(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.wda = &qmi.WDAService{}
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "wwp0s20u1i4", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "qmimux0", nil },
+	}
+
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeNative, DefaultInterface: "wwp0s20u1i4"}
+	// state left at its zero value (not StateConnected)
+
+	if _, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1}); err != nil {
+		t.Fatalf("ConvergeDataPlane() error = %v", err)
+	}
+
+	select {
+	case evt := <-m.eventCh:
+		t.Fatalf("unexpected event enqueued: %v (nothing was connected, nothing to redial)", evt)
+	default:
+	}
+}
+
+// TestConvergeDataPlaneSameGenerationDoesNotRedial: re-declaring the same
+// spec hits ConvergeDataPlane's own early-return (no real convergence, no
+// new generation) -- must not trigger a redial either.
+func TestConvergeDataPlaneSameGenerationDoesNotRedial(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.mu.Lock()
+	m.state = StateConnected
+	m.connectedDataPlaneGeneration = m.dataPlane.snapshot.Generation
+	m.mu.Unlock()
+
+	if _, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1}); err != nil {
+		t.Fatalf("ConvergeDataPlane() error = %v", err)
+	}
+
+	select {
+	case evt := <-m.eventCh:
+		t.Fatalf("unexpected event enqueued: %v (spec unchanged, no redial needed)", evt)
+	default:
+	}
+}
 
 // TestRotateViaRadioResetRefusesWhileSecondaryPDNActive 是 IP 轮换路径的隔离
 // 回归测试。rotateViaRadioReset 是独立于 RadioReset() 的第二份射频 off/on
