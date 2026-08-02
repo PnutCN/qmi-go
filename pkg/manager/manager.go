@@ -80,7 +80,12 @@ type Config struct {
 
 	ProfileIndex uint8 // PDN Profile 索引 (对应 -n 参数, 默认 0 表示使用模组默认 Profile)
 	MuxID        uint8 // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
-	NoDial       bool  // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
+	// DataPlane declares the topology intent for this Manager. A zero Mode
+	// temporarily means "not declared" and uses the legacy MuxID fallback;
+	// all production callers are migrated to this field before that fallback
+	// is removed.
+	DataPlane DataPlaneSpec
+	NoDial    bool // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
 
 	DataPlanePolicy DataPlanePolicy // Data-plane service allocation policy / 数据面服务分配策略
 	Timeouts        TimeoutConfig
@@ -1268,10 +1273,10 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 	return nil
 }
 
-// EnsureDataPlaneTopology converges the configured default topology. New
+// EnsureDataPlaneTopology converges the declared default topology. New
 // callers should use ConvergeDataPlane so they receive its stable snapshot.
 func (m *Manager) EnsureDataPlaneTopology(ctx context.Context) error {
-	_, err := m.ConvergeDataPlane(ctx, dataPlaneSpecFromConfig(m.cfg))
+	_, err := m.ConvergeDataPlane(ctx, m.declaredDataPlaneSpec())
 	return err
 }
 

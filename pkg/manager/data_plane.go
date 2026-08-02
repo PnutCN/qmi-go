@@ -30,6 +30,10 @@ type DataPlaneSnapshot struct {
 	Mode             DataPlaneMode
 	DefaultInterface string
 	DefaultMuxID     uint8
+	// DegradedReason is non-empty when QMAP was declared but only Native
+	// could be achieved. It lets QMAP-dependent callers report why they cannot
+	// establish their secondary PDN.
+	DegradedReason string
 }
 
 func dataPlaneSpecFromConfig(cfg Config) DataPlaneSpec {
@@ -42,10 +46,27 @@ func dataPlaneSpecFromConfig(cfg Config) DataPlaneSpec {
 type dataPlaneController struct {
 	mu              sync.Mutex
 	snapshot        DataPlaneSnapshot
+	declaredSpec    DataPlaneSpec
 	masterInterface string
 	nextSessionID   uint64
 	sessions        map[uint64]*managedPDNSession
 	reservedMuxes   map[uint8]uint64
+}
+
+// declaredDataPlaneSpec returns the topology intent this Manager converges
+// to. Precedence is the most recent explicit ConvergeDataPlane declaration,
+// then Config.DataPlane, and finally the transitional MuxID derivation.
+func (m *Manager) declaredDataPlaneSpec() DataPlaneSpec {
+	m.dataPlane.mu.Lock()
+	declared := m.dataPlane.declaredSpec
+	m.dataPlane.mu.Unlock()
+	if declared.Mode != "" {
+		return declared
+	}
+	if m.cfg.DataPlane.Mode != "" {
+		return m.cfg.DataPlane
+	}
+	return dataPlaneSpecFromConfig(m.cfg)
 }
 
 type dataPlaneOps struct {
@@ -94,6 +115,10 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 	m.dataPlane.mu.Lock()
 	defer m.dataPlane.mu.Unlock()
 
+	// Record intent before attempting convergence so future Ensure calls use
+	// the last explicit declaration rather than re-deriving from Config.
+	m.dataPlane.declaredSpec = spec
+
 	if snapshot := m.dataPlane.snapshot; snapshot.Generation != 0 &&
 		snapshot.Mode == spec.Mode && snapshot.DefaultMuxID == spec.DefaultMuxID {
 		return snapshot, nil
@@ -102,33 +127,61 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: allocate data-plane services: %w", err)
 	}
 
-	// The modem's own WDA aggregation protocol must track spec too, not just
-	// the kernel-side mux topology below: a device discovered with IMS
-	// disabled has its Manager built (and its data format decided) around
-	// MuxID=0, and only learns it needs QMAP once the card policy resolves
-	// to VoLTE -- long after enableRawIP's one-time startup check already
-	// ran and left the modem in native mode. Without this, the kernel mux
-	// interface for spec.DefaultMuxID gets created successfully but every
-	// WDSBindMuxDataPort against it fails with INVALID_ARGUMENT, because the
-	// modem was never told to start framing packets as QMAP.
-	if err := m.ensureModemDataFormat(ctx, dataFormatTargetForMux(spec.DefaultMuxID)); err != nil {
-		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: ensure modem data format: %w", err)
-	}
-
 	originalMaster := m.cfg.Device.NetInterface
 	if originalMaster == "" {
 		return DataPlaneSnapshot{}, errors.New("qmi manager: missing data-plane interface")
 	}
+
 	if spec.Mode == DataPlaneModeNative {
-		snapshot := DataPlaneSnapshot{
-			Generation:       m.dataPlane.snapshot.Generation + 1,
-			Mode:             spec.Mode,
-			DefaultInterface: originalMaster,
-			DefaultMuxID:     spec.DefaultMuxID,
+		snapshot, err := m.convergeNativeLocked(ctx, originalMaster)
+		if err != nil {
+			return DataPlaneSnapshot{}, err
 		}
-		m.dataPlane.masterInterface = originalMaster
 		m.dataPlane.snapshot = snapshot
 		return snapshot, nil
+	}
+
+	// QMAP is preferred, but a failed mux setup must not take down the default
+	// data plane. Native is the fallback; only failure of both rungs is fatal.
+	snapshot, qmapErr := m.convergeQMAPLocked(ctx, spec, originalMaster)
+	if qmapErr == nil {
+		m.dataPlane.snapshot = snapshot
+		return snapshot, nil
+	}
+	m.log.WithError(qmapErr).Warn("QMAP 数据面建立失败，降级为 Native 以保住默认数据连接；该设备上 VoLTE 不可用")
+	degraded, nativeErr := m.convergeNativeLocked(ctx, originalMaster)
+	if nativeErr != nil {
+		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: QMAP failed (%v), native fallback failed: %w", qmapErr, nativeErr)
+	}
+	degraded.DegradedReason = qmapErr.Error()
+	m.dataPlane.snapshot = degraded
+	return degraded, nil
+}
+
+// convergeNativeLocked brings the device to native framing and returns the
+// snapshot to publish. Callers must hold m.dataPlane.mu.
+func (m *Manager) convergeNativeLocked(ctx context.Context, master string) (DataPlaneSnapshot, error) {
+	if err := m.ensureModemDataFormat(ctx, dataFormatTargetForMux(0)); err != nil {
+		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: ensure modem data format (native): %w", err)
+	}
+	m.dataPlane.masterInterface = master
+	m.mu.Lock()
+	m.masterIface = master
+	m.muxIface = ""
+	m.mu.Unlock()
+	return DataPlaneSnapshot{
+		Generation:       m.dataPlane.snapshot.Generation + 1,
+		Mode:             DataPlaneModeNative,
+		DefaultInterface: master,
+		DefaultMuxID:     0,
+	}, nil
+}
+
+// convergeQMAPLocked brings the device to QMAP framing with the declared
+// default mux established. Callers must hold m.dataPlane.mu.
+func (m *Manager) convergeQMAPLocked(ctx context.Context, spec DataPlaneSpec, originalMaster string) (DataPlaneSnapshot, error) {
+	if err := m.ensureModemDataFormat(ctx, dataFormatTargetForMux(spec.DefaultMuxID)); err != nil {
+		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: ensure modem data format: %w", err)
 	}
 
 	master := m.dataPlane.masterInterface
@@ -140,20 +193,19 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 		master = topology.MasterInterface
 		if defaultIface := topology.MuxInterfaces[spec.DefaultMuxID]; defaultIface != "" {
 			m.dataPlane.masterInterface = master
-			snapshot := DataPlaneSnapshot{
-				Generation:       m.dataPlane.snapshot.Generation + 1,
-				Mode:             spec.Mode,
-				DefaultInterface: defaultIface,
-				DefaultMuxID:     spec.DefaultMuxID,
-			}
-			m.dataPlane.snapshot = snapshot
 			m.mu.Lock()
 			m.masterIface = master
 			m.muxIface = defaultIface
 			m.mu.Unlock()
-			return snapshot, nil
+			return DataPlaneSnapshot{
+				Generation:       m.dataPlane.snapshot.Generation + 1,
+				Mode:             DataPlaneModeQMAP,
+				DefaultInterface: defaultIface,
+				DefaultMuxID:     spec.DefaultMuxID,
+			}, nil
 		}
 	}
+
 	ops := m.resolvedDataPlaneOps()
 	if err := ops.enableRawIP(master); err != nil {
 		m.log.WithError(err).Warn("开启 Raw IP 模式失败")
@@ -162,22 +214,15 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 	if err != nil {
 		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: create default data mux: %w", err)
 	}
-
 	m.dataPlane.masterInterface = master
-	snapshot := DataPlaneSnapshot{
-		Generation:       m.dataPlane.snapshot.Generation + 1,
-		Mode:             spec.Mode,
-		DefaultInterface: defaultIface,
-		DefaultMuxID:     spec.DefaultMuxID,
-	}
-	m.dataPlane.snapshot = snapshot
-
-	// Transitional internal state for the existing default dial path. No
-	// external caller receives either of these mutable names through this API.
 	m.mu.Lock()
 	m.masterIface = master
 	m.muxIface = defaultIface
 	m.mu.Unlock()
-
-	return snapshot, nil
+	return DataPlaneSnapshot{
+		Generation:       m.dataPlane.snapshot.Generation + 1,
+		Mode:             DataPlaneModeQMAP,
+		DefaultInterface: defaultIface,
+		DefaultMuxID:     spec.DefaultMuxID,
+	}, nil
 }

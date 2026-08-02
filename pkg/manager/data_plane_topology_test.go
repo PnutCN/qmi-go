@@ -45,8 +45,8 @@ func TestEnsureDataPlaneTopologySkipsMuxWorkWhenNative(t *testing.T) {
 	if m.muxIface != "" {
 		t.Fatalf("muxIface = %q, want empty — MuxID=0 must not touch mux state", m.muxIface)
 	}
-	if m.masterIface != "" {
-		t.Fatalf("masterIface = %q, want empty — MuxID=0 must not rename the master", m.masterIface)
+	if m.masterIface != "wwan0" {
+		t.Fatalf("masterIface = %q, want the published Native master", m.masterIface)
 	}
 }
 

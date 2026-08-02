@@ -2,12 +2,115 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
+
+// TestConvergeDataPlaneDegradesToNativeWhenQMAPFails pins the second rung of
+// the fallback ladder: a declared QMAP topology that cannot create its mux
+// must publish Native with the reason, preserving the default data connection.
+func TestConvergeDataPlaneDegradesToNativeWhenQMAPFails(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
+		DataPlanePolicy: DataPlanePolicyLazy,
+	}
+	m.wda = &qmi.WDAService{}
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(0)
+		return &got, nil
+	}
+	m.setDataFormatFn = func(context.Context, qmi.DataFormat) error { return nil }
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "wwp0s20u1i4", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "", errors.New("add_mux unsupported") },
+	}
+
+	got, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{
+		Mode: DataPlaneModeQMAP, DefaultMuxID: 1,
+	})
+	if err != nil {
+		t.Fatalf("ConvergeDataPlane() error = %v, want nil (QMAP failure must degrade instead of failing)", err)
+	}
+	if got.Mode != DataPlaneModeNative {
+		t.Fatalf("Mode = %q, want %q", got.Mode, DataPlaneModeNative)
+	}
+	if got.DefaultInterface != "wwp0s20u1i4" {
+		t.Fatalf("DefaultInterface = %q, want the physical master", got.DefaultInterface)
+	}
+	if got.DegradedReason == "" {
+		t.Fatal("DegradedReason is empty: a degraded convergence must carry the QMAP failure")
+	}
+}
+
+// TestConvergeDataPlaneReturnsErrorWhenNativeFallbackAlsoFails pins the third
+// rung: if Native cannot be established either, the real failure is exposed.
+func TestConvergeDataPlaneReturnsErrorWhenNativeFallbackAlsoFails(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
+		DataPlanePolicy: DataPlanePolicyLazy,
+	}
+	m.wda = &qmi.WDAService{}
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
+	m.setDataFormatFn = func(context.Context, qmi.DataFormat) error {
+		return errors.New("WDA unavailable")
+	}
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "wwp0s20u1i4", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "", errors.New("add_mux unsupported") },
+	}
+
+	if _, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{
+		Mode: DataPlaneModeQMAP, DefaultMuxID: 1,
+	}); err == nil {
+		t.Fatal("expected an error: QMAP and Native must both fail before returning success")
+	}
+}
+
+// TestConvergeDataPlaneRecordsDeclaredSpec pins the separation between
+// topology intent and the currently published result.
+func TestConvergeDataPlaneRecordsDeclaredSpec(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
+		DataPlanePolicy: DataPlanePolicyLazy,
+	}
+	m.wda = &qmi.WDAService{}
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			return netcfg.QMAPTopology{MasterInterface: "wwp0s20u1i4", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "qmimux0", nil },
+	}
+
+	if _, err := m.ConvergeDataPlane(context.Background(), DataPlaneSpec{
+		Mode: DataPlaneModeQMAP, DefaultMuxID: 1,
+	}); err != nil {
+		t.Fatalf("ConvergeDataPlane() error = %v", err)
+	}
+	if got := m.declaredDataPlaneSpec(); got.Mode != DataPlaneModeQMAP || got.DefaultMuxID != 1 {
+		t.Fatalf("declaredDataPlaneSpec() = %+v, want {QMAP 1}", got)
+	}
+}
 
 func TestConvergeDataPlanePublishesAfterMasterMutation(t *testing.T) {
 	m := newRecoveryTestManager()
