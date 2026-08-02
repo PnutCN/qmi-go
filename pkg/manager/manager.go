@@ -1204,6 +1204,14 @@ func (m *Manager) dataPlaneDisabled() bool {
 }
 
 func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
+	m.dataPlane.mu.Lock()
+	defer m.dataPlane.mu.Unlock()
+	return m.ensureDataPlaneServicesLocked(ctx)
+}
+
+// ensureDataPlaneServicesLocked allocates WDA/WDS and reconciles residual
+// muxes. Callers must hold m.dataPlane.mu.
+func (m *Manager) ensureDataPlaneServicesLocked(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1247,10 +1255,7 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		}
 		m.log.Debug("Allocated WDA client")
 
-		keepMuxIDs := []uint8{}
-		if m.cfg.MuxID > 0 {
-			keepMuxIDs = append(keepMuxIDs, m.cfg.MuxID)
-		}
+		keepMuxIDs := m.activeMuxIDsLocked()
 		// Clear any QMAP mux left allocated by a crashed previous process
 		// before enableRawIP runs. New topologies keep the configured
 		// physical-master name; discovery rejects an incompatible legacy
@@ -2939,6 +2944,11 @@ func (m *Manager) cleanup() {
 	// Secondary PDNs own independent WDS clients and muxes, but share this
 	// manager's transport. Release them before clearing the shared services.
 	m.closeManagedPDNSessions(cleanupCtx)
+	topology, _ := m.defaultDataPlaneTarget()
+	m.dataPlane.mu.Lock()
+	m.dataPlane.snapshot = DataPlaneSnapshot{}
+	m.dataPlane.masterInterface = ""
+	m.dataPlane.mu.Unlock()
 
 	m.mu.Lock()
 	wds := m.wds
@@ -2958,7 +2968,12 @@ func (m *Manager) cleanup() {
 	ifname := m.cfg.Device.NetInterface
 
 	muxIface := m.muxIface
-	muxID := m.cfg.MuxID
+	muxID := topology.DefaultMuxID
+	if muxID == 0 {
+		// Transitional compatibility for callers that have not published a
+		// snapshot yet. Task 6 removes this Config.MuxID-derived fallback.
+		muxID = m.declaredDataPlaneSpec().DefaultMuxID
+	}
 	masterIface := m.masterIface
 	if masterIface == "" {
 		masterIface = m.cfg.Device.NetInterface
@@ -4118,7 +4133,14 @@ func (m *Manager) handleDialFailure(err error) {
 	delay := m.getRetryDelay()
 	m.retryCount++
 	if m.retryCount == m.cfg.RetryPolicy.RadioResetAfter {
-		go m.RadioReset()
+		// Radio reset is device-wide and would destroy an active secondary
+		// PDN such as the VoLTE IMS bearer. The default connection may retry,
+		// but it cannot reset the radio while another owner is live.
+		if m.hasActiveManagedPDN() {
+			m.log.Warn("默认数据连接重试已达射频复位阈值，但存在活跃的次级 PDN(如 VoLTE IMS 承载)，跳过射频复位")
+		} else {
+			go m.RadioReset()
+		}
 	}
 	m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected, Error: err})
 	m.log.Infof("Will retry in %v (%d/%d)", delay, m.retryCount, len(m.retryDelays))

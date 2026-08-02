@@ -123,7 +123,7 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 		snapshot.Mode == spec.Mode && snapshot.DefaultMuxID == spec.DefaultMuxID {
 		return snapshot, nil
 	}
-	if err := m.ensureDataPlaneServices(ctx); err != nil {
+	if err := m.ensureDataPlaneServicesLocked(ctx); err != nil {
 		return DataPlaneSnapshot{}, fmt.Errorf("qmi manager: allocate data-plane services: %w", err)
 	}
 
@@ -156,6 +156,38 @@ func (m *Manager) ConvergeDataPlane(ctx context.Context, spec DataPlaneSpec) (Da
 	degraded.DegradedReason = qmapErr.Error()
 	m.dataPlane.snapshot = degraded
 	return degraded, nil
+}
+
+// hasActiveManagedPDN reports whether any secondary PDN is currently open on
+// this Manager.
+func (m *Manager) hasActiveManagedPDN() bool {
+	m.dataPlane.mu.Lock()
+	defer m.dataPlane.mu.Unlock()
+	return len(m.dataPlane.sessions) > 0
+}
+
+// activeMuxIDsLocked returns every mux that residual cleanup must preserve:
+// the published or declared default mux and every live managed PDN session.
+// Callers must hold m.dataPlane.mu.
+func (m *Manager) activeMuxIDsLocked() []uint8 {
+	seen := make(map[uint8]struct{})
+	add := func(id uint8) {
+		if id > 0 {
+			seen[id] = struct{}{}
+		}
+	}
+	add(m.dataPlane.snapshot.DefaultMuxID)
+	add(m.dataPlane.declaredSpec.DefaultMuxID)
+	for _, session := range m.dataPlane.sessions {
+		if session != nil {
+			add(session.muxID)
+		}
+	}
+	ids := make([]uint8, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // convergeNativeLocked brings the device to native framing and returns the

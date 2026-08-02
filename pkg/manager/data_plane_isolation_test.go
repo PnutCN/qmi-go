@@ -128,4 +128,61 @@ func TestDisconnectUsesPhysicalInterfaceWhenNative(t *testing.T) {
 	}
 }
 
+// TestHasActiveManagedPDNTracksSessions ensures active-PDN state comes from
+// persistent session records rather than the short-lived reservation map.
+func TestHasActiveManagedPDNTracksSessions(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	if m.hasActiveManagedPDN() {
+		t.Fatal("empty sessions must not report an active PDN")
+	}
+	m.dataPlane.sessions = map[uint64]*managedPDNSession{
+		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+	}
+	if !m.hasActiveManagedPDN() {
+		t.Fatal("a live session must report an active PDN")
+	}
+}
+
+// TestResidualMuxReconcileKeepsActiveIMSMux protects an established secondary
+// PDN from residual-mux cleanup. reservedMuxes is intentionally insufficient:
+// it is removed as soon as OpenPDN finishes.
+func TestResidualMuxReconcileKeepsActiveIMSMux(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.dataPlane.sessions = map[uint64]*managedPDNSession{
+		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+	}
+
+	m.dataPlane.mu.Lock()
+	keep := m.activeMuxIDsLocked()
+	m.dataPlane.mu.Unlock()
+
+	seen := map[uint8]bool{}
+	for _, id := range keep {
+		seen[id] = true
+	}
+	if !seen[1] {
+		t.Fatalf("keep = %v, must include default mux 1", keep)
+	}
+	if !seen[2] {
+		t.Fatalf("keep = %v, must include active IMS mux 2", keep)
+	}
+}
+
+// TestActiveMuxIDsIncludesDeclaredDefaultBeforePublish protects the first
+// convergence: the declared default must survive cleanup before a snapshot is
+// available.
+func TestActiveMuxIDsIncludesDeclaredDefaultBeforePublish(t *testing.T) {
+	m := newCoexistTestManager(t, "qmimux0", 1)
+	m.dataPlane.snapshot = DataPlaneSnapshot{}
+	m.dataPlane.declaredSpec = DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1}
+
+	m.dataPlane.mu.Lock()
+	keep := m.activeMuxIDsLocked()
+	m.dataPlane.mu.Unlock()
+
+	if len(keep) != 1 || keep[0] != 1 {
+		t.Fatalf("keep = %v, want [1] from the declared spec", keep)
+	}
+}
+
 var _ = qmi.MuxBinding{}
