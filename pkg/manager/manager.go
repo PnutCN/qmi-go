@@ -79,11 +79,7 @@ type Config struct {
 	DisableVOICEInd bool        // Disable VOICE indications / 禁用 VOICE 指示
 
 	ProfileIndex uint8 // PDN Profile 索引 (对应 -n 参数, 默认 0 表示使用模组默认 Profile)
-	MuxID        uint8 // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
-	// DataPlane declares the topology intent for this Manager. A zero Mode
-	// temporarily means "not declared" and uses the legacy MuxID fallback;
-	// all production callers are migrated to this field before that fallback
-	// is removed.
+	// DataPlane declares the topology intent for this Manager.
 	DataPlane DataPlaneSpec
 	NoDial    bool // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
 
@@ -2624,10 +2620,9 @@ func (m *Manager) voiceIndicationRegistration() (qmi.VoiceIndicationRegistration
 	}, true
 }
 
-// dataFormatTargetForMux returns the WDA data format a device must be in for
-// the given MuxID: QMAP aggregation when muxed (muxID > 0), disabled
-// otherwise. Pure and side-effect-free so enableRawIP's target derivation is
-// testable without a modem.
+// dataFormatTargetForMux returns the WDA data format required by a topology
+// with the given default mux. It is pure and side-effect-free so topology
+// convergence can test it without a modem.
 func dataFormatTargetForMux(muxID uint8) qmi.DataFormat {
 	target := qmi.DataFormat{
 		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
@@ -2680,16 +2675,8 @@ func (m *Manager) modemDataFormatMatches(ctx context.Context, target qmi.DataFor
 // + UL/DL aggregation) match target, reading the current value first so an
 // already-correct modem is left untouched.
 //
-// This is the only place that mutates the modem's aggregation protocol.
-// Both enableRawIP (initial Manager setup, based on the MuxID known when the
-// Manager was constructed) and ConvergeDataPlane (runtime policy changes,
-// e.g. a device discovered with IMS disabled that only learns it needs VoLTE
-// after its card policy resolves) funnel through it, so the kernel-side mux
-// topology decision and the modem-side QMAP framing decision can never drift
-// apart. Before this, only enableRawIP touched the modem's data format, and
-// it never re-ran after the Manager's initial MuxID turned out to be wrong
-// (see the WDSBindMuxDataPort INVALID_ARGUMENT incident this closes) --
-// exactly the class of bug ADR-0008 exists to prevent.
+// This is the only place that mutates the modem's aggregation protocol, so
+// the kernel-side mux topology and modem-side QMAP framing cannot drift apart.
 func (m *Manager) ensureModemDataFormat(ctx context.Context, target qmi.DataFormat) error {
 	if m.wda == nil {
 		return fmt.Errorf("WDA service not available")
@@ -2706,13 +2693,14 @@ func (m *Manager) ensureModemDataFormat(ctx context.Context, target qmi.DataForm
 	return setDataFormat(setCtx, target)
 }
 
-// enableRawIP enables RawIP mode on both the modem (WDA) and the kernel interface / 启用RawIP模式：同时在Modem(WDA)和内核接口上启用
+// enableRawIP enables RawIP mode on the kernel interface.
+//
+// Modem-side data format belongs to ensureModemDataFormat, driven by the
+// declared DataPlaneSpec. Keeping that mutation in one place prevents the
+// kernel and modem topology writers from fighting each other.
 func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
 		return m.enableRawIPHook(parent)
-	}
-	if m.wda == nil {
-		return fmt.Errorf("WDA service not available")
 	}
 
 	// 1. Kernel Check (Linux Only) / 1. 内核检查 (仅限Linux)
@@ -2740,40 +2728,15 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	} else {
 		// Non-Linux platforms: Assume kernel/driver doesn't need manual raw_ip toggle via sysfs / 非Linux平台：假设内核/驱动不需要通过sysfs手动切换raw_ip
 		// or it's always enabled/handled by driver. / 或者它总是由驱动程序启用/处理。
-		// We still proceed to configure the Modem, as that's platform independent QMI. / 我们仍然继续配置Modem，因为那是与平台无关的QMI。
-		kernelEnabled = true // Treat as "done" for the purpose of the combined check / 将其视为“已完成”以进行组合检查
+		kernelEnabled = true // The driver handles raw_ip outside sysfs.
 	}
 
-	// Target data format is derived from MuxID: a muxed connection (MuxID>0)
-	// requires QMAP aggregation on both directions, or bindMux fails
-	// (measured: EC25 0x0030, EM7511 0x0003); a native connection requires
-	// aggregation disabled, or an un-mux'd netdev receives QMAP-framed
-	// packets it cannot parse (this is what silently broke the default data
-	// connection in the incident this target-driven rewrite closes -- see
-	// ADR-0008). MuxID never changes for the lifetime of a Manager, so this
-	// target is the SAME on every call, unlike the old raw-IP-only check.
-	target := dataFormatTargetForMux(m.cfg.MuxID)
-
-	// Optimization: Check if already at target in Modem (if WDA available) / 优化：检查Modem中是否已处于目标状态 (如果WDA可用)
-	modemEnabled, checkErr := m.modemDataFormatMatches(parent, target)
-	if checkErr != nil {
-		m.log.WithError(checkErr).Debug("Failed to get current data format, assuming mismatch")
-	}
-
-	if kernelEnabled && modemEnabled {
-		m.log.Info("Raw IP mode already at target, skipping configuration")
+	if kernelEnabled {
+		m.log.Debug("Kernel raw_ip already enabled, skipping")
 		return nil
 	}
 
-	// 2. Set Modem Data Format to target / 2. 将Modem数据格式设置为目标状态
-	m.log.Infof("Setting modem data format to target (mux=%d)...", m.cfg.MuxID)
-	if err := m.ensureModemDataFormat(parent, target); err != nil {
-		m.log.WithError(err).Warn("Failed to set modem data format to target (might already be set or not supported), continuing to force kernel...")
-	} else {
-		m.log.Infof("Modem data format set to target (mux=%d)", m.cfg.MuxID)
-	}
-
-	// 3. Enable Raw IP in kernel (Linux Only) / 3. 在内核中启用Raw IP (仅限Linux)
+	// Enable Raw IP in kernel (Linux Only).
 	if isLinux && !kernelEnabled {
 		// Check again if file exists before writing / 在写入之前再次检查文件是否存在
 		if _, err := os.Stat(sysfsPath); os.IsNotExist(err) {
@@ -2969,11 +2932,6 @@ func (m *Manager) cleanup() {
 
 	muxIface := m.muxIface
 	muxID := topology.DefaultMuxID
-	if muxID == 0 {
-		// Transitional compatibility for callers that have not published a
-		// snapshot yet. Task 6 removes this Config.MuxID-derived fallback.
-		muxID = m.declaredDataPlaneSpec().DefaultMuxID
-	}
 	masterIface := m.masterIface
 	if masterIface == "" {
 		masterIface = m.cfg.Device.NetInterface

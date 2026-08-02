@@ -53,7 +53,17 @@ func TestCleanupDeletesDefaultMuxFromResolvedQMAPMaster(t *testing.T) {
 	t.Cleanup(func() { netcfg.SetConfigurator(original) })
 
 	m := newRecoveryTestManager()
-	m.cfg = Config{Device: ModemDevice{NetInterface: "wwan0"}, MuxID: 1, Timeouts: TimeoutConfig{Stop: time.Second}}
+	m.cfg = Config{
+		Device:    ModemDevice{NetInterface: "wwan0"},
+		DataPlane: DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
+		Timeouts:  TimeoutConfig{Stop: time.Second},
+	}
+	m.dataPlane.snapshot = DataPlaneSnapshot{
+		Generation:       1,
+		Mode:             DataPlaneModeQMAP,
+		DefaultInterface: "qmimux7",
+		DefaultMuxID:     1,
+	}
 	m.muxIface = "qmimux7"
 	m.masterIface = "wwan0_q_q"
 

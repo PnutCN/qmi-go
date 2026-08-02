@@ -36,13 +36,6 @@ type DataPlaneSnapshot struct {
 	DegradedReason string
 }
 
-func dataPlaneSpecFromConfig(cfg Config) DataPlaneSpec {
-	if cfg.MuxID == 0 {
-		return DataPlaneSpec{Mode: DataPlaneModeNative}
-	}
-	return DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: cfg.MuxID}
-}
-
 type dataPlaneController struct {
 	mu              sync.Mutex
 	snapshot        DataPlaneSnapshot
@@ -54,8 +47,9 @@ type dataPlaneController struct {
 }
 
 // declaredDataPlaneSpec returns the topology intent this Manager converges
-// to. Precedence is the most recent explicit ConvergeDataPlane declaration,
-// then Config.DataPlane, and finally the transitional MuxID derivation.
+// to: the most recent explicit ConvergeDataPlane declaration, otherwise the
+// Config.DataPlane declaration. There is deliberately no derivation from
+// unrelated configuration fields: topology is a runtime decision.
 func (m *Manager) declaredDataPlaneSpec() DataPlaneSpec {
 	m.dataPlane.mu.Lock()
 	declared := m.dataPlane.declaredSpec
@@ -63,10 +57,7 @@ func (m *Manager) declaredDataPlaneSpec() DataPlaneSpec {
 	if declared.Mode != "" {
 		return declared
 	}
-	if m.cfg.DataPlane.Mode != "" {
-		return m.cfg.DataPlane
-	}
-	return dataPlaneSpecFromConfig(m.cfg)
+	return m.cfg.DataPlane
 }
 
 type dataPlaneOps struct {

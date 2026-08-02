@@ -48,6 +48,15 @@ var (
 
 const Version = "1.0.0"
 
+// dataPlaneSpecFromFlag turns the -m flag into an explicit topology
+// declaration. Manager no longer derives topology from unrelated config.
+func dataPlaneSpecFromFlag(muxID uint8) manager.DataPlaneSpec {
+	if muxID == 0 {
+		return manager.DataPlaneSpec{Mode: manager.DataPlaneModeNative}
+	}
+	return manager.DataPlaneSpec{Mode: manager.DataPlaneModeQMAP, DefaultMuxID: muxID}
+}
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Quectel-CM Go Edition v%s\n", Version)
@@ -141,7 +150,7 @@ func main() {
 		NoRoute:       !*setRoute,
 		NoDNS:         !*setDNS,
 		ProfileIndex:  uint8(*profileIndex),
-		MuxID:         uint8(*muxID),
+		DataPlane:     dataPlaneSpecFromFlag(uint8(*muxID)),
 		ClientOptions: qmi.ClientOptions{UseQRTR: *useQRTR},
 	}
 

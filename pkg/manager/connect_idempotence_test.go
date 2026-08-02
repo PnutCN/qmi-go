@@ -15,6 +15,7 @@ func TestConnectIsIdempotentWhileConnecting(t *testing.T) {
 		Device:          ModemDevice{NetInterface: "wwan0"},
 		EnableIPv4:      true,
 		DataPlanePolicy: DataPlanePolicyLazy,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeNative},
 		Timeouts:        TimeoutConfig{Dial: time.Second},
 	}
 	m.client = &qmi.Client{}

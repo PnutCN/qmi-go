@@ -24,7 +24,7 @@ func TestEnsureDataPlaneTopologySkipsMuxWorkWhenNative(t *testing.T) {
 		Device:          ModemDevice{NetInterface: "wwan0"},
 		EnableIPv4:      true,
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           0,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeNative},
 	}
 	m.client = &qmi.Client{}
 	m.newWDSService = func(context.Context, *qmi.Client) (*qmi.WDSService, error) {
@@ -62,7 +62,7 @@ func TestEnsureDataPlaneTopologyAttemptsMuxSetupWhenMuxed(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "nonexistent-test-iface-topology"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	m.client = &qmi.Client{}
 	m.newWDAService = func(context.Context, *qmi.Client) (*qmi.WDAService, error) {
@@ -96,7 +96,7 @@ func TestEnsureDataPlaneTopologyIsIdempotent(t *testing.T) {
 		Device:          ModemDevice{NetInterface: "wwan0"},
 		EnableIPv4:      true,
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           0,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeNative},
 	}
 	m.client = &qmi.Client{}
 	wdaCalls := 0

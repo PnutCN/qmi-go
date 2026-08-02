@@ -117,7 +117,7 @@ func TestConvergeDataPlanePublishesAfterMasterMutation(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	// Keep this test at topology ownership: no real QMI client allocation is
 	// needed when a WDA service has already been established.
@@ -162,7 +162,7 @@ func TestConvergeDataPlaneCoalescesConcurrentSameSpec(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	m.wda = &qmi.WDAService{}
 	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
@@ -242,7 +242,7 @@ func TestConvergeDataPlaneSwitchesModemToQMAPWhenSpecRequiresIt(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           0, // built disabled, like a freshly discovered device
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeNative}, // initially native before runtime policy convergence
 	}
 	m.wda = &qmi.WDAService{}
 	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
@@ -286,7 +286,7 @@ func TestConvergeDataPlaneSkipsModemWriteWhenAlreadyQMAP(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	m.wda = &qmi.WDAService{}
 	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
@@ -321,7 +321,7 @@ func TestConvergeDataPlaneAdoptsExistingRenamedTopology(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	m.wda = &qmi.WDAService{}
 	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
@@ -365,7 +365,7 @@ func TestEnsureDataPlaneTopologyReusesConvergedQMAP(t *testing.T) {
 	m.cfg = Config{
 		Device:          ModemDevice{NetInterface: "wwp0s20u1i4"},
 		DataPlanePolicy: DataPlanePolicyLazy,
-		MuxID:           1,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
 	}
 	m.wda = &qmi.WDAService{}
 	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
