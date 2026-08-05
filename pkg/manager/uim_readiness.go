@@ -35,6 +35,10 @@ type UIMReadiness struct {
 	ProvisioningActive bool
 	NeedsProvisioning  bool
 	Reason             UIMReadinessReason
+	ActiveSlotIsEUICC bool  // 激活槽内是否为 eUICC（eSIM 芯片）
+	PIN1Retries       uint8 // PIN1 剩余验证次数
+	PUK1Retries       uint8 // PUK1 剩余解锁次数
+	CardDetailsKnown  bool  // PIN1Retries/PUK1Retries 是否取到有效值
 	Err            error
 }
 
@@ -85,6 +89,24 @@ func resolveActiveUIMSlot(info *qmi.UIMSlotStatus) (uint8, bool, string) {
 	return 0, false, ""
 }
 
+// resolveActiveUIMSlotEUICC 判定当前激活槽内的卡是否为 eUICC。
+// 判定条件与 resolveActiveUIMSlot 完全一致：卡在位且槽处于激活态。
+func resolveActiveUIMSlotEUICC(info *qmi.UIMSlotStatus) bool {
+	if info == nil {
+		return false
+	}
+	for _, slot := range info.Slots {
+		if slot.PhysicalCardStatus != qmi.UIMPhysicalCardStatePresent {
+			continue
+		}
+		if slot.PhysicalSlotStatus != qmi.UIMSlotStateActive {
+			continue
+		}
+		return slot.IsEUICC
+	}
+	return false
+}
+
 func buildUIMReadiness(status qmi.SIMStatus, details *qmi.CardStatusDetails, slotInfo *qmi.UIMSlotStatus, ids DeviceIdentities, sourceErr error) UIMReadiness {
 	return buildUIMReadinessWithSlotError(status, details, slotInfo, ids, sourceErr, nil)
 }
@@ -105,6 +127,12 @@ func buildUIMReadinessWithSlotError(status qmi.SIMStatus, details *qmi.CardStatu
 		ICCID:          strings.TrimSpace(ids.ICCID),
 		IMSI:           strings.TrimSpace(ids.IMSI),
 		Err:            sourceErr,
+	}
+	out.ActiveSlotIsEUICC = resolveActiveUIMSlotEUICC(slotInfo)
+	if details != nil {
+		out.CardDetailsKnown = true
+		out.PIN1Retries = details.PIN1Retries
+		out.PUK1Retries = details.PUK1Retries
 	}
 
 	if cardErr != nil {

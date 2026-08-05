@@ -328,3 +328,100 @@ func TestBuildUIMReadinessReadyAppIsProvisioned(t *testing.T) {
 		t.Fatalf("ready app must be UIMReady/Ready, got %+v", r)
 	}
 }
+
+func TestResolveActiveUIMSlotEUICC(t *testing.T) {
+	cases := []struct {
+		name string
+		info *qmi.UIMSlotStatus
+		want bool
+	}{
+		{"nil 输入", nil, false},
+		{"无槽", &qmi.UIMSlotStatus{}, false},
+		{
+			name: "激活槽是实体卡",
+			info: &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{{
+				PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+				PhysicalSlotStatus: qmi.UIMSlotStateActive,
+				LogicalSlot:        1,
+				IsEUICC:            false,
+			}}},
+			want: false,
+		},
+		{
+			name: "激活槽是 eUICC",
+			info: &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{{
+				PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+				PhysicalSlotStatus: qmi.UIMSlotStateActive,
+				LogicalSlot:        1,
+				IsEUICC:            true,
+			}}},
+			want: true,
+		},
+		{
+			name: "eUICC 在未激活槽，不应被采纳",
+			info: &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{
+				{
+					PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+					PhysicalSlotStatus: 0,
+					LogicalSlot:        1,
+					IsEUICC:            true,
+				},
+				{
+					PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+					PhysicalSlotStatus: qmi.UIMSlotStateActive,
+					LogicalSlot:        2,
+					IsEUICC:            false,
+				},
+			}},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolveActiveUIMSlotEUICC(c.info); got != c.want {
+				t.Fatalf("resolveActiveUIMSlotEUICC = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuildUIMReadinessCarriesCardDetails(t *testing.T) {
+	details := &qmi.CardStatusDetails{
+		CardState:   0x01,
+		AppState:    qmi.UIMAppStateReady,
+		PIN1Retries: 3,
+		PUK1Retries: 10,
+	}
+	slotInfo := &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{{
+		PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+		PhysicalSlotStatus: qmi.UIMSlotStateActive,
+		LogicalSlot:        1,
+		IsEUICC:            true,
+	}}}
+	ids := DeviceIdentities{ICCID: "8964", IMSI: "5302"}
+
+	out := buildUIMReadiness(qmi.SIMReady, details, slotInfo, ids, nil)
+
+	if !out.CardDetailsKnown {
+		t.Fatal("CardDetailsKnown 应为 true")
+	}
+	if out.PIN1Retries != 3 || out.PUK1Retries != 10 {
+		t.Fatalf("PIN1Retries=%d PUK1Retries=%d, want 3/10", out.PIN1Retries, out.PUK1Retries)
+	}
+	if !out.ActiveSlotIsEUICC {
+		t.Fatal("ActiveSlotIsEUICC 应为 true")
+	}
+	if out.ActiveSlot != 1 {
+		t.Fatalf("ActiveSlot=%d, want 1", out.ActiveSlot)
+	}
+}
+
+func TestBuildUIMReadinessWithoutCardDetails(t *testing.T) {
+	out := buildUIMReadiness(qmi.SIMReady, nil, nil, DeviceIdentities{ICCID: "8964"}, nil)
+	if out.CardDetailsKnown {
+		t.Fatal("details 为 nil 时 CardDetailsKnown 应为 false")
+	}
+	if out.ActiveSlotIsEUICC {
+		t.Fatal("slotInfo 为 nil 时 ActiveSlotIsEUICC 应为 false")
+	}
+}
