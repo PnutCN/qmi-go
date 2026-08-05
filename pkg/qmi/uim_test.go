@@ -22,3 +22,28 @@ func TestDispatchUIMIndications(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildSendAPDUTLVsOmitsChannelIDForBasicChannel(t *testing.T) {
+	tlvs := buildSendAPDUTLVs(1, 0, []byte{0x80, 0xC2, 0x00, 0x00})
+
+	for _, tlv := range tlvs {
+		if tlv.Type == 0x10 {
+			t.Fatal("basic channel must omit the optional Channel ID TLV")
+		}
+	}
+}
+
+func TestBuildSendAPDUTLVsKeepsChannelIDForLogicalChannel(t *testing.T) {
+	tlvs := buildSendAPDUTLVs(1, 2, []byte{0x00, 0xA4, 0x04, 0x00})
+
+	for _, tlv := range tlvs {
+		if tlv.Type != 0x10 {
+			continue
+		}
+		if len(tlv.Value) != 1 || tlv.Value[0] != 2 {
+			t.Fatalf("Channel ID TLV = %v, want [2]", tlv.Value)
+		}
+		return
+	}
+	t.Fatal("logical channel must include the Channel ID TLV")
+}

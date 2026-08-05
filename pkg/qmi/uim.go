@@ -623,11 +623,15 @@ func buildSendAPDUTLVs(slot uint8, channel uint8, command []byte) []TLV {
 	value := make([]byte, 2+len(command))
 	binary.LittleEndian.PutUint16(value[0:2], uint16(length))
 	copy(value[2:], command)
-	return []TLV{
-		{Type: 0x10, Value: []byte{channel}},
-		{Type: 0x02, Value: value},
-		{Type: 0x01, Value: []byte{slot}},
+
+	tlvs := make([]TLV, 0, 3)
+	if channel != 0 {
+		tlvs = append(tlvs, TLV{Type: 0x10, Value: []byte{channel}})
 	}
+	return append(tlvs,
+		TLV{Type: 0x02, Value: value},
+		TLV{Type: 0x01, Value: []byte{slot}},
+	)
 }
 
 func uimBoolToByte(v bool) byte {
