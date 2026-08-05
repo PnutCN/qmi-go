@@ -425,3 +425,72 @@ func TestBuildUIMReadinessWithoutCardDetails(t *testing.T) {
 		t.Fatal("slotInfo 为 nil 时 ActiveSlotIsEUICC 应为 false")
 	}
 }
+
+// TestResolveActiveUIMPhysicalSlotDiffersFromLogicalSlot 复现真实双物理槽 eSIM 设备上的
+// 逻辑槽号与物理槽位置不一致的场景：
+//
+//	qmicli -d /dev/cdc-wdm1 -p --uim-get-slot-status
+//	Physical slot 1: absent, inactive
+//	Physical slot 2: present, active, Logical slot: 1, Is eUICC: yes
+//
+// resolveActiveUIMSlot（供 post_switch_convergence 之类的切卡收敛判断使用）应继续返回
+// 逻辑槽号 1；resolveActiveUIMPhysicalSlot（供人类可读的卡槽展示使用）必须返回物理槽位置 2。
+func TestResolveActiveUIMPhysicalSlotDiffersFromLogicalSlot(t *testing.T) {
+	info := &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{
+		{
+			PhysicalCardStatus: 0, // absent
+			PhysicalSlotStatus: 0, // inactive
+		},
+		{
+			PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+			PhysicalSlotStatus: qmi.UIMSlotStateActive,
+			LogicalSlot:        1,
+			IsEUICC:            true,
+		},
+	}}
+
+	logicalSlot, logicalKnown, _ := resolveActiveUIMSlot(info)
+	if !logicalKnown || logicalSlot != 1 {
+		t.Fatalf("resolveActiveUIMSlot = (%d, %v), want (1, true)（既有切卡收敛语义不应被本次修复改变）", logicalSlot, logicalKnown)
+	}
+
+	physicalSlot, physicalKnown := resolveActiveUIMPhysicalSlot(info)
+	if !physicalKnown || physicalSlot != 2 {
+		t.Fatalf("resolveActiveUIMPhysicalSlot = (%d, %v), want (2, true)（应返回物理槽位置，即 qmicli 里的 Physical slot 2）", physicalSlot, physicalKnown)
+	}
+}
+
+func TestResolveActiveUIMPhysicalSlotNoActiveSlot(t *testing.T) {
+	slot, known := resolveActiveUIMPhysicalSlot(nil)
+	if known || slot != 0 {
+		t.Fatalf("resolveActiveUIMPhysicalSlot(nil) = (%d, %v), want (0, false)", slot, known)
+	}
+
+	info := &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{{PhysicalCardStatus: 0, PhysicalSlotStatus: 0}}}
+	slot, known = resolveActiveUIMPhysicalSlot(info)
+	if known || slot != 0 {
+		t.Fatalf("无激活槽时 resolveActiveUIMPhysicalSlot = (%d, %v), want (0, false)", slot, known)
+	}
+}
+
+func TestBuildUIMReadinessCarriesActivePhysicalSlot(t *testing.T) {
+	info := &qmi.UIMSlotStatus{Slots: []qmi.UIMSlotStatusSlot{
+		{PhysicalCardStatus: 0, PhysicalSlotStatus: 0},
+		{
+			PhysicalCardStatus: qmi.UIMPhysicalCardStatePresent,
+			PhysicalSlotStatus: qmi.UIMSlotStateActive,
+			LogicalSlot:        1,
+			IsEUICC:            true,
+		},
+	}}
+	ids := DeviceIdentities{ICCID: "8964", IMSI: "5302"}
+
+	out := buildUIMReadiness(qmi.SIMReady, &qmi.CardStatusDetails{CardState: 0x01}, info, ids, nil)
+
+	if out.ActiveSlot != 1 {
+		t.Fatalf("ActiveSlot(逻辑槽) = %d, want 1", out.ActiveSlot)
+	}
+	if !out.PhysicalSlotKnown || out.ActivePhysicalSlot != 2 {
+		t.Fatalf("ActivePhysicalSlot=%d PhysicalSlotKnown=%v, want 2/true", out.ActivePhysicalSlot, out.PhysicalSlotKnown)
+	}
+}
