@@ -494,3 +494,70 @@ func TestBuildUIMReadinessCarriesActivePhysicalSlot(t *testing.T) {
 		t.Fatalf("ActivePhysicalSlot=%d PhysicalSlotKnown=%v, want 2/true", out.ActivePhysicalSlot, out.PhysicalSlotKnown)
 	}
 }
+
+// TestBuildUIMReadinessCarriesCardAndPINState CardState 与 PIN1State 必须透传：
+// qmi.SIMBlocked 同时承载「卡错误(CardState=2)」与「PIN 永久锁死」两种语义，
+// 上层只拿 SIMStatus 无从区分，会把瞬态卡错误误报成 PUK 锁定。
+func TestBuildUIMReadinessCarriesCardAndPINState(t *testing.T) {
+	cases := []struct {
+		name          string
+		details       *qmi.CardStatusDetails
+		status        qmi.SIMStatus
+		wantCardState uint8
+		wantPIN1      qmi.PINStatus
+		wantKnown     bool
+	}{
+		{
+			name:          "卡错误",
+			details:       &qmi.CardStatusDetails{CardState: 0x02},
+			status:        qmi.SIMBlocked,
+			wantCardState: 0x02,
+			wantPIN1:      qmi.PINStatusNotInit,
+			wantKnown:     true,
+		},
+		{
+			name: "PIN 被锁需要 PUK",
+			details: &qmi.CardStatusDetails{
+				CardState: 0x01, PIN1State: qmi.PINStatusBlocked, PUK1Retries: 10,
+			},
+			status:        qmi.SIMPUKRequired,
+			wantCardState: 0x01,
+			wantPIN1:      qmi.PINStatusBlocked,
+			wantKnown:     true,
+		},
+		{
+			name: "PIN 永久锁死",
+			details: &qmi.CardStatusDetails{
+				CardState: 0x01, PIN1State: qmi.PINStatusPermBlocked,
+			},
+			status:        qmi.SIMBlocked,
+			wantCardState: 0x01,
+			wantPIN1:      qmi.PINStatusPermBlocked,
+			wantKnown:     true,
+		},
+		{
+			name:      "details 为 nil 时不得声称已知",
+			details:   nil,
+			status:    qmi.SIMNotReady,
+			wantKnown: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := buildUIMReadiness(c.status, c.details, nil, DeviceIdentities{ICCID: "8964"}, nil)
+			if out.CardDetailsKnown != c.wantKnown {
+				t.Fatalf("CardDetailsKnown=%v want %v", out.CardDetailsKnown, c.wantKnown)
+			}
+			if !c.wantKnown {
+				return
+			}
+			if out.CardState != c.wantCardState {
+				t.Errorf("CardState=%#x want %#x", out.CardState, c.wantCardState)
+			}
+			if out.PIN1State != c.wantPIN1 {
+				t.Errorf("PIN1State=%d want %d", out.PIN1State, c.wantPIN1)
+			}
+		})
+	}
+}

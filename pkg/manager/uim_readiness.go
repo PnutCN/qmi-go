@@ -40,8 +40,16 @@ type UIMReadiness struct {
 	ActiveSlotIsEUICC  bool  // 激活槽内是否为 eUICC（eSIM 芯片）
 	PIN1Retries        uint8 // PIN1 剩余验证次数
 	PUK1Retries        uint8 // PUK1 剩余解锁次数
-	CardDetailsKnown   bool  // PIN1Retries/PUK1Retries 是否取到有效值
-	Err                error
+
+	// SIMStatus 会把「卡错误」与「PIN 永久锁死」都归成 qmi.SIMBlocked，
+	// 上层只看它无法区分。以下两个字段保留原始判据：
+	//   CardState: 0=absent 1=present 2=error（QMI_UIM_CARD_STATE_*）
+	//   PIN1State: 仅当 PINStatusBlocked/PermBlocked 时才是真的被 PIN 锁住
+	CardState uint8
+	PIN1State qmi.PINStatus
+
+	CardDetailsKnown bool // CardState/PIN1State/PIN1Retries/PUK1Retries 是否取到有效值
+	Err              error
 }
 
 func isUIMReadinessTransportFatal(err error) bool {
@@ -158,6 +166,8 @@ func buildUIMReadinessWithSlotError(status qmi.SIMStatus, details *qmi.CardStatu
 		out.CardDetailsKnown = true
 		out.PIN1Retries = details.PIN1Retries
 		out.PUK1Retries = details.PUK1Retries
+		out.CardState = details.CardState
+		out.PIN1State = details.PIN1State
 	}
 
 	if cardErr != nil {
