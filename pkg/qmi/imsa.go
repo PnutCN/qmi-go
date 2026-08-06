@@ -16,7 +16,15 @@ type IMSAService struct {
 }
 
 func NewIMSAService(client *Client) (*IMSAService, error) {
-	clientID, err := client.AllocateClientID(ServiceIMSA)
+	return NewIMSAServiceWithContext(context.Background(), client)
+}
+
+// NewIMSAServiceWithContext 带 context 分配 IMSA client-id。
+//
+// 与 NAS/UIM/VOICE 等服务保持一致:client-id 分配要发一次真实 CTL 请求,
+// 模组不响应时没有 deadline 就会把启动流程整个挂住。
+func NewIMSAServiceWithContext(ctx context.Context, client *Client) (*IMSAService, error) {
+	clientID, err := client.AllocateClientIDWithContext(ctx, ServiceIMSA)
 	if err != nil {
 		return nil, err
 	}

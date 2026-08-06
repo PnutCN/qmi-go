@@ -265,6 +265,7 @@ type Manager struct {
 	registerNASIndications            func(ctx context.Context, cfg qmi.NASIndicationRegistration) error
 	registerUIMIndications            func(ctx context.Context) (uint32, error)
 	registerVOICEIndications          func(ctx context.Context, cfg qmi.VoiceIndicationRegistration) error
+	registerIMSAIndications           func(ctx context.Context, cfg qmi.IMSAIndicationRegistration) error
 	queryWMSTransportState            func(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error)
 	queryWMSRoutes                    func(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	setWMSRoutes                      func(ctx context.Context, routes []qmi.WMSRoute, transferStatusReportToClient bool) error
@@ -291,6 +292,8 @@ type Manager struct {
 	newWDAService                     func(ctx context.Context, client *qmi.Client) (*qmi.WDAService, error)
 	newWMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WMSService, error)
 	newVOICEService                   func(ctx context.Context, client *qmi.Client) (*qmi.VOICEService, error)
+	newIMSAService                    func(ctx context.Context, client *qmi.Client) (*qmi.IMSAService, error)
+	newIMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.IMSService, error)
 	enableRawIPHook                   func(ctx context.Context) error
 	getDataFormatFn                   func(ctx context.Context) (*qmi.DataFormat, error)
 	setDataFormatFn                   func(ctx context.Context, f qmi.DataFormat) error
@@ -1185,6 +1188,20 @@ func (m *Manager) createVOICEService(ctx context.Context) (*qmi.VOICEService, er
 	return qmi.NewVOICEServiceWithContext(ctx, m.client)
 }
 
+func (m *Manager) createIMSAService(ctx context.Context) (*qmi.IMSAService, error) {
+	if m.newIMSAService != nil {
+		return m.newIMSAService(ctx, m.client)
+	}
+	return qmi.NewIMSAServiceWithContext(ctx, m.client)
+}
+
+func (m *Manager) createIMSService(ctx context.Context) (*qmi.IMSService, error) {
+	if m.newIMSService != nil {
+		return m.newIMSService(ctx, m.client)
+	}
+	return qmi.NewIMSServiceWithContext(ctx, m.client)
+}
+
 func (m *Manager) shouldAllocateWDA() bool {
 	return strings.TrimSpace(m.cfg.Device.NetInterface) != "" && (m.cfg.EnableIPv4 || m.cfg.EnableIPv6)
 }
@@ -1516,6 +1533,13 @@ func (m *Manager) registerVOICEIndicationsWithContext(ctx context.Context, cfg q
 	return m.withVOICERecovery("registerVOICEIndicationsWithContext", func(voice *qmi.VOICEService) error {
 		return voice.IndicationRegister(ctx, cfg)
 	})
+}
+
+func (m *Manager) registerIMSAIndicationsWithContext(ctx context.Context, imsa *qmi.IMSAService, cfg qmi.IMSAIndicationRegistration) error {
+	if m.registerIMSAIndications != nil {
+		return m.registerIMSAIndications(ctx, cfg)
+	}
+	return imsa.RegisterIndications(ctx, cfg)
 }
 
 func (m *Manager) queryWMSTransportStateWithContext(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error) {
@@ -2578,16 +2602,78 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 				return nil
 			},
 		},
+		{
+			run: func(taskCtx context.Context) error {
+				// IMSA 是 VoLTE/VoWiFi 注册状态的唯一 QMI 来源(Get IMS Registration
+				// Status / Get IMS Services Status),Technology 字段区分 wwan/wlan。
+				//
+				// 这里以前是无条件 `m.imsa = nil`,注释归因为"该设备族经常返回
+				// client-id 分配失败(0x001f)"。0x001f 就是 InvalidServiceType ——
+				// 真正的原因是分配前没做能力检查:WMS/VOICE 都有 hasQMIService 守卫,
+				// 只有 IMS/IMSA 没有,于是在不暴露该服务的模组上必然失败。
+				//
+				// 2026-08-06 在六个 EC20(同型号同固件)上实测:cdc-wdm1/2/4 的
+				// get-service-version-info 里有 ims/imsa/imsp,wdm0/3/5 没有,
+				// 而后者恰好是 AT+QCFG="ims" 读到 0(IMS 未使能)的那三个。
+				// 能力检查一加,失败就不会发生 —— 不支持的模组直接跳过。
+				if !m.hasQMIService(qmi.ServiceIMSA) {
+					m.log.Debug("Skipping IMSA client allocation (modem not supported)")
+					return nil
+				}
+				m.log.Debug("Allocating IMSA client...")
+				imsa, err := m.createIMSAService(taskCtx)
+				if err != nil {
+					m.log.WithError(err).Warn("Failed to allocate IMSA client")
+					return err
+				}
+				m.log.Debug("Allocated IMSA client")
+				m.mu.Lock()
+				m.imsa = imsa
+				m.mu.Unlock()
+
+				cfg, ok := m.imsaIndicationRegistration()
+				if !ok {
+					m.log.Debug("IMSA indications disabled by config")
+					return nil
+				}
+				indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
+				defer cancel()
+				// 指示注册失败不回滚客户端:主动查询(GetIMSRegistrationStatus)仍然可用,
+				// 退化成轮询比彻底没有 IMS 状态好。
+				if err := m.registerIMSAIndicationsWithContext(indCtx, imsa, cfg); err != nil {
+					m.log.WithError(err).Warn("Failed to register IMSA indications")
+				}
+				return nil
+			},
+		},
+		{
+			run: func(taskCtx context.Context) error {
+				// IMS(0x12)是"IMS 各业务使能设置"服务,与 IMSA 的注册状态是两回事。
+				// EC20 上 Get IMS Services Enabled Setting 会回 QMI error 3(Internal),
+				// 所以调用方不能把它当作必然可用 —— 但客户端本身分配得起来,
+				// 留着它才有机会在支持的模组上读写 VoLTE/VoWiFi 使能位。
+				if !m.hasQMIService(qmi.ServiceIMS) {
+					m.log.Debug("Skipping IMS client allocation (modem not supported)")
+					return nil
+				}
+				m.log.Debug("Allocating IMS client...")
+				ims, err := m.createIMSService(taskCtx)
+				if err != nil {
+					m.log.WithError(err).Warn("Failed to allocate IMS client")
+					return err
+				}
+				m.log.Debug("Allocated IMS client")
+				m.mu.Lock()
+				m.ims = ims
+				m.mu.Unlock()
+				return nil
+			},
+		},
 	}
 	_ = m.runStartupServiceTasks(ctx, false, auxTasks)
 
-	// IMS/IMSA/IMSP
-	// 当前设备族在这些服务上经常返回 CTL client-id 分配失败（如 0x001f），
-	// 且主链路不依赖它们，默认跳过分配以减少启动噪声和恢复抖动。
-	m.ims = nil
-	m.imsa = nil
+	// IMSP(IMS Presence)没有调用方,不分配。
 	m.imsp = nil
-	m.log.Debug("Skipping IMS/IMSA/IMSP client allocation")
 
 	return nil
 }

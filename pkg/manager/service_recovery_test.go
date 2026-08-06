@@ -11,7 +11,7 @@ import (
 )
 
 func newRecoveryTestManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		log:                   NewNopLogger(),
 		events:                NewEventEmitter(),
 		eventCh:               make(chan internalEvent, 8),
@@ -19,6 +19,18 @@ func newRecoveryTestManager() *Manager {
 		modemResetDedupWindow: defaultModemResetDedupWindow,
 		uimRecoverCooldown:    defaultUIMRecoverCooldown,
 	}
+	// IMSA/IMS 默认打桩:测试里的 client 是零值 qmi.Client,HasService 对它
+	// 恒返回 true(versionQueried=false 时的乐观回答),真构造函数会一路走到
+	// SendRequest 的 nil map 上 panic。其余服务在各自用例里本来就注入了钩子,
+	// 只有这两个是后加的 —— 给默认桩比让每个既有用例补一遍更不容易漏。
+	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
+		return &qmi.IMSAService{}, nil
+	}
+	m.newIMSService = func(context.Context, *qmi.Client) (*qmi.IMSService, error) {
+		return &qmi.IMSService{}, nil
+	}
+	m.registerIMSAIndications = func(context.Context, qmi.IMSAIndicationRegistration) error { return nil }
+	return m
 }
 
 func waitInternalRecoveryEvent(t *testing.T, ch <-chan internalEvent, timeout time.Duration) internalEvent {

@@ -15,7 +15,12 @@ type IMSService struct {
 }
 
 func NewIMSService(client *Client) (*IMSService, error) {
-	clientID, err := client.AllocateClientID(ServiceIMS)
+	return NewIMSServiceWithContext(context.Background(), client)
+}
+
+// NewIMSServiceWithContext 带 context 分配 IMS client-id。理由同 IMSA。
+func NewIMSServiceWithContext(ctx context.Context, client *Client) (*IMSService, error) {
+	clientID, err := client.AllocateClientIDWithContext(ctx, ServiceIMS)
 	if err != nil {
 		return nil, err
 	}
