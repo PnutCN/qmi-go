@@ -2636,8 +2636,9 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 				// 只有 IMS/IMSA 没有,于是在不暴露该服务的模组上必然失败。
 				//
 				// 2026-08-06 在六个 EC20(同型号同固件)上实测:cdc-wdm1/2/4 的
-				// get-service-version-info 里有 ims/imsa/imsp,wdm0/3/5 没有,
-				// 而后者恰好是 AT+QCFG="ims" 读到 0(IMS 未使能)的那三个。
+				// get-service-version-info 里有 ims/imsa/imsp,wdm0/3/5 没有 ——
+				// 差别在于模组最终有没有启用 IMS(由 AT+QCFG="ims" 与运营商 MBN
+				// 共同决定,其中 wdm1 的使能位是 0 但电信卡的 MBN 启用了 IMS)。
 				// 能力检查一加,失败就不会发生 —— 不支持的模组直接跳过。
 				if !m.hasQMIService(qmi.ServiceIMSA) {
 					m.log.Debug("Skipping IMSA client allocation (modem not supported)")
