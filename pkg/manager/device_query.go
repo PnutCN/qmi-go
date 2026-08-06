@@ -905,6 +905,20 @@ func (m *Manager) WDSGetCurrentDataBearerTechnology(ctx context.Context) (*qmi.C
 	return wds.GetCurrentDataBearerTechnology(ctx)
 }
 
+// WDSDiscoverIMSProfileIndex 遍历 3GPP Profile 列表，找到应该用于 IMS PDN 的
+// 那个 profile(优先 IMCN Flag=1，其次 APN 精确匹配 apnHint)，让调用方不必
+// 手工猜测/配置 profile index。见 qmi.WDSService.DiscoverIMSProfileIndex 的
+// doc comment：IMCN Flag 在实测硬件上并不可靠，APN 匹配是必要的兜底。
+func (m *Manager) WDSDiscoverIMSProfileIndex(ctx context.Context, apnHint string) (index uint8, found bool, err error) {
+	m.mu.RLock()
+	wds := m.wds
+	m.mu.RUnlock()
+	if wds == nil {
+		return 0, false, ErrServiceNotReady("WDS")
+	}
+	return wds.DiscoverIMSProfileIndex(ctx, qmi.WDSProfileType3GPP, apnHint)
+}
+
 // IMSABind 显式绑定 IMSA 到指定 subscription/binding
 func (m *Manager) IMSABind(ctx context.Context, binding uint32) error {
 	m.mu.RLock()

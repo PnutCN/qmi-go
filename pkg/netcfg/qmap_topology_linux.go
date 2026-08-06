@@ -26,33 +26,71 @@ func discoverQMAPTopologyAt(root, configuredMaster string) (QMAPTopology, error)
 		return QMAPTopology{}, fmt.Errorf("QMAP topology: scan %s: %w", root, err)
 	}
 
-	masters := make([]string, 0, 1)
-	muxes := make(map[uint8]string)
-	for _, entry := range entries {
-		info, err := os.Stat(filepath.Join(root, entry.Name()))
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if hasQMAPControlTriad(root, name) {
-			masters = append(masters, name)
-		}
-		if muxID, ok := readQMAPMuxID(root, name); ok {
-			if existing, exists := muxes[muxID]; exists && existing != name {
-				return QMAPTopology{}, fmt.Errorf("QMAP topology: mux ID %d belongs to both %s and %s", muxID, existing, name)
-			}
-			muxes[muxID] = name
-		}
+	// Fast path: the configured interface is itself still the QMAP master.
+	// This is the common case, and it matters on a host with more than one
+	// physical QMI device present -- with every QMI backend now declaring
+	// QMAP (not just VoLTE devices), that is not an edge case. Each device's
+	// own configured name resolves its own master directly here, without
+	// ever having to tell it apart from another device's master/mux set.
+	if hasQMAPControlTriad(root, configuredMaster) {
+		return QMAPTopology{
+			MasterInterface: configuredMaster,
+			MuxInterfaces:   muxesBelongingTo(root, entries, configuredMaster),
+		}, nil
 	}
 
+	// Slow path: the configured interface may have been renamed away to make
+	// room for a mux reusing its old name (see
+	// TestDiscoverQMAPTopologyAdoptsRenamedMaster). Every other QMAP master
+	// candidate on the host is a possibility; with more than one, there is no
+	// signal left to pick the right one, so that legitimately stays an error
+	// rather than a guess.
+	masters := make([]string, 0, 1)
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != configuredMaster && hasQMAPControlTriad(root, name) {
+			masters = append(masters, name)
+		}
+	}
 	switch len(masters) {
 	case 0:
-		return QMAPTopology{MasterInterface: configuredMaster, MuxInterfaces: muxes}, nil
+		return QMAPTopology{MasterInterface: configuredMaster, MuxInterfaces: map[uint8]string{}}, nil
 	case 1:
-		return QMAPTopology{MasterInterface: masters[0], MuxInterfaces: muxes}, nil
+		return QMAPTopology{
+			MasterInterface: masters[0],
+			MuxInterfaces:   muxesBelongingTo(root, entries, masters[0]),
+		}, nil
 	default:
 		return QMAPTopology{}, fmt.Errorf("QMAP topology: ambiguous physical masters %s", strings.Join(masters, ", "))
 	}
+}
+
+// muxesBelongingTo scans an already-listed directory for QMAP mux netdevs
+// that the kernel reports as children of master, via the "lower_<master>"
+// file qmi_wwan exposes under each mux's own netdev directory -- the same
+// signal ReconcileResidualMux and GetQMAPMuxIface use to tell one physical
+// device's muxes from another's. Without this, a second physical QMI device
+// on the host would leak its mux_id entries into this device's topology.
+func muxesBelongingTo(root string, entries []os.DirEntry, master string) map[uint8]string {
+	muxes := make(map[uint8]string)
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == master || !muxBelongsToMaster(root, name, master) {
+			continue
+		}
+		if muxID, ok := readQMAPMuxID(root, name); ok {
+			muxes[muxID] = name
+		}
+	}
+	return muxes
+}
+
+// muxBelongsToMaster reports whether the kernel's qmi_wwan driver reports
+// muxIface as a child of master, via the "lower_<master>" file it exposes
+// under /sys/class/net/<muxIface>/.
+func muxBelongsToMaster(root, muxIface, master string) bool {
+	_, err := os.Stat(filepath.Join(root, muxIface, "lower_"+master))
+	return err == nil
 }
 
 func hasQMAPControlTriad(root, ifname string) bool {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
@@ -42,6 +44,7 @@ func TestOpenPDNRollsBackInReverseOrderWhenSettingsFail(t *testing.T) {
 			events = append(events, "settings")
 			return nil, errors.New("settings failed")
 		},
+		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
 		stop: func(context.Context, *qmi.WDSService, uint32) error {
 			events = append(events, "stop")
 			return nil
@@ -158,6 +161,278 @@ func TestOpenPDNPassesProfileIndexToStart(t *testing.T) {
 	}
 }
 
+func TestOpenPDNPassesCallTypeToStart(t *testing.T) {
+	embedded := qmi.WDSCallTypeEmbedded
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	var got PDNRequest
+	m.pdnOps.start = func(_ context.Context, _ *qmi.WDSService, req PDNRequest) (uint32, error) {
+		got = req
+		return 42, nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, CallType: &embedded,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if got.CallType == nil || *got.CallType != qmi.WDSCallTypeEmbedded {
+		t.Fatalf("start request CallType = %v, want embedded", got.CallType)
+	}
+}
+
+func TestOpenPDNIsolatesUserspaceInterfaceBeforeBringUp(t *testing.T) {
+	var order []string
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.prepareUserspace = func(iface string) error {
+		order = append(order, "prepare:"+iface)
+		return nil
+	}
+	m.pdnOps.bringUp = func(iface string) error {
+		order = append(order, "bringUp:"+iface)
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, UserspaceOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	want := []string{"prepare:qmimux1", "bringUp:qmimux1"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+}
+
+func TestOpenPDNSkipsIsolationUnlessUserspaceOnly(t *testing.T) {
+	called := false
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.prepareUserspace = func(string) error {
+		called = true
+		return nil
+	}
+
+	if _, err := m.OpenPDN(context.Background(), PDNRequest{APN: "internet", MuxID: 2, IPFamily: qmi.IpFamilyV4}); err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if called {
+		t.Fatal("interface was isolated without UserspaceOnly")
+	}
+}
+
+func TestDefaultStartAppliesCallTypeToWDSService(t *testing.T) {
+	embedded := qmi.WDSCallTypeEmbedded
+	ops := defaultPDNOps()
+	client := newUIMReadinessTestClient(t)
+	serveUIMReadinessTestRequests(t, client, func(req *qmi.Packet) (*qmi.Packet, error) {
+		switch req.MessageID {
+		case qmi.WDSSetClientIPFamilyPref:
+			return &qmi.Packet{TLVs: []qmi.TLV{{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}}}}, nil
+		case qmi.WDSStartNetworkInterface:
+			if tlv := qmi.FindTLV(req.TLVs, 0x31); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != 2 {
+				t.Fatalf("profile TLV = %v, want [2]", tlv)
+			}
+			if tlv := qmi.FindTLV(req.TLVs, 0x35); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != qmi.WDSCallTypeEmbedded {
+				t.Fatalf("call type TLV = %v, want [%d]", tlv, qmi.WDSCallTypeEmbedded)
+			}
+			return &qmi.Packet{TLVs: []qmi.TLV{
+				{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}},
+				{Type: 0x01, Value: []byte{0x2a, 0x00, 0x00, 0x00}},
+			}}, nil
+		default:
+			t.Fatalf("unexpected QMI message 0x%04x", req.MessageID)
+			return nil, nil
+		}
+	})
+
+	wds := &qmi.WDSService{}
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("client"), reflect.ValueOf(client))
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("clientID"), reflect.ValueOf(uint8(1)))
+
+	handle, err := ops.start(context.Background(), wds, PDNRequest{
+		APN: "ims", IPFamily: qmi.IpFamilyV6, ProfileIndex: 2, CallType: &embedded,
+	})
+	if err != nil {
+		t.Fatalf("default start error = %v", err)
+	}
+	if handle != 42 {
+		t.Fatalf("default start handle = %d, want 42", handle)
+	}
+	if !wds.HasCallType || wds.CallType != qmi.WDSCallTypeEmbedded {
+		t.Fatalf("service call type = (%d, %v), want (%d, true)", wds.CallType, wds.HasCallType, qmi.WDSCallTypeEmbedded)
+	}
+	if wds.ProfileIndex != 2 {
+		t.Fatalf("service profile index = %d, want 2", wds.ProfileIndex)
+	}
+}
+
+func TestDefaultStartClearsCallTypeWhenRequestOmitsIt(t *testing.T) {
+	embedded := qmi.WDSCallTypeEmbedded
+	ops := defaultPDNOps()
+	client := newUIMReadinessTestClient(t)
+	startRequests := 0
+	serveUIMReadinessTestRequests(t, client, func(req *qmi.Packet) (*qmi.Packet, error) {
+		switch req.MessageID {
+		case qmi.WDSSetClientIPFamilyPref:
+			return &qmi.Packet{TLVs: []qmi.TLV{{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}}}}, nil
+		case qmi.WDSStartNetworkInterface:
+			startRequests++
+			switch startRequests {
+			case 1:
+				if tlv := qmi.FindTLV(req.TLVs, 0x31); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != 2 {
+					t.Fatalf("first profile TLV = %v, want [2]", tlv)
+				}
+				if tlv := qmi.FindTLV(req.TLVs, 0x35); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != qmi.WDSCallTypeEmbedded {
+					t.Fatalf("first call type TLV = %v, want [%d]", tlv, qmi.WDSCallTypeEmbedded)
+				}
+			case 2:
+				if tlv := qmi.FindTLV(req.TLVs, 0x31); tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != 3 {
+					t.Fatalf("second profile TLV = %v, want [3]", tlv)
+				}
+				if tlv := qmi.FindTLV(req.TLVs, 0x35); tlv != nil {
+					t.Fatalf("second call type TLV = %v, want absent", tlv)
+				}
+			default:
+				t.Fatalf("unexpected start request #%d", startRequests)
+			}
+			return &qmi.Packet{TLVs: []qmi.TLV{
+				{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}},
+				{Type: 0x01, Value: []byte{byte(0x29 + startRequests), 0x00, 0x00, 0x00}},
+			}}, nil
+		default:
+			t.Fatalf("unexpected QMI message 0x%04x", req.MessageID)
+			return nil, nil
+		}
+	})
+
+	wds := &qmi.WDSService{}
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("client"), reflect.ValueOf(client))
+	setUnexportedField(t, reflect.ValueOf(wds).Elem().FieldByName("clientID"), reflect.ValueOf(uint8(1)))
+
+	if _, err := ops.start(context.Background(), wds, PDNRequest{
+		APN: "ims", IPFamily: qmi.IpFamilyV6, ProfileIndex: 2, CallType: &embedded,
+	}); err != nil {
+		t.Fatalf("first default start error = %v", err)
+	}
+	if _, err := ops.start(context.Background(), wds, PDNRequest{
+		APN: "ims", IPFamily: qmi.IpFamilyV6, ProfileIndex: 3,
+	}); err != nil {
+		t.Fatalf("second default start error = %v", err)
+	}
+
+	if startRequests != 2 {
+		t.Fatalf("start requests = %d, want 2", startRequests)
+	}
+	if wds.HasCallType {
+		t.Fatalf("service HasCallType = true after nil request, want false")
+	}
+	if wds.CallType != 0 {
+		t.Fatalf("service CallType = %d after nil request, want 0", wds.CallType)
+	}
+	if wds.ProfileIndex != 3 {
+		t.Fatalf("service profile index = %d after second request, want 3", wds.ProfileIndex)
+	}
+}
+
+// A configured endpoint must win: a modem that needs a hand-picked value
+// stays serviceable, and discovery must not silently override an operator.
+func TestOpenPDNKeepsConfiguredEndpointInterface(t *testing.T) {
+	discovered := false
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(string) (uint32, error) {
+		discovered = true
+		return 8, nil
+	}
+	var got qmi.MuxBinding
+	m.pdnOps.bind = func(_ context.Context, _ *qmi.WDSService, binding qmi.MuxBinding) error {
+		got = binding
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, EndpointType: 2, InterfaceID: 4,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	if discovered {
+		t.Fatal("discovery ran despite a configured InterfaceID")
+	}
+	if got.EpIfID != 4 {
+		t.Fatalf("EpIfID = %d, want the configured 4", got.EpIfID)
+	}
+}
+
+// Unset means ask the kernel. Measured on an EM9190, whose endpoint is 8
+// while the shipped default was 4 -- binding with the wrong number fails with
+// an internal QMI error that says nothing about endpoints.
+func TestOpenPDNDiscoversEndpointInterfaceWhenUnset(t *testing.T) {
+	var askedFor string
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(iface string) (uint32, error) {
+		askedFor = iface
+		return 8, nil
+	}
+	var got qmi.MuxBinding
+	m.pdnOps.bind = func(_ context.Context, _ *qmi.WDSService, binding qmi.MuxBinding) error {
+		got = binding
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{
+		APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6, EndpointType: 2,
+	})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	// The mux netdev has no USB device of its own; only the master does.
+	if askedFor != "wwan0" {
+		t.Fatalf("discovery asked about %q, want the master interface", askedFor)
+	}
+	if got.EpIfID != 8 {
+		t.Fatalf("EpIfID = %d, want the discovered 8", got.EpIfID)
+	}
+}
+
+// A discovery failure must name the config key that fixes it, because the
+// QMI error it would otherwise produce (internal, on bind) explains nothing.
+func TestOpenPDNSurfacesEndpointDiscoveryFailure(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.discoverEndpoint = func(string) (uint32, error) {
+		return 0, netcfg.ErrDataEndpointUnavailable
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV6})
+	if err == nil {
+		t.Fatal("OpenPDN() = nil error, want the discovery failure surfaced")
+	}
+	if !errors.Is(err, netcfg.ErrDataEndpointUnavailable) {
+		t.Fatalf("err = %v, want it to wrap ErrDataEndpointUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "ep_if_id") {
+		t.Fatalf("err = %v, want it to name the config key that fixes it", err)
+	}
+}
+
 func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 	return pdnOps{
 		bringUpMaster: func(string) error { return nil },
@@ -169,9 +444,10 @@ func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 		settings: func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error) {
 			return &qmi.RuntimeSettings{}, nil
 		},
-		bringUp:    func(string) error { return nil },
-		bringDown:  func(string) error { return nil },
-		stop:       func(context.Context, *qmi.WDSService, uint32) error { return nil },
-		releaseWDS: func(*qmi.WDSService) error { return nil },
+		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
+		bringUp:          func(string) error { return nil },
+		bringDown:        func(string) error { return nil },
+		stop:             func(context.Context, *qmi.WDSService, uint32) error { return nil },
+		releaseWDS:       func(*qmi.WDSService) error { return nil },
 	}
 }

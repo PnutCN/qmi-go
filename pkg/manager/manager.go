@@ -79,8 +79,9 @@ type Config struct {
 	DisableVOICEInd bool        // Disable VOICE indications / 禁用 VOICE 指示
 
 	ProfileIndex uint8 // PDN Profile 索引 (对应 -n 参数, 默认 0 表示使用模组默认 Profile)
-	MuxID        uint8 // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
-	NoDial       bool  // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
+	// DataPlane declares the topology intent for this Manager.
+	DataPlane DataPlaneSpec
+	NoDial    bool // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
 
 	DataPlanePolicy DataPlanePolicy // Data-plane service allocation policy / 数据面服务分配策略
 	Timeouts        TimeoutConfig
@@ -177,6 +178,12 @@ type Manager struct {
 	coreReadyLastErr  string
 	coreReadySince    time.Time
 	desiredConnection bool
+	// connectedDataPlaneGeneration is the DataPlaneSnapshot.Generation the
+	// default connection was last dialed against. A QMAP mux binding can
+	// only be set before StartNetworkInterface, so an already-established
+	// connection cannot be migrated to a new mux in place -- see
+	// redialIfDataPlaneGenerationChanged.
+	connectedDataPlaneGeneration uint64
 
 	// Event handling
 	// Event handling / 事件处理
@@ -204,6 +211,7 @@ type Manager struct {
 	dataPlane    dataPlaneController
 	dataPlaneOps dataPlaneOps
 	pdnOps       pdnOps
+	netcfgOps    netcfgOps
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -1215,6 +1223,14 @@ func (m *Manager) dataPlaneDisabled() bool {
 }
 
 func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
+	m.dataPlane.mu.Lock()
+	defer m.dataPlane.mu.Unlock()
+	return m.ensureDataPlaneServicesLocked(ctx)
+}
+
+// ensureDataPlaneServicesLocked allocates WDA/WDS and reconciles residual
+// muxes. Callers must hold m.dataPlane.mu.
+func (m *Manager) ensureDataPlaneServicesLocked(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1258,10 +1274,7 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 		}
 		m.log.Debug("Allocated WDA client")
 
-		keepMuxIDs := []uint8{}
-		if m.cfg.MuxID > 0 {
-			keepMuxIDs = append(keepMuxIDs, m.cfg.MuxID)
-		}
+		keepMuxIDs := m.activeMuxIDsLocked()
 		// Clear any QMAP mux left allocated by a crashed previous process
 		// before enableRawIP runs. New topologies keep the configured
 		// physical-master name; discovery rejects an incompatible legacy
@@ -1285,10 +1298,10 @@ func (m *Manager) ensureDataPlaneServices(ctx context.Context) error {
 	return nil
 }
 
-// EnsureDataPlaneTopology converges the configured default topology. New
+// EnsureDataPlaneTopology converges the declared default topology. New
 // callers should use ConvergeDataPlane so they receive its stable snapshot.
 func (m *Manager) EnsureDataPlaneTopology(ctx context.Context) error {
-	_, err := m.ConvergeDataPlane(ctx, dataPlaneSpecFromConfig(m.cfg))
+	_, err := m.ConvergeDataPlane(ctx, m.declaredDataPlaneSpec())
 	return err
 }
 
@@ -2196,7 +2209,7 @@ func (m *Manager) RotateIP() error {
 	}
 
 	// Flush old addresses to avoid duplicates / 清除旧地址以避免重复
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	m.flushDefaultDataAddresses()
 
 	// 3. Reconnect / 3. 重新连接
 	handle, err := m.wds.StartNetworkInterface(ctx,
@@ -2251,6 +2264,16 @@ func (m *Manager) RotateIP() error {
 
 // rotateViaRadioReset performs IP rotation by resetting the radio / rotateViaRadioReset 通过重置射频执行 IP 轮换
 func (m *Manager) rotateViaRadioReset() error {
+	// A radio power cycle is device-wide: it destroys any secondary PDN
+	// riding the same radio (the VoLTE IMS bearer). This is a separate
+	// implementation from RadioReset(), so guarding that one is not enough --
+	// "redial produced the same IP" is the normal escalation for rotation, so
+	// this path is reached by ordinary user action.
+	if m.hasActiveManagedPDN() {
+		m.log.Warn("IP 轮换需要射频复位，但存在活跃的次级 PDN(如 VoLTE IMS 承载)，拒绝复位")
+		return ErrRotateBlockedBySecondaryPDN
+	}
+
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
 	defer cancel()
 
@@ -2270,7 +2293,7 @@ func (m *Manager) rotateViaRadioReset() error {
 	}
 
 	// Flush old addresses / 2. 清除旧地址
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+	m.flushDefaultDataAddresses()
 
 	// 2. Radio off / 3. 关闭射频
 	if err := m.withDMSRecovery("rotateViaRadioReset.RadioPowerCycle", func(dms *qmi.DMSService) error {
@@ -2699,10 +2722,9 @@ func (m *Manager) voiceIndicationRegistration() (qmi.VoiceIndicationRegistration
 	}, true
 }
 
-// dataFormatTargetForMux returns the WDA data format a device must be in for
-// the given MuxID: QMAP aggregation when muxed (muxID > 0), disabled
-// otherwise. Pure and side-effect-free so enableRawIP's target derivation is
-// testable without a modem.
+// dataFormatTargetForMux returns the WDA data format required by a topology
+// with the given default mux. It is pure and side-effect-free so topology
+// convergence can test it without a modem.
 func dataFormatTargetForMux(muxID uint8) qmi.DataFormat {
 	target := qmi.DataFormat{
 		LinkProtocol:      qmi.LinkProtocolIP, // 0x02 = Raw IP
@@ -2732,13 +2754,55 @@ func dataFormatMatches(current, target qmi.DataFormat) bool {
 		current.DlDataAggregation == target.DlDataAggregation
 }
 
-// enableRawIP enables RawIP mode on both the modem (WDA) and the kernel interface / 启用RawIP模式：同时在Modem(WDA)和内核接口上启用
+// modemDataFormatMatches reports whether the modem's current WDA data format
+// already satisfies target, without mutating anything.
+func (m *Manager) modemDataFormatMatches(ctx context.Context, target qmi.DataFormat) (bool, error) {
+	if m.wda == nil {
+		return false, fmt.Errorf("WDA service not available")
+	}
+	getCtx, cancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.StatusCheck)
+	defer cancel()
+	getDataFormat := m.getDataFormatFn
+	if getDataFormat == nil {
+		getDataFormat = m.wda.GetDataFormat
+	}
+	currentFormat, err := getDataFormat(getCtx)
+	if err != nil {
+		return false, err
+	}
+	return dataFormatMatches(*currentFormat, target), nil
+}
+
+// ensureModemDataFormat makes the modem's own WDA data format (link protocol
+// + UL/DL aggregation) match target, reading the current value first so an
+// already-correct modem is left untouched.
+//
+// This is the only place that mutates the modem's aggregation protocol, so
+// the kernel-side mux topology and modem-side QMAP framing cannot drift apart.
+func (m *Manager) ensureModemDataFormat(ctx context.Context, target qmi.DataFormat) error {
+	if m.wda == nil {
+		return fmt.Errorf("WDA service not available")
+	}
+	if matches, err := m.modemDataFormatMatches(ctx, target); err == nil && matches {
+		return nil
+	}
+	setCtx, cancel := contextWithMaxTimeout(ctx, m.cfg.Timeouts.StatusCheck)
+	defer cancel()
+	setDataFormat := m.setDataFormatFn
+	if setDataFormat == nil {
+		setDataFormat = m.wda.SetDataFormat
+	}
+	return setDataFormat(setCtx, target)
+}
+
+// enableRawIP enables RawIP mode on the kernel interface.
+//
+// Modem-side data format belongs to ensureModemDataFormat, driven by the
+// declared DataPlaneSpec. Keeping that mutation in one place prevents the
+// kernel and modem topology writers from fighting each other.
 func (m *Manager) enableRawIP(parent context.Context) error {
 	if m.enableRawIPHook != nil {
 		return m.enableRawIPHook(parent)
-	}
-	if m.wda == nil {
-		return fmt.Errorf("WDA service not available")
 	}
 
 	// 1. Kernel Check (Linux Only) / 1. 内核检查 (仅限Linux)
@@ -2766,55 +2830,15 @@ func (m *Manager) enableRawIP(parent context.Context) error {
 	} else {
 		// Non-Linux platforms: Assume kernel/driver doesn't need manual raw_ip toggle via sysfs / 非Linux平台：假设内核/驱动不需要通过sysfs手动切换raw_ip
 		// or it's always enabled/handled by driver. / 或者它总是由驱动程序启用/处理。
-		// We still proceed to configure the Modem, as that's platform independent QMI. / 我们仍然继续配置Modem，因为那是与平台无关的QMI。
-		kernelEnabled = true // Treat as "done" for the purpose of the combined check / 将其视为“已完成”以进行组合检查
+		kernelEnabled = true // The driver handles raw_ip outside sysfs.
 	}
 
-	// Target data format is derived from MuxID: a muxed connection (MuxID>0)
-	// requires QMAP aggregation on both directions, or bindMux fails
-	// (measured: EC25 0x0030, EM7511 0x0003); a native connection requires
-	// aggregation disabled, or an un-mux'd netdev receives QMAP-framed
-	// packets it cannot parse (this is what silently broke the default data
-	// connection in the incident this target-driven rewrite closes -- see
-	// ADR-0008). MuxID never changes for the lifetime of a Manager, so this
-	// target is the SAME on every call, unlike the old raw-IP-only check.
-	target := dataFormatTargetForMux(m.cfg.MuxID)
-
-	// Optimization: Check if already at target in Modem (if WDA available) / 优化：检查Modem中是否已处于目标状态 (如果WDA可用)
-	modemEnabled := false
-	ctx, cancel := contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	getDataFormat := m.getDataFormatFn
-	if getDataFormat == nil {
-		getDataFormat = m.wda.GetDataFormat
-	}
-	if currentFormat, err := getDataFormat(ctx); err == nil {
-		modemEnabled = dataFormatMatches(*currentFormat, target)
-	} else {
-		m.log.WithError(err).Debug("Failed to get current data format, assuming mismatch")
-	}
-
-	if kernelEnabled && modemEnabled {
-		m.log.Info("Raw IP mode already at target, skipping configuration")
+	if kernelEnabled {
+		m.log.Debug("Kernel raw_ip already enabled, skipping")
 		return nil
 	}
 
-	// 2. Set Modem Data Format to target / 2. 将Modem数据格式设置为目标状态
-	m.log.Infof("Setting modem data format to target (mux=%d)...", m.cfg.MuxID)
-	format := target
-	ctx, cancel = contextWithMaxTimeout(parent, m.cfg.Timeouts.StatusCheck)
-	defer cancel()
-	setDataFormat := m.setDataFormatFn
-	if setDataFormat == nil {
-		setDataFormat = m.wda.SetDataFormat
-	}
-	if err := setDataFormat(ctx, format); err != nil {
-		m.log.WithError(err).Warn("Failed to set modem data format to target (might already be set or not supported), continuing to force kernel...")
-	} else {
-		m.log.Infof("Modem data format set to target (mux=%d)", m.cfg.MuxID)
-	}
-
-	// 3. Enable Raw IP in kernel (Linux Only) / 3. 在内核中启用Raw IP (仅限Linux)
+	// Enable Raw IP in kernel (Linux Only).
 	if isLinux && !kernelEnabled {
 		// Check again if file exists before writing / 在写入之前再次检查文件是否存在
 		if _, err := os.Stat(sysfsPath); os.IsNotExist(err) {
@@ -2985,6 +3009,10 @@ func (m *Manager) cleanup() {
 	// Secondary PDNs own independent WDS clients and muxes, but share this
 	// manager's transport. Release them before clearing the shared services.
 	m.closeManagedPDNSessions(cleanupCtx)
+	m.dataPlane.mu.Lock()
+	m.dataPlane.snapshot = DataPlaneSnapshot{}
+	m.dataPlane.masterInterface = ""
+	m.dataPlane.mu.Unlock()
 
 	m.mu.Lock()
 	wds := m.wds
@@ -3004,7 +3032,6 @@ func (m *Manager) cleanup() {
 	ifname := m.cfg.Device.NetInterface
 
 	muxIface := m.muxIface
-	muxID := m.cfg.MuxID
 	masterIface := m.masterIface
 	if masterIface == "" {
 		masterIface = m.cfg.Device.NetInterface
@@ -3050,15 +3077,22 @@ func (m *Manager) cleanup() {
 
 	cleanupTasks := make([]cleanupTask, 0, 4)
 
-	if muxIface != "" && muxID > 0 {
+	if muxIface != "" || masterIface != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "qmap",
 			run: func(context.Context) error {
-				return errors.Join(
-					netcfg.FlushAddresses(muxIface),
-					netcfg.BringDown(muxIface),
-					netcfg.DelQMAPMux(masterIface, muxID),
-				)
+				var err error
+				if muxIface != "" {
+					err = errors.Join(
+						netcfg.FlushAddresses(muxIface),
+						netcfg.BringDown(muxIface),
+					)
+				}
+				if masterIface != "" {
+					_, reconcileErr := netcfg.ReconcileResidualMux(masterIface, nil)
+					err = errors.Join(err, reconcileErr)
+				}
+				return err
 			},
 		})
 	}
@@ -3646,7 +3680,7 @@ func (m *Manager) doConnect() error {
 	defer cancelDial()
 
 	// EnsureDataPlaneTopology allocates WDA/WDS(V6), cleans up crash-residual
-	// mux state, and (when MuxID>0) brings the device to QMAP with mux 1
+	// mux state, and brings the declared topology to a stable snapshot
 	// established and renamed -- everything doConnect used to do inline
 	// here. Extracted so a sibling IMS PDN (VoLTE) that needs this same
 	// topology can call it too, independent of whether this default
@@ -3664,27 +3698,26 @@ func (m *Manager) doConnect() error {
 	}
 
 	// ========== 多路拨号 (QMAP) 绑定 ==========
-	if m.cfg.MuxID > 0 {
-		m.mu.RLock()
-		masterIface := m.masterIface
-		m.mu.RUnlock()
-		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
-			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
-
-		// 绑定 WDS Client 到 Mux Data Port
-		binding := qmi.MuxBinding{
-			EpType:     0x02, // HSUSB
-			EpIfID:     0x04, // 默认 Interface ID
-			MuxID:      m.cfg.MuxID,
-			ClientType: 1, // Tethered
+	topology, masterIface := m.defaultDataPlaneTarget()
+	if topology.Mode == DataPlaneModeQMAP && topology.DefaultMuxID > 0 {
+		binding, err := m.defaultMuxBinding()
+		if err != nil {
+			// In QMAP mode, dialing without a mux binding can produce an IP
+			// address with no usable traffic and corrupt a sibling mux stream.
+			m.log.WithError(err).Error("默认数据连接无法确定 QMAP 绑定端点，放弃本次拨号")
+			m.handleDialFailure(err)
+			return err
 		}
+		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s, 端点=%d",
+			binding.MuxID, m.cfg.ProfileIndex, masterIface, binding.EpIfID)
+
 		if m.wds != nil {
 			ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
 			if err := m.wds.BindMuxDataPort(ctx, binding); err != nil {
 				m.log.WithError(err).Error("WDS IPv4 BindMuxDataPort 失败")
 				// 非致命，继续
 			} else {
-				m.log.Infof("WDS IPv4 已绑定 MuxID=%d", m.cfg.MuxID)
+				m.log.Infof("WDS IPv4 已绑定 MuxID=%d", binding.MuxID)
 			}
 			cancel()
 		}
@@ -3695,7 +3728,7 @@ func (m *Manager) doConnect() error {
 			if err := m.wdsV6.BindMuxDataPort(ctx, binding); err != nil {
 				m.log.WithError(err).Warn("WDS IPv6 BindMuxDataPort 失败")
 			} else {
-				m.log.Infof("WDS IPv6 已绑定 MuxID=%d", m.cfg.MuxID)
+				m.log.Infof("WDS IPv6 已绑定 MuxID=%d", binding.MuxID)
 			}
 			cancel()
 		}
@@ -3773,6 +3806,9 @@ func (m *Manager) doConnect() error {
 	}
 
 	m.setState(StateConnected)
+	m.mu.Lock()
+	m.connectedDataPlaneGeneration = topology.Generation
+	m.mu.Unlock()
 	m.retryCount = 0
 	m.log.Info("Connection established successfully!")
 
@@ -3785,19 +3821,49 @@ func (m *Manager) doConnect() error {
 	return nil
 }
 
-func (m *Manager) configureNetwork() error {
-	// 多路拨号模式下，IP/DNS/Route 配置在虚拟网卡上
-	ifname := m.cfg.Device.NetInterface
-	m.mu.RLock()
-	if m.muxIface != "" {
-		ifname = m.muxIface
+// defaultDataPlaneTarget returns the published topology snapshot and physical
+// master. Consumers must use this runtime result instead of Config.
+func (m *Manager) defaultDataPlaneTarget() (DataPlaneSnapshot, string) {
+	m.dataPlane.mu.Lock()
+	defer m.dataPlane.mu.Unlock()
+	return m.dataPlane.snapshot, m.dataPlane.masterInterface
+}
+
+// defaultMuxBinding builds the default QMAP binding using the endpoint
+// discovered from the physical master rather than a modem-specific constant.
+func (m *Manager) defaultMuxBinding() (qmi.MuxBinding, error) {
+	snapshot, master := m.defaultDataPlaneTarget()
+	if master == "" {
+		master = m.cfg.Device.NetInterface
 	}
-	m.mu.RUnlock()
+	endpointIfID, err := m.resolvedPDNOps().discoverEndpoint(master)
+	if err != nil {
+		return qmi.MuxBinding{}, fmt.Errorf("qmi manager: discover data endpoint for %s: %w", master, err)
+	}
+	return qmi.MuxBinding{
+		EpType:     0x02, // HSUSB
+		EpIfID:     endpointIfID,
+		MuxID:      snapshot.DefaultMuxID,
+		ClientType: 1, // Tethered
+	}, nil
+}
+
+func (m *Manager) configureNetwork() error {
+	// Configure IP/DNS/routes on the interface published by topology
+	// convergence. Under QMAP the physical master only carries the muxes.
+	topology, master := m.defaultDataPlaneTarget()
+	ifname := topology.DefaultInterface
+	if ifname == "" {
+		ifname = m.cfg.Device.NetInterface
+	}
+	if master == "" {
+		master = m.cfg.Device.NetInterface
+	}
 	m.log.Infof("Configuring network interface %s...", ifname)
 
 	// 多路拨号时也要确保物理网卡是 up 的
-	if m.muxIface != "" && ifname != m.cfg.Device.NetInterface {
-		if err := netcfg.BringUp(m.cfg.Device.NetInterface); err != nil {
+	if topology.Mode == DataPlaneModeQMAP && ifname != master {
+		if err := netcfg.BringUp(master); err != nil {
 			m.log.WithError(err).Warn("Failed to bring master interface up")
 		}
 	}
@@ -3924,6 +3990,69 @@ func (m *Manager) configureNetwork() error {
 	return nil
 }
 
+// netcfgOps injects the host network mutations used when tearing down the
+// default connection, making the physical-master invariant testable without
+// requiring root privileges.
+type netcfgOps struct {
+	flushAddresses func(string) error
+	flushRoutes    func(string) error
+	bringDown      func(string) error
+}
+
+func (m *Manager) resolvedNetcfgOps() netcfgOps {
+	ops := m.netcfgOps
+	if ops.flushAddresses == nil {
+		ops.flushAddresses = netcfg.FlushAddresses
+	}
+	if ops.flushRoutes == nil {
+		ops.flushRoutes = netcfg.FlushRoutes
+	}
+	if ops.bringDown == nil {
+		ops.bringDown = netcfg.BringDown
+	}
+	return ops
+}
+
+// defaultDataInterface returns the netdev the default data connection owns:
+// the mux under QMAP, the physical interface under Native.
+func (m *Manager) defaultDataInterface() string {
+	topology, _ := m.defaultDataPlaneTarget()
+	if target := topology.DefaultInterface; target != "" {
+		return target
+	}
+	return m.cfg.Device.NetInterface
+}
+
+// flushDefaultDataAddresses drops the addresses on the default connection's
+// own netdev, without touching its link state or the physical master.
+//
+// Under QMAP the default connection's address lives on the mux, so flushing
+// the physical master (as this code used to) left a dead address on the mux
+// forever after a carrier-side disconnect, and cleared nothing useful.
+func (m *Manager) flushDefaultDataAddresses() {
+	target := m.defaultDataInterface()
+	if err := m.resolvedNetcfgOps().flushAddresses(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡地址失败")
+	}
+}
+
+// teardownDefaultDataInterface clears only the default connection's netdev.
+// Under QMAP the published default interface is a mux, while Native publishes
+// the physical interface and has no sibling PDN to protect.
+func (m *Manager) teardownDefaultDataInterface() {
+	target := m.defaultDataInterface()
+	ops := m.resolvedNetcfgOps()
+	if err := ops.flushAddresses(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡地址失败")
+	}
+	if err := ops.flushRoutes(target); err != nil {
+		m.log.WithError(err).Debug("清理默认数据网卡路由失败")
+	}
+	if err := ops.bringDown(target); err != nil {
+		m.log.WithError(err).Debug("关闭默认数据网卡失败")
+	}
+}
+
 func (m *Manager) doDisconnect() {
 	m.log.Info("Disconnecting...")
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
@@ -3939,12 +4068,11 @@ func (m *Manager) doDisconnect() {
 
 	}
 
-	netcfg.FlushAddresses(m.cfg.Device.NetInterface)
-	netcfg.FlushRoutes(m.cfg.Device.NetInterface)
-	netcfg.BringDown(m.cfg.Device.NetInterface)
+	m.teardownDefaultDataInterface()
 
 	m.mu.Lock()
 	m.settings = nil
+	m.connectedDataPlaneGeneration = 0
 	m.mu.Unlock()
 
 	m.setState(StateDisconnected)
@@ -4042,7 +4170,7 @@ func (m *Manager) doStatusCheck(full bool) {
 		if currentState == StateConnected {
 			m.log.Warn("Connection lost!")
 			m.handleV4 = 0
-			netcfg.FlushAddresses(m.cfg.Device.NetInterface)
+			m.flushDefaultDataAddresses()
 			m.setState(StateDisconnected)
 			m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
 
@@ -4093,7 +4221,14 @@ func (m *Manager) handleDialFailure(err error) {
 	delay := m.getRetryDelay()
 	m.retryCount++
 	if m.retryCount == m.cfg.RetryPolicy.RadioResetAfter {
-		go m.RadioReset()
+		// Radio reset is device-wide and would destroy an active secondary
+		// PDN such as the VoLTE IMS bearer. The default connection may retry,
+		// but it cannot reset the radio while another owner is live.
+		if m.hasActiveManagedPDN() {
+			m.log.Warn("默认数据连接重试已达射频复位阈值，但存在活跃的次级 PDN(如 VoLTE IMS 承载)，跳过射频复位")
+		} else {
+			go m.RadioReset()
+		}
 	}
 	m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected, Error: err})
 	m.log.Infof("Will retry in %v (%d/%d)", delay, m.retryCount, len(m.retryDelays))

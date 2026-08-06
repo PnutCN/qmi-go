@@ -109,12 +109,13 @@ func runProfiles(ctx context.Context, wds *qmi.WDSService, profileType uint8) {
 
 func runProfile(ctx context.Context, wds *qmi.WDSService, profileType, profileIndex uint8) {
 	fmt.Println("=== WDS Profile Settings ===")
-	apn, err := wds.GetProfileSettings(ctx, profileType, profileIndex)
+	settings, err := wds.GetProfileSettings(ctx, profileType, profileIndex)
 	if err != nil {
 		log.Printf("GetProfileSettings failed: %v", err)
 		return
 	}
-	fmt.Printf("Type=%d Index=%d APN=%q\n", profileType, profileIndex, apn)
+	fmt.Printf("Type=%d Index=%d Name=%q APN=%q PDPType=%d IMCNFlag=%v\n",
+		profileType, profileIndex, settings.Name, settings.APN, settings.PDPType, settings.IMCNFlag)
 	fmt.Println()
 }
 

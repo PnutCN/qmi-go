@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 )
 
 const (
@@ -15,6 +16,10 @@ const (
 	WDSGetDataBearerTechnology        uint16 = 0x0037
 	WDSGetCurrentDataBearerTechnology uint16 = 0x0044
 	WDSSetAutoconnectSettings         uint16 = 0x0051
+	// WDSBindDataPort binds a WDS client to a fixed modem data port, the
+	// embedded/BAM-DMUX counterpart of WDSBindMuxDataPort's QMAP mux binding.
+	// Its single input TLV 0x01 is a guint16 SIO port (see WDSSIOPort*).
+	WDSBindDataPort uint16 = 0x0089
 	/* Defined in frame.go / 在 frame.go 中定义
 	WDSGetCurrentChannelRate uint16 = 0x0023
 	WDSGetPktStatistics      uint16 = 0x0024
@@ -76,6 +81,11 @@ const (
 	RuntimeMaskDomainName  uint32 = 1 << 14
 	RuntimeMaskIPFamily    uint32 = 1 << 15
 	RuntimeMaskIMCN        uint32 = 1 << 16
+	// Bits 17 and 18 complete libqmi's QmiWdsRequestedSettings. Extended
+	// technology is TLV 0x2D, which modems return unprompted today; operator
+	// reserved PCO is 0x2F and is not returned unless requested.
+	RuntimeMaskExtendedTechnology  uint32 = 1 << 17
+	RuntimeMaskOperatorReservedPCO uint32 = 1 << 18
 )
 
 // ============================================================================
@@ -83,9 +93,13 @@ const (
 // ============================================================================
 
 type WDSService struct {
-	client               *Client
-	clientID             uint8
-	ProfileIndex         uint8
+	client       *Client
+	clientID     uint8
+	ProfileIndex uint8
+	// CallType is WDS TLV 0x35. HasCallType gates it because
+	// WDSCallTypeLaptop is 0, so the zero value cannot mean "unset".
+	CallType             uint8
+	HasCallType          bool
 	TechnologyPreference uint16 // Bitmask: 0x8000=3GPP, 0x4000=3GPP2
 }
 
@@ -141,6 +155,12 @@ const (
 // index alike. The collision is on the PDN configuration, not the data
 // endpoint, so binding a different mux cannot work around it and retrying
 // cannot clear it -- the modem's IMS stack has to release the APN first.
+//
+// Re-checked on the Sierra Wireless EM9190 on August 1, 2026 with profile 2
+// / IPv6 in both host-visible variants of TLV 0x35: omitting the TLV entirely
+// and sending WDSCallTypeEmbedded (1) both returned the same internal call
+// end reason (type 2, code 241). On that hardware/firmware, TLV 0x35 does not
+// distinguish a host IMS PDN from the modem's own held IMS call either.
 func (r *CallEndReason) IsInterfaceInUseConfigMatch() bool {
 	return r != nil &&
 		r.Type == CallEndReasonTypeInternal &&
@@ -177,6 +197,26 @@ func (e *StartNetworkError) Error() string {
 func (e *StartNetworkError) Unwrap() error {
 	return e.Err
 }
+
+// Call type for Start Network Interface TLV 0x35 (libqmi QmiWdsCallType).
+// It tells the modem whether the call belongs to the modem itself or to a
+// tethered host, which is part of the call configuration the modem matches
+// against when deciding whether a request duplicates an existing call --
+// see CallEndReason.IsInterfaceInUseConfigMatch.
+const (
+	WDSCallTypeLaptop   uint8 = 0
+	WDSCallTypeEmbedded uint8 = 1
+)
+
+// SIO ports for WDSBindDataPort (libqmi QmiSioPort). The A2 MUX range is the
+// BAM-DMUX data path used by embedded and PCIe modems, where the kernel
+// driver pre-creates one netdev per port instead of the host adding QMAP
+// muxes. RMNET0..RMNET7 are contiguous from 0x0e04.
+const (
+	WDSSIOPortNone          uint16 = 0x0000
+	WDSSIOPortA2MuxRMNET0   uint16 = 0x0e04
+	WDSSIOPortA2MuxRMNETMax uint16 = 0x0e0b
+)
 
 // MuxBinding info for QMAP / QMAP 的 Mux 绑定信息
 type MuxBinding struct {
@@ -371,6 +411,35 @@ func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, user
 		// Non-fatal, continue / 非致命，继续
 	}
 
+	tlvs := buildStartNetworkTLVs(apn, username, password, authType, ipFamily, w.ProfileIndex, w.TechnologyPreference, w.CallType, w.HasCallType)
+
+	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSStartNetworkInterface, tlvs)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := resp.CheckResult(); err != nil {
+		var reason *CallEndReason
+		if verboseTLV := FindTLV(resp.TLVs, 0x11); verboseTLV != nil && len(verboseTLV.Value) >= 4 {
+			reason = &CallEndReason{
+				Type: binary.LittleEndian.Uint16(verboseTLV.Value[0:2]),
+				Code: binary.LittleEndian.Uint16(verboseTLV.Value[2:4]),
+			}
+		}
+		return 0, &StartNetworkError{Err: err, Reason: reason}
+	}
+
+	// Get handle from TLV 0x01 / 从TLV 0x01获取句柄
+	handleTLV := FindTLV(resp.TLVs, 0x01)
+	if handleTLV == nil || len(handleTLV.Value) < 4 {
+		return 0, fmt.Errorf("no handle in response")
+	}
+
+	handle := binary.LittleEndian.Uint32(handleTLV.Value)
+	return handle, nil
+}
+
+func buildStartNetworkTLVs(apn, username, password string, authType, ipFamily, profileIndex uint8, technologyPreference uint16, callType uint8, hasCallType bool) []TLV {
 	var tlvs []TLV
 
 	// TLV 0x14: APN name / TLV 0x14: APN名称
@@ -397,41 +466,24 @@ func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, user
 	tlvs = append(tlvs, NewTLVUint8(0x19, ipFamily))
 
 	// TLV 0x31: 3GPP Profile Index / 3GPP Profile 索引 (Optional)
-	if w.ProfileIndex > 0 {
-		tlvs = append(tlvs, NewTLVUint8(0x31, w.ProfileIndex))
+	if profileIndex > 0 {
+		tlvs = append(tlvs, NewTLVUint8(0x31, profileIndex))
 	}
 
 	// TLV 0x34: Technology Preference / 技术偏好 (Optional)
-	if w.TechnologyPreference > 0 {
+	if technologyPreference > 0 {
 		buf := make([]byte, 2)
-		binary.LittleEndian.PutUint16(buf, w.TechnologyPreference)
+		binary.LittleEndian.PutUint16(buf, technologyPreference)
 		tlvs = append(tlvs, TLV{Type: 0x34, Value: buf})
 	}
-
-	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSStartNetworkInterface, tlvs)
-	if err != nil {
-		return 0, err
+	// TLV 0x35 tells the modem whether this call belongs to the modem itself
+	// or to a tethered host. It is part of the configuration the modem
+	// compares when refusing a duplicate call, so declaring it can be what
+	// separates a host IMS PDN from the modem's own.
+	if hasCallType {
+		tlvs = append(tlvs, NewTLVUint8(0x35, callType))
 	}
-
-	if err := resp.CheckResult(); err != nil {
-		var reason *CallEndReason
-		if verboseTLV := FindTLV(resp.TLVs, 0x11); verboseTLV != nil && len(verboseTLV.Value) >= 4 {
-			reason = &CallEndReason{
-				Type: binary.LittleEndian.Uint16(verboseTLV.Value[0:2]),
-				Code: binary.LittleEndian.Uint16(verboseTLV.Value[2:4]),
-			}
-		}
-		return 0, &StartNetworkError{Err: err, Reason: reason}
-	}
-
-	// Get handle from TLV 0x01 / 从TLV 0x01获取句柄
-	handleTLV := FindTLV(resp.TLVs, 0x01)
-	if handleTLV == nil || len(handleTLV.Value) < 4 {
-		return 0, fmt.Errorf("no handle in response")
-	}
-
-	handle := binary.LittleEndian.Uint32(handleTLV.Value)
-	return handle, nil
+	return tlvs
 }
 
 // StopNetworkInterface terminates a data call / StopNetworkInterface终止数据呼叫
@@ -528,6 +580,9 @@ type RuntimeSettings struct {
 	// PCSCFUsingPCO reports whether the network signalled P-CSCF discovery via PCO.
 	// PCSCFUsingPCO 表示网络是否通过 PCO 信令 P-CSCF 发现。
 	PCSCFUsingPCO bool
+	// HasPCSCFUsingPCO distinguishes an explicit "no PCO delivery" report from
+	// a modem that never sent TLV 0x22 at all.
+	HasPCSCFUsingPCO bool
 	// PCSCFv4 holds the IPv4 P-CSCF addresses delivered by the network.
 	// PCSCFv4 保存网络下发的 IPv4 P-CSCF 地址。
 	PCSCFv4 []net.IP
@@ -543,6 +598,12 @@ type RuntimeSettings struct {
 	// IMCN reports whether this bearer is the IMS-dedicated PDN.
 	// IMCN 表示该承载是否为 IMS 专用 PDN。
 	IMCN bool
+	// ResponseTLVs is the raw Get Current Settings response, including TLVs
+	// this package does not decode. Modems return fields libqmi never
+	// defined -- the IPv6 P-CSCF list in 0x2E was one of them -- and dropping
+	// them here makes such a field undiscoverable without a bespoke tool.
+	// ResponseTLVs 保留 Get Current Settings 的原始响应（含本包未解码的 TLV）。
+	ResponseTLVs []TLV
 }
 
 func parsePacketServiceStatusPacket(packet *Packet, checkResult bool) (ConnectionStatus, error) {
@@ -633,7 +694,7 @@ func (w *WDSService) GetRuntimeSettings(ctx context.Context, ipFamily uint8) (*R
 // RuntimeSettings 值。它只做纯粹的 TLV 解析；结果码检查和请求构造仍留在
 // GetRuntimeSettings 中。
 func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
-	settings := &RuntimeSettings{}
+	settings := &RuntimeSettings{ResponseTLVs: cloneTLVs(resp.TLVs)}
 
 	// Parse IPv4 settings / 解析IPv4设置
 	if tlv := FindTLV(resp.TLVs, TLVWDSIPv4Address); tlv != nil && len(tlv.Value) >= 4 {
@@ -678,6 +739,7 @@ func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 
 	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFUsingPCO); tlv != nil && len(tlv.Value) >= 1 {
 		settings.PCSCFUsingPCO = tlv.Value[0] != 0
+		settings.HasPCSCFUsingPCO = true
 	}
 	if tlv := FindTLV(resp.TLVs, TLVWDSPCSCFServerAddrList); tlv != nil && len(tlv.Value) >= 1 {
 		count := int(tlv.Value[0])
@@ -719,6 +781,19 @@ func parseRuntimeSettings(resp *Packet) *RuntimeSettings {
 	}
 
 	return settings
+}
+
+// cloneTLVs deep-copies a TLV slice. TLV.Value aliases the response buffer,
+// which the caller is free to reuse once parsing returns.
+func cloneTLVs(in []TLV) []TLV {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]TLV, 0, len(in))
+	for _, tlv := range in {
+		out = append(out, TLV{Type: tlv.Type, Value: append([]byte(nil), tlv.Value...)})
+	}
+	return out
 }
 
 // RegisterEventReport registers for WDS indications / RegisterEventReport注册WDS指示
@@ -774,100 +849,73 @@ func (s *WDSService) BindMuxDataPort(ctx context.Context, binding MuxBinding) er
 }
 
 // GetProfileList retrieves the list of profiles / GetProfileList 获取 Profile 列表
+//
+// Per the WDS Get Profile List (0x002A) definition, the input is TLV 0x10
+// (Profile Type, guint8) and the output TLV 0x01 (Profile List) is a
+// guint8-count-prefixed array of variable-length entries: Profile Type
+// (guint8) + Profile Index (guint8) + Profile Name (guint8-length-prefixed
+// string). An earlier version of this function guessed at both the input
+// TLV and a fixed 3-byte entry size, which corrupted every entry after the
+// first non-empty name (measured on a Quectel EC20F: type/index bytes of
+// entry N+1 came back as the tail of entry N's name).
 func (s *WDSService) GetProfileList(ctx context.Context, profileType uint8) ([]ProfileInfo, error) {
-	attempts := [][]TLV{
-		nil,
-		{NewTLVUint8(0x11, profileType)},
-		{NewTLVUint8(0x01, profileType)},
+	tlvs := []TLV{NewTLVUint8(0x10, profileType)}
+	resp, err := s.client.SendRequest(ctx, ServiceWDS, s.clientID, WDSGetProfileList, tlvs)
+	if err != nil {
+		return nil, err
+	}
+	if err := resp.CheckResult(); err != nil {
+		return nil, err
 	}
 
-	var lastErr error
-	for _, tlvs := range attempts {
-		resp, err := s.client.SendRequest(ctx, ServiceWDS, s.clientID, WDSGetProfileList, tlvs)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if err := resp.CheckResult(); err != nil {
-			lastErr = err
-			continue
-		}
+	return parseProfileList(resp.TLVs), nil
+}
 
-		if tlv := FindTLV(resp.TLVs, 0x01); tlv != nil && len(tlv.Value) >= 1 {
-			count := int(tlv.Value[0])
-			profiles := make([]ProfileInfo, 0, count)
-
-			if len(tlv.Value) >= 1+count*3 {
-				offset := 1
-				for i := 0; i < count; i++ {
-					if offset+3 > len(tlv.Value) {
-						break
-					}
-					pType := tlv.Value[offset]
-					pIndex := tlv.Value[offset+1]
-					profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex})
-					offset += 3
-				}
-				return profiles, nil
-			}
-
-			if len(tlv.Value) >= 1+count*2 {
-				offset := 1
-				for i := 0; i < count; i++ {
-					if offset+2 > len(tlv.Value) {
-						break
-					}
-					pType := tlv.Value[offset]
-					pIndex := tlv.Value[offset+1]
-					profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex})
-					offset += 2
-				}
-				return profiles, nil
-			}
-
-			return profiles, nil
-		}
-
-		if tlv := FindTLV(resp.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 1 {
-			count := int(tlv.Value[0])
-			offset := 1
-			profiles := make([]ProfileInfo, 0, count)
-			for i := 0; i < count && offset < len(tlv.Value); i++ {
-				if offset+3 > len(tlv.Value) {
-					break
-				}
-				pType := tlv.Value[offset]
-				pIndex := tlv.Value[offset+1]
-				pNameLen := int(tlv.Value[offset+2])
-				offset += 3
-
-				pName := ""
-				if offset+pNameLen <= len(tlv.Value) {
-					pName = string(tlv.Value[offset : offset+pNameLen])
-					offset += pNameLen
-				} else {
-					// 防止出现半截断数据导致后续遍历全乱，直接截断退出
-					break
-				}
-
-				profiles = append(profiles, ProfileInfo{
-					Type:  pType,
-					Index: pIndex,
-					Name:  pName,
-				})
-			}
-			return profiles, nil
-		}
-
-		return nil, nil
+func parseProfileList(tlvs []TLV) []ProfileInfo {
+	tlv := FindTLV(tlvs, 0x01)
+	if tlv == nil || len(tlv.Value) < 1 {
+		return nil
 	}
-	return nil, lastErr
+	count := int(tlv.Value[0])
+	offset := 1
+	profiles := make([]ProfileInfo, 0, count)
+	for i := 0; i < count; i++ {
+		if offset+3 > len(tlv.Value) {
+			break
+		}
+		pType := tlv.Value[offset]
+		pIndex := tlv.Value[offset+1]
+		pNameLen := int(tlv.Value[offset+2])
+		offset += 3
+		if offset+pNameLen > len(tlv.Value) {
+			// Truncated data: stop rather than read past the buffer or
+			// misinterpret the remainder as further entries.
+			break
+		}
+		pName := string(tlv.Value[offset : offset+pNameLen])
+		offset += pNameLen
+		profiles = append(profiles, ProfileInfo{Type: pType, Index: pIndex, Name: pName})
+	}
+	return profiles
+}
+
+// ProfileSettings holds the subset of a WDS Get Profile Settings (0x002B)
+// response this package parses. IMCNFlag is TLV 0x22 -- the same field the
+// modem uses to mark a profile as IM CN subsystem (IMS) dedicated -- so it
+// is what auto-discovery below matches against instead of guessing from the
+// APN string (every profile on a carrier commonly shares the same "ims"
+// APN name; only the IMCN flag actually distinguishes them).
+type ProfileSettings struct {
+	Name        string
+	APN         string
+	PDPType     uint8
+	HasPDPType  bool
+	IMCNFlag    bool
+	HasIMCNFlag bool
 }
 
 // GetProfileSettings retrieves settings for a specific profile / GetProfileSettings 获取特定 Profile 的设置
-// Note: This returns raw TLVs or a map as profile structure is very complex
-// simplified here to just return "success" if it exists for now, or implement basic APN reading
-func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profileIndex uint8) (string, error) {
+func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profileIndex uint8) (ProfileSettings, error) {
 	bufId := make([]byte, 2)
 	bufId[0] = profileType
 	bufId[1] = profileIndex
@@ -890,13 +938,86 @@ func (s *WDSService) GetProfileSettings(ctx context.Context, profileType, profil
 			continue
 		}
 
-		if tlv := FindTLV(resp.TLVs, 0x14); tlv != nil {
-			return string(tlv.Value), nil
-		}
-
-		return "", nil
+		return parseProfileSettings(resp.TLVs), nil
 	}
-	return "", lastErr
+	return ProfileSettings{}, lastErr
+}
+
+func parseProfileSettings(tlvs []TLV) ProfileSettings {
+	var ps ProfileSettings
+	if tlv := FindTLV(tlvs, 0x10); tlv != nil {
+		ps.Name = string(tlv.Value)
+	}
+	if tlv := FindTLV(tlvs, 0x11); tlv != nil && len(tlv.Value) >= 1 {
+		ps.PDPType = tlv.Value[0]
+		ps.HasPDPType = true
+	}
+	if tlv := FindTLV(tlvs, 0x14); tlv != nil {
+		ps.APN = string(tlv.Value)
+	}
+	if tlv := FindTLV(tlvs, 0x22); tlv != nil && len(tlv.Value) >= 1 {
+		ps.IMCNFlag = tlv.Value[0] != 0
+		ps.HasIMCNFlag = true
+	}
+	return ps
+}
+
+// DiscoverIMSProfileIndex finds the profile that should be used for the IMS
+// PDN, so callers never have to guess or hardcode a profile index. It walks
+// Get Profile List and reads each profile's settings via Get Profile
+// Settings, preferring a profile the modem itself marked IM CN subsystem
+// (IMS) dedicated (IMCN flag), and falling back to an exact APN match
+// against apnHint when none is marked.
+//
+// The IMCN-flag fallback exists because the flag turned out not to be a
+// reliable signal in practice: measured on a Quectel EC20F with a real "ims"
+// APN profile provisioned by the carrier, every profile's IMCN flag read
+// back false, including the "ims" one -- the flag is part of the QMI spec,
+// but nothing requires a carrier's OTA profile provisioning to actually set
+// it. APN matching degrades gracefully to what every profile already has:
+// its own configured APN string.
+//
+// found is false, with a nil error, when every profile was read successfully
+// but none matched either signal -- a legitimate "no dedicated IMS profile
+// on this SIM" outcome, not a failure. A non-nil error means discovery
+// itself could not complete (e.g. Get Profile List failed); callers should
+// treat that the same as "not found" rather than blocking on it, since an
+// unreadable profile list is not evidence that no IMS profile exists.
+func (s *WDSService) DiscoverIMSProfileIndex(ctx context.Context, profileType uint8, apnHint string) (index uint8, found bool, err error) {
+	profiles, err := s.GetProfileList(ctx, profileType)
+	if err != nil {
+		return 0, false, err
+	}
+	index, found = pickIMSProfileIndex(profiles, func(p ProfileInfo) (ProfileSettings, error) {
+		return s.GetProfileSettings(ctx, p.Type, p.Index)
+	}, apnHint)
+	return index, found, nil
+}
+
+// pickIMSProfileIndex applies DiscoverIMSProfileIndex's selection rule
+// (IMCN flag first, exact APN match against apnHint second) to an
+// already-listed set of profiles. Split out from DiscoverIMSProfileIndex so
+// the decision logic is testable without a QMI transport: settingsFor is
+// the only QMI-touching piece, injected as a plain function.
+func pickIMSProfileIndex(profiles []ProfileInfo, settingsFor func(ProfileInfo) (ProfileSettings, error), apnHint string) (index uint8, found bool) {
+	apnHint = strings.TrimSpace(apnHint)
+	apnMatch, hasAPNMatch := uint8(0), false
+	for _, p := range profiles {
+		ps, err := settingsFor(p)
+		if err != nil {
+			continue
+		}
+		if ps.HasIMCNFlag && ps.IMCNFlag {
+			return p.Index, true
+		}
+		if !hasAPNMatch && apnHint != "" && strings.EqualFold(strings.TrimSpace(ps.APN), apnHint) {
+			apnMatch, hasAPNMatch = p.Index, true
+		}
+	}
+	if hasAPNMatch {
+		return apnMatch, true
+	}
+	return 0, false
 }
 
 // GetChannelRates returns the current and maximum channel rates.

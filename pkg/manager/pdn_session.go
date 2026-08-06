@@ -17,6 +17,11 @@ var (
 	// Callers may classify this as an APN/network rejection; topology and
 	// host-link failures must retain their own error category.
 	ErrPDNStart = errors.New("qmi manager: start PDN network")
+	// ErrRotateBlockedBySecondaryPDN reports that IP rotation needed to
+	// escalate to a radio reset, but a secondary PDN (e.g. the VoLTE IMS
+	// bearer) is live on the same radio. Retrying cannot clear it: the caller
+	// must release that PDN first, or accept the current IP.
+	ErrRotateBlockedBySecondaryPDN = errors.New("qmi manager: IP rotation requires a radio reset, blocked by an active secondary PDN")
 )
 
 type PDNRequest struct {
@@ -24,9 +29,18 @@ type PDNRequest struct {
 	MuxID        uint8
 	IPFamily     uint8
 	ProfileIndex uint8
+	// CallType, when set, is forwarded as WDS TLV 0x35. Nil leaves the TLV
+	// off entirely, which is not the same as sending WDSCallTypeLaptop.
+	CallType     *uint8
 	EndpointType uint32
-	InterfaceID  uint32
-	ClientType   uint32
+	// InterfaceID is the USB interface number of the modem's data endpoint.
+	// Zero means "discover it from the kernel": zero is never a usable value
+	// for Bind Mux Data Port, so it is free to mean unset.
+	InterfaceID uint32
+	ClientType  uint32
+	// UserspaceOnly marks a PDN whose IP layer lives in a userspace netstack,
+	// so the kernel must not autoconfigure the interface from carrier RAs.
+	UserspaceOnly bool
 }
 
 type PDNSnapshot struct {
@@ -43,17 +57,19 @@ type PDNSession interface {
 }
 
 type pdnOps struct {
-	bringUpMaster func(string) error
-	addMux        func(master string, muxID uint8) (string, error)
-	deleteMux     func(master string, muxID uint8) error
-	leaseWDS      func(context.Context, *qmi.Client) (*qmi.WDSService, error)
-	bind          func(context.Context, *qmi.WDSService, qmi.MuxBinding) error
-	start         func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error)
-	settings      func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error)
-	bringUp       func(string) error
-	bringDown     func(string) error
-	stop          func(context.Context, *qmi.WDSService, uint32) error
-	releaseWDS    func(*qmi.WDSService) error
+	bringUpMaster    func(string) error
+	addMux           func(master string, muxID uint8) (string, error)
+	deleteMux        func(master string, muxID uint8) error
+	leaseWDS         func(context.Context, *qmi.Client) (*qmi.WDSService, error)
+	bind             func(context.Context, *qmi.WDSService, qmi.MuxBinding) error
+	start            func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error)
+	settings         func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error)
+	discoverEndpoint func(string) (uint32, error)
+	prepareUserspace func(string) error
+	bringUp          func(string) error
+	bringDown        func(string) error
+	stop             func(context.Context, *qmi.WDSService, uint32) error
+	releaseWDS       func(*qmi.WDSService) error
 }
 
 func defaultPDNOps() pdnOps {
@@ -67,13 +83,20 @@ func defaultPDNOps() pdnOps {
 		},
 		start: func(ctx context.Context, wds *qmi.WDSService, req PDNRequest) (uint32, error) {
 			wds.ProfileIndex = req.ProfileIndex
+			if req.CallType != nil {
+				wds.CallType, wds.HasCallType = *req.CallType, true
+			} else {
+				wds.CallType, wds.HasCallType = 0, false
+			}
 			return wds.StartNetworkInterface(ctx, req.APN, "", "", 0, req.IPFamily)
 		},
 		settings: func(ctx context.Context, wds *qmi.WDSService, family uint8) (*qmi.RuntimeSettings, error) {
 			return wds.GetRuntimeSettings(ctx, family)
 		},
-		bringUp:   netcfg.BringUp,
-		bringDown: netcfg.BringDown,
+		discoverEndpoint: netcfg.DiscoverDataEndpointInterface,
+		prepareUserspace: netcfg.PrepareUserspaceOnly,
+		bringUp:          netcfg.BringUp,
+		bringDown:        netcfg.BringDown,
 		stop: func(ctx context.Context, wds *qmi.WDSService, handle uint32) error {
 			return wds.StopNetworkInterface(ctx, handle)
 		},
@@ -104,6 +127,12 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 	}
 	if ops.settings == nil {
 		ops.settings = defaults.settings
+	}
+	if ops.discoverEndpoint == nil {
+		ops.discoverEndpoint = defaults.discoverEndpoint
+	}
+	if ops.prepareUserspace == nil {
+		ops.prepareUserspace = defaults.prepareUserspace
 	}
 	if ops.bringUp == nil {
 		ops.bringUp = defaults.bringUp
@@ -196,7 +225,15 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	if err != nil {
 		return nil, fmt.Errorf("qmi manager: lease PDN WDS: %w", err)
 	}
-	binding := qmi.MuxBinding{EpType: req.EndpointType, EpIfID: req.InterfaceID, MuxID: req.MuxID, ClientType: req.ClientType}
+	endpointIfID := req.InterfaceID
+	if endpointIfID == 0 {
+		discovered, err := ops.discoverEndpoint(master)
+		if err != nil {
+			return nil, fmt.Errorf("qmi manager: discover data endpoint for %s (set ims.volte.ep_if_id to override): %w", master, err)
+		}
+		endpointIfID = discovered
+	}
+	binding := qmi.MuxBinding{EpType: req.EndpointType, EpIfID: endpointIfID, MuxID: req.MuxID, ClientType: req.ClientType}
 	if err := ops.bind(ctx, wds, binding); err != nil {
 		return nil, fmt.Errorf("qmi manager: bind PDN mux: %w", err)
 	}
@@ -211,6 +248,11 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	}
 	if settings == nil {
 		return nil, errors.New("qmi manager: PDN settings are empty")
+	}
+	if req.UserspaceOnly {
+		if err := ops.prepareUserspace(iface); err != nil {
+			return nil, fmt.Errorf("qmi manager: isolate userspace-only PDN interface: %w", err)
+		}
 	}
 	if err := ops.bringUp(iface); err != nil {
 		return nil, fmt.Errorf("qmi manager: bring PDN interface up: %w", err)
