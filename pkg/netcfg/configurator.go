@@ -1,6 +1,9 @@
 package netcfg
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
 // NetworkConfigurator defines the interface for OS-specific network operations
 // NetworkConfigurator 定义了特定于操作系统的网络操作接口
@@ -74,19 +77,36 @@ type NetworkConfigurator interface {
 	ReconcileResidualMux(masterIface string, keepMuxIDs []uint8) ([]uint8, error)
 }
 
-var currentConfigurator NetworkConfigurator
+// 进程级单例。锁保护的是懒初始化那一步:GetConfigurator 在 nil 时会**写**
+// currentConfigurator,而它同时被多条线并发调用 —— Manager.cleanup 就是把
+// FlushAddresses / ReconcileResidualMux 等清理任务并发跑的(runCleanupTasks),
+// 两个任务同时首次取配置器,一个读到 nil 的同时另一个正在写。-race 稳定复现。
+//
+// 不用 sync.Once:SetConfigurator 允许运行时替换(测试注入 mock),Once 之后
+// 就再也换不回来了。用普通 Mutex 而非 RWMutex 是因为读路径里本身带着写,
+// RWMutex 得做锁升级,而这个函数的调用频率(每次网络配置操作)完全不值当。
+var (
+	configuratorMu      sync.Mutex
+	currentConfigurator NetworkConfigurator
+)
 
 // SetConfigurator sets the active network configurator
 // SetConfigurator 设置活动的网络配置器
 func SetConfigurator(c NetworkConfigurator) {
+	configuratorMu.Lock()
+	defer configuratorMu.Unlock()
 	currentConfigurator = c
 }
 
 // GetConfigurator returns the active network configurator
 // GetConfigurator 返回活动的网络配置器
 func GetConfigurator() NetworkConfigurator {
+	configuratorMu.Lock()
+	defer configuratorMu.Unlock()
 	if currentConfigurator == nil {
 		// Auto-detect platform implementation / 自动检测平台实现
+		// 在锁内构造是安全的:GetPlatformConfigurator 只是 NewXConfigurator(),
+		// 不会绕回来再取一次配置器。
 		currentConfigurator = GetPlatformConfigurator()
 	}
 	return currentConfigurator
