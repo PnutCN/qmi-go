@@ -6,7 +6,7 @@ import (
 )
 
 // ============================================================================
-// QMUX Service Types (from QCQMI.h) / QMUX服务类型 
+// QMUX Service Types (from QCQMI.h) / QMUX服务类型
 // ============================================================================
 
 // ServiceType constants are uint16 so that QRTR-only services beyond the
