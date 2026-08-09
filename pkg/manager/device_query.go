@@ -921,79 +921,51 @@ func (m *Manager) WDSDiscoverIMSProfileIndex(ctx context.Context, apnHint string
 
 // IMSABind 显式绑定 IMSA 到指定 subscription/binding
 func (m *Manager) IMSABind(ctx context.Context, binding uint32) error {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return ErrServiceNotReady("IMSA")
-	}
-	return imsa.Bind(ctx, binding)
+	return m.withIMSARecovery("IMSABind", func(imsa *qmi.IMSAService) error {
+		return imsa.Bind(ctx, binding)
+	})
 }
 
 // IMSAGetIMSRegistrationStatus 获取 IMS 注册状态
 func (m *Manager) IMSAGetIMSRegistrationStatus(ctx context.Context) (*qmi.IMSARegistrationStatus, error) {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return nil, ErrServiceNotReady("IMSA")
-	}
-	return imsa.GetIMSRegistrationStatus(ctx)
+	return withIMSARecoveryValue(m, "IMSAGetIMSRegistrationStatus", func(imsa *qmi.IMSAService) (*qmi.IMSARegistrationStatus, error) {
+		return imsa.GetIMSRegistrationStatus(ctx)
+	})
 }
 
 // IMSAGetIMSServicesStatus 获取 IMS 各业务可用状态
 func (m *Manager) IMSAGetIMSServicesStatus(ctx context.Context) (*qmi.IMSAServicesStatus, error) {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return nil, ErrServiceNotReady("IMSA")
-	}
-	return imsa.GetIMSServicesStatus(ctx)
+	return withIMSARecoveryValue(m, "IMSAGetIMSServicesStatus", func(imsa *qmi.IMSAService) (*qmi.IMSAServicesStatus, error) {
+		return imsa.GetIMSServicesStatus(ctx)
+	})
 }
 
 // IMSARegisterIndications 注册 IMSA 指示开关
 func (m *Manager) IMSARegisterIndications(ctx context.Context, cfg qmi.IMSAIndicationRegistration) error {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return ErrServiceNotReady("IMSA")
-	}
-	return imsa.RegisterIndications(ctx, cfg)
+	return m.withIMSARecovery("IMSARegisterIndications", func(imsa *qmi.IMSAService) error {
+		return imsa.RegisterIndications(ctx, cfg)
+	})
 }
 
 // IMSBind 显式绑定 IMS settings service
 func (m *Manager) IMSBind(ctx context.Context, binding uint32) error {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return ErrServiceNotReady("IMS")
-	}
-	return ims.Bind(ctx, binding)
+	return m.withIMSRecovery("IMSBind", func(ims *qmi.IMSService) error {
+		return ims.Bind(ctx, binding)
+	})
 }
 
 // IMSGetServicesEnabledSetting 获取 IMS enable setting
 func (m *Manager) IMSGetServicesEnabledSetting(ctx context.Context) (*qmi.IMSServicesEnabledSettings, error) {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return nil, ErrServiceNotReady("IMS")
-	}
-	return ims.GetServicesEnabledSetting(ctx)
+	return withIMSRecoveryValue(m, "IMSGetServicesEnabledSetting", func(ims *qmi.IMSService) (*qmi.IMSServicesEnabledSettings, error) {
+		return ims.GetServicesEnabledSetting(ctx)
+	})
 }
 
 // IMSSetServicesEnabledSetting 显式修改 IMS enable setting
 func (m *Manager) IMSSetServicesEnabledSetting(ctx context.Context, update qmi.IMSServicesEnabledSettingsUpdate) error {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return ErrServiceNotReady("IMS")
-	}
-	return ims.SetServicesEnabledSetting(ctx, update)
+	return m.withIMSRecovery("IMSSetServicesEnabledSetting", func(ims *qmi.IMSService) error {
+		return ims.SetServicesEnabledSetting(ctx, update)
+	})
 }
 
 // IMSPGetEnablerState 获取 IMSP enabler 状态

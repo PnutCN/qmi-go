@@ -1,6 +1,9 @@
 package netcfg
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
 // NetworkConfigurator defines the interface for OS-specific network operations
 // NetworkConfigurator 定义了特定于操作系统的网络操作接口
@@ -74,17 +77,24 @@ type NetworkConfigurator interface {
 	ReconcileResidualMux(masterIface string, keepMuxIDs []uint8) ([]uint8, error)
 }
 
-var currentConfigurator NetworkConfigurator
+var (
+	configuratorMu      sync.Mutex
+	currentConfigurator NetworkConfigurator
+)
 
 // SetConfigurator sets the active network configurator
 // SetConfigurator 设置活动的网络配置器
 func SetConfigurator(c NetworkConfigurator) {
+	configuratorMu.Lock()
+	defer configuratorMu.Unlock()
 	currentConfigurator = c
 }
 
 // GetConfigurator returns the active network configurator
 // GetConfigurator 返回活动的网络配置器
 func GetConfigurator() NetworkConfigurator {
+	configuratorMu.Lock()
+	defer configuratorMu.Unlock()
 	if currentConfigurator == nil {
 		// Auto-detect platform implementation / 自动检测平台实现
 		currentConfigurator = GetPlatformConfigurator()

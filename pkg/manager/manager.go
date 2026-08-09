@@ -231,6 +231,8 @@ type Manager struct {
 	wmsRecoveryMu           sync.Mutex
 	wmsReplayMu             sync.Mutex
 	voiceRecoveryMu         sync.Mutex
+	imsRecoveryMu           sync.Mutex
+	imsaRecoveryMu          sync.Mutex
 	uimLastRecoverSignal    time.Time
 	uimRecoverCooldown      time.Duration
 	wmsReplayInProgress     bool
@@ -273,6 +275,7 @@ type Manager struct {
 	registerNASIndications            func(ctx context.Context, cfg qmi.NASIndicationRegistration) error
 	registerUIMIndications            func(ctx context.Context) (uint32, error)
 	registerVOICEIndications          func(ctx context.Context, cfg qmi.VoiceIndicationRegistration) error
+	registerIMSAIndications           func(ctx context.Context, cfg qmi.IMSAIndicationRegistration) error
 	queryWMSTransportState            func(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error)
 	queryWMSRoutes                    func(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	setWMSRoutes                      func(ctx context.Context, routes []qmi.WMSRoute, transferStatusReportToClient bool) error
@@ -289,6 +292,10 @@ type Manager struct {
 	rebindWMSServiceHook              func(reason string) (*qmi.WMSService, error)
 	ensureVOICEServiceHook            func() (*qmi.VOICEService, error)
 	rebindVOICEServiceHook            func(reason string) (*qmi.VOICEService, error)
+	ensureIMSServiceHook              func() (*qmi.IMSService, error)
+	rebindIMSServiceHook              func(reason string) (*qmi.IMSService, error)
+	ensureIMSAServiceHook             func() (*qmi.IMSAService, error)
+	rebindIMSAServiceHook             func(reason string) (*qmi.IMSAService, error)
 	openLogicalChannelHook            func(ctx context.Context, slot uint8, aid []byte) (byte, error)
 	closeLogicalChannelHook           func(ctx context.Context, slot uint8, channel uint8) error
 	sendAPDUHook                      func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error)
@@ -299,6 +306,8 @@ type Manager struct {
 	newWDAService                     func(ctx context.Context, client *qmi.Client) (*qmi.WDAService, error)
 	newWMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WMSService, error)
 	newVOICEService                   func(ctx context.Context, client *qmi.Client) (*qmi.VOICEService, error)
+	newIMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.IMSService, error)
+	newIMSAService                    func(ctx context.Context, client *qmi.Client) (*qmi.IMSAService, error)
 	enableRawIPHook                   func(ctx context.Context) error
 	getDataFormatFn                   func(ctx context.Context) (*qmi.DataFormat, error)
 	setDataFormatFn                   func(ctx context.Context, f qmi.DataFormat) error
@@ -1193,6 +1202,20 @@ func (m *Manager) createVOICEService(ctx context.Context) (*qmi.VOICEService, er
 	return qmi.NewVOICEServiceWithContext(ctx, m.client)
 }
 
+func (m *Manager) createIMSService(ctx context.Context) (*qmi.IMSService, error) {
+	if m.newIMSService != nil {
+		return m.newIMSService(ctx, m.client)
+	}
+	return qmi.NewIMSServiceWithContext(ctx, m.client)
+}
+
+func (m *Manager) createIMSAService(ctx context.Context) (*qmi.IMSAService, error) {
+	if m.newIMSAService != nil {
+		return m.newIMSAService(ctx, m.client)
+	}
+	return qmi.NewIMSAServiceWithContext(ctx, m.client)
+}
+
 func (m *Manager) shouldAllocateWDA() bool {
 	return strings.TrimSpace(m.cfg.Device.NetInterface) != "" && (m.cfg.EnableIPv4 || m.cfg.EnableIPv6)
 }
@@ -1529,6 +1552,16 @@ func (m *Manager) registerVOICEIndicationsWithContext(ctx context.Context, cfg q
 	return m.withVOICERecovery("registerVOICEIndicationsWithContext", func(voice *qmi.VOICEService) error {
 		return voice.IndicationRegister(ctx, cfg)
 	})
+}
+
+func (m *Manager) registerIMSAIndicationsWithContext(ctx context.Context, imsa *qmi.IMSAService, cfg qmi.IMSAIndicationRegistration) error {
+	if m.registerIMSAIndications != nil {
+		return m.registerIMSAIndications(ctx, cfg)
+	}
+	if imsa == nil {
+		return ErrServiceNotReady("IMSA")
+	}
+	return imsa.RegisterIndications(ctx, cfg)
 }
 
 func (m *Manager) queryWMSTransportStateWithContext(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error) {
@@ -2451,10 +2484,13 @@ func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks 
 // hasQMIService 检查底层 Client 是否声明支持该服务。
 // 仅在 client 初始化完成后调用有效。
 func (m *Manager) hasQMIService(service uint16) bool {
-	if m.client == nil {
+	m.mu.RLock()
+	client := m.client
+	m.mu.RUnlock()
+	if client == nil {
 		return false
 	}
-	return m.client.HasService(service)
+	return client.HasService(service)
 }
 
 func (m *Manager) allocateServices(ctx context.Context) error {
@@ -2546,6 +2582,12 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		return err
 	}
 
+	m.mu.Lock()
+	m.ims = nil
+	m.imsa = nil
+	m.imsp = nil
+	m.mu.Unlock()
+
 	auxTasks := []startupServiceTask{
 		{
 			run: func(taskCtx context.Context) error {
@@ -2601,16 +2643,59 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 				return nil
 			},
 		},
+		{
+			run: func(taskCtx context.Context) error {
+				if !m.hasQMIService(qmi.ServiceIMS) {
+					m.log.Debug("Skipping IMS client allocation (modem not supported)")
+					return nil
+				}
+				m.log.Debug("Allocating IMS client...")
+				ims, err := m.createIMSService(taskCtx)
+				if err != nil {
+					m.log.WithError(err).Warn("Failed to allocate IMS client; continuing without IMS control service")
+					return nil
+				}
+				m.log.Debug("Allocated IMS client")
+				m.mu.Lock()
+				m.ims = ims
+				m.mu.Unlock()
+				return nil
+			},
+		},
+		{
+			run: func(taskCtx context.Context) error {
+				if !m.hasQMIService(qmi.ServiceIMSA) {
+					m.log.Debug("Skipping IMSA client allocation (modem not supported)")
+					return nil
+				}
+				m.log.Debug("Allocating IMSA client...")
+				imsa, err := m.createIMSAService(taskCtx)
+				if err != nil {
+					m.log.WithError(err).Warn("Failed to allocate IMSA client; continuing without IMSA control service")
+					return nil
+				}
+				m.log.Debug("Allocated IMSA client")
+				m.mu.Lock()
+				m.imsa = imsa
+				m.mu.Unlock()
+
+				if cfg, ok := m.imsaIndicationRegistration(); ok {
+					indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
+					defer cancel()
+					if err := m.registerIMSAIndicationsWithContext(indCtx, imsa, cfg); err != nil {
+						m.log.WithError(err).Warn("Failed to register IMSA indications; retaining IMSA client")
+					}
+				} else {
+					m.log.Debug("IMSA indications disabled by config")
+				}
+				return nil
+			},
+		},
 	}
 	_ = m.runStartupServiceTasks(ctx, false, auxTasks)
 
-	// IMS/IMSA/IMSP
-	// 当前设备族在这些服务上经常返回 CTL client-id 分配失败（如 0x001f），
-	// 且主链路不依赖它们，默认跳过分配以减少启动噪声和恢复抖动。
-	m.ims = nil
-	m.imsa = nil
-	m.imsp = nil
-	m.log.Debug("Skipping IMS/IMSA/IMSP client allocation")
+	// IMSP remains intentionally unallocated; IMS and IMSA are allocated above
+	// when the modem advertises the corresponding QMI services.
 
 	return nil
 }

@@ -1,9 +1,41 @@
 package qmi
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
+
+func TestNewIMSServiceWithContextHonorsCanceledContext(t *testing.T) {
+	client := &Client{
+		transactions: make(map[uint32]*transactionEntry),
+		writeCh:      make(chan writeRequest),
+		closeCh:      make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := NewIMSServiceWithContext(ctx, client)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewIMSServiceWithContext() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestNewIMSAServiceWithContextHonorsCanceledContext(t *testing.T) {
+	client := &Client{
+		transactions: make(map[uint32]*transactionEntry),
+		writeCh:      make(chan writeRequest),
+		closeCh:      make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := NewIMSAServiceWithContext(ctx, client)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewIMSAServiceWithContext() error = %v, want context.Canceled", err)
+	}
+}
 
 func imsTLVUint32(tlvType uint8, v uint32) TLV {
 	buf := make([]byte, 4)
