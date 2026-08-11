@@ -141,6 +141,7 @@ const (
 
 	CallEndReasonInternalPDNIPv4CallDisallowed     uint16 = 208
 	CallEndReasonInternalPDNIPv6CallDisallowed     uint16 = 210
+	CallEndReasonInternalMMGSDICardEvent           uint16 = 218
 	CallEndReasonInternalIPVersionMismatch         uint16 = 231
 	CallEndReasonInternalInterfaceInUseConfigMatch uint16 = 241
 )
@@ -174,6 +175,27 @@ func (r *CallEndReason) IsIPFamilyDisallowed() bool {
 	return r.Code == CallEndReasonInternalPDNIPv4CallDisallowed ||
 		r.Code == CallEndReasonInternalPDNIPv6CallDisallowed ||
 		r.Code == CallEndReasonInternalIPVersionMismatch
+}
+
+// IsAbortedByCardEvent reports that the modem's own card services subsystem
+// tore this call down because the SIM raised an event mid-setup. The code is
+// libqmi's QMI_WDS_VERBOSE_CALL_END_REASON_INTERNAL_MMGDSI_CARD_EVENT --
+// spelled "MMGDSI" there, a typo for Qualcomm's MMGSDI, so grep libqmi for the
+// misspelling rather than the constant name used here. Like
+// IsInterfaceInUseConfigMatch this never reached the network, so it must not
+// be reported as a rejection -- but unlike it, this one is transient: the
+// event settles in well under a second and the next attempt normally works.
+//
+// Measured on an EC20 (2026-08-11): an eUICC AID scan was opening UIM logical
+// channels -- triggered by a UIM slot status indication -- while WDS Start
+// Network Interface was in flight for the IMS APN, and the modem ended the
+// call this way. The caller's fix is to keep card access quiet across PDN
+// bring-up; this predicate exists so the failure is at least labelled and
+// retried correctly when that window is missed.
+func (r *CallEndReason) IsAbortedByCardEvent() bool {
+	return r != nil &&
+		r.Type == CallEndReasonTypeInternal &&
+		r.Code == CallEndReasonInternalMMGSDICardEvent
 }
 
 type StartNetworkError struct {
