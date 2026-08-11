@@ -751,21 +751,28 @@ func TestParsePacketServiceStatusIndication(t *testing.T) {
 // both, or a 3GPP reason would be misread as a local modem condition.
 func TestCallEndReasonPredicatesKeyOnTypeAndCode(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		reason       *CallEndReason
-		wantInUse    bool
-		wantIPFamily bool
+		name          string
+		reason        *CallEndReason
+		wantInUse     bool
+		wantIPFamily  bool
+		wantCardEvent bool
 	}{
-		{"nil", nil, false, false},
-		{"interface in use", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, true, false},
-		{"ipv4 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv4CallDisallowed}, false, true},
-		{"ipv6 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv6CallDisallowed}, false, true},
+		{"nil", nil, false, false, false},
+		{"interface in use", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, true, false, false},
+		{"ipv4 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv4CallDisallowed}, false, true, false},
+		{"ipv6 disallowed", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalPDNIPv6CallDisallowed}, false, true, false},
 		// Measured on an EM9190: the same IPv4-on-an-IPv6-IMS-APN request that
 		// an EC25 refuses with 208 comes back as 231 here.
-		{"ip version mismatch", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalIPVersionMismatch}, false, true},
-		{"same codes under 3gpp type", &CallEndReason{Type: 6, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, false, false},
-		{"3gpp regular deactivation", &CallEndReason{Type: 6, Code: 36}, false, false},
-		{"unknown internal code", &CallEndReason{Type: CallEndReasonTypeInternal, Code: 1}, false, false},
+		{"ip version mismatch", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalIPVersionMismatch}, false, true, false},
+		// Measured on an EC20 (2026-08-11): an eUICC AID scan opening logical
+		// channels while WDS Start Network was in flight aborted the IMS PDN
+		// this way. Nothing reached the network, so it must not read as a
+		// rejection.
+		{"aborted by card event", &CallEndReason{Type: CallEndReasonTypeInternal, Code: CallEndReasonInternalMMGSDICardEvent}, false, false, true},
+		{"same codes under 3gpp type", &CallEndReason{Type: 6, Code: CallEndReasonInternalInterfaceInUseConfigMatch}, false, false, false},
+		{"card event code under 3gpp type", &CallEndReason{Type: 6, Code: CallEndReasonInternalMMGSDICardEvent}, false, false, false},
+		{"3gpp regular deactivation", &CallEndReason{Type: 6, Code: 36}, false, false, false},
+		{"unknown internal code", &CallEndReason{Type: CallEndReasonTypeInternal, Code: 1}, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.reason.IsInterfaceInUseConfigMatch(); got != tc.wantInUse {
@@ -773,6 +780,9 @@ func TestCallEndReasonPredicatesKeyOnTypeAndCode(t *testing.T) {
 			}
 			if got := tc.reason.IsIPFamilyDisallowed(); got != tc.wantIPFamily {
 				t.Fatalf("IsIPFamilyDisallowed() = %v, want %v", got, tc.wantIPFamily)
+			}
+			if got := tc.reason.IsAbortedByCardEvent(); got != tc.wantCardEvent {
+				t.Fatalf("IsAbortedByCardEvent() = %v, want %v", got, tc.wantCardEvent)
 			}
 		})
 	}
