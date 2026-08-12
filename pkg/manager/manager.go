@@ -4718,22 +4718,6 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 		}
 		m.emitEvent(event)
 
-	case qmi.EventWMSSMSCAddress:
-		event := m.qmiIndicationEvent(EventWMSSMSCAddress, evt)
-		if evt.Packet != nil {
-			info, err := qmi.ParseWMSSMSCAddressIndication(evt.Packet)
-			if err != nil {
-				m.log.WithError(err).Warn("Failed to parse WMS SMSC address indication")
-			} else {
-				event.WMSSMSCAddress = info
-				digits := strings.TrimSpace(info.Digits)
-				known := digits != ""
-				now := time.Now()
-				m.setWMSSMSCState(digits, known, known, false, now, now)
-			}
-		}
-		m.emitEvent(event)
-
 	case qmi.EventWMSTransportNetworkRegistrationStatus:
 		event := m.qmiIndicationEvent(EventWMSTransportNetworkRegistrationStatus, evt)
 		if evt.Packet != nil {

@@ -33,7 +33,6 @@ const (
 	EventVoiceUSSDReleased                                      // Voice USSD released indication / 语音 USSD 释放指示
 	EventVoiceSupplementaryService                              // Voice supplementary service indication / 语音补充业务指示
 	EventVoiceUSSDNoWaitResult                                  // Voice originate USSD no wait result / 语音异步 USSD 结果
-	EventWMSSMSCAddress                                         // WMS SMSC address indication / WMS 短信中心地址指示
 	EventWMSTransportNetworkRegistrationStatus                  // WMS transport network registration status indication / WMS 传输网络注册状态指示
 	EventPacketServiceStatusChanged                             // Packet service status changed indication / 数据服务状态改变指示
 	EventServingSystemChanged                                   // Serving system changed indication / 服务系统改变指示
@@ -90,8 +89,6 @@ func (e EventType) String() string {
 		return "VoiceSupplementaryServiceRequest"
 	case EventVoiceUSSDNoWaitResult:
 		return "VoiceUSSDNoWaitResult"
-	case EventWMSSMSCAddress:
-		return "WMSSMSCAddress"
 	case EventWMSTransportNetworkRegistrationStatus:
 		return "WMSTransportNetworkRegistrationStatus"
 	case EventPacketServiceStatusChanged:
@@ -162,7 +159,6 @@ type Event struct {
 	PacketServiceStatus       qmi.ConnectionStatus                            // WDS packet service status / WDS 数据服务状态
 	UIMRefresh                *qmi.UIMRefreshIndication                       // UIM refresh indication payload / UIM 刷新指示载荷
 	UIMSlotStatus             *qmi.UIMSlotStatus                              // UIM slot status indication payload / UIM 卡槽状态指示载荷
-	WMSSMSCAddress            *qmi.WMSSMSCAddress                             // WMS SMSC address / WMS 短信中心地址
 	WMSTransportRegistration  qmi.WMSTransportNetworkRegistration             // WMS transport registration / WMS 传输网络注册状态
 	TLVMeta                   []qmi.TLVMeta                                   // TLV metadata for diagnostics / TLV 元数据（诊断用）
 	RawQMIType                qmi.EventType                                   // Raw QMI event type / 原始 QMI 事件类型
@@ -454,14 +450,6 @@ func cloneUIMSlotStatus(in *qmi.UIMSlotStatus) *qmi.UIMSlotStatus {
 	return &out
 }
 
-func cloneWMSSMSCAddress(in *qmi.WMSSMSCAddress) *qmi.WMSSMSCAddress {
-	if in == nil {
-		return nil
-	}
-	out := *in
-	return &out
-}
-
 func cloneTLVMeta(in []qmi.TLVMeta) []qmi.TLVMeta {
 	if len(in) == 0 {
 		return nil
@@ -522,7 +510,6 @@ func cloneEvent(event Event) Event {
 	out.NASCellLocationInfo = cloneNASCellLocationInfo(event.NASCellLocationInfo)
 	out.UIMRefresh = cloneUIMRefreshIndication(event.UIMRefresh)
 	out.UIMSlotStatus = cloneUIMSlotStatus(event.UIMSlotStatus)
-	out.WMSSMSCAddress = cloneWMSSMSCAddress(event.WMSSMSCAddress)
 	out.TLVMeta = cloneTLVMeta(event.TLVMeta)
 	return out
 }

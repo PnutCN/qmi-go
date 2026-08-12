@@ -3,6 +3,7 @@ package qmi
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -93,11 +94,6 @@ func (s WMSTransportNetworkRegistration) String() string {
 	default:
 		return "unknown"
 	}
-}
-
-type WMSSMSCAddress struct {
-	Type   string
-	Digits string
 }
 
 type WMSRoute struct {
@@ -492,26 +488,18 @@ func (w *WMSService) GetSMSCAddress(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return parseGetSMSCAddressResponse(resp)
+}
 
+func parseGetSMSCAddressResponse(resp *Packet) (string, error) {
 	if err := resp.CheckResult(); err != nil {
-		return "", err
+		return "", fmt.Errorf("get SMSC address failed: %w", err)
 	}
-
-	// TLV 0x01: SMSC Address / 短信中心地址
-	// Type(3 bytes for type/length) + Address...
-	// Usually: [Type(3 chars string)] [Length(1)] [Digits...]
-	// But QMI spec says:
-	// string SMSCAddressType (max 3)
-	// string SMSCAddress (max 20)
-	// Let's look for TLV 0x01
 	tlv := FindTLV(resp.TLVs, 0x01)
 	if tlv == nil {
-		return "", fmt.Errorf("SMSC address TLV not found")
+		return "", errors.New("get SMSC address response missing address TLV")
 	}
-
-	// Parse as string for simplicity, though it might be binary encoded digits
-	// Typically ASCII for type, and ASCII digits for address
-	return string(tlv.Value), nil
+	return parseWMSSMSCAddressValue(tlv.Value)
 }
 
 // RegisterEventReport enables indications for new messages / RegisterEventReport 开启新消息指示
@@ -876,14 +864,6 @@ func parseTransportNetworkRegistrationStatusResponse(resp *Packet) (WMSTransport
 	return WMSTransportNetworkRegistration(tlv.Value[0]), nil
 }
 
-func ParseWMSSMSCAddressIndication(packet *Packet) (*WMSSMSCAddress, error) {
-	tlv := FindTLV(packet.TLVs, 0x01)
-	if tlv == nil {
-		return nil, fmt.Errorf("smsc address TLV not found")
-	}
-	return parseWMSSMSCAddressValue(tlv.Value)
-}
-
 func ParseWMSTransportNetworkRegistrationStatusIndication(packet *Packet) (WMSTransportNetworkRegistration, error) {
 	tlv := FindTLV(packet.TLVs, 0x01)
 	if tlv == nil {
@@ -912,18 +892,23 @@ func parseWMSSupportedMessagesResponse(resp *Packet) ([]uint8, error) {
 	return out, nil
 }
 
-func parseWMSSMSCAddressValue(value []byte) (*WMSSMSCAddress, error) {
+func parseWMSSMSCAddressValue(value []byte) (string, error) {
 	if len(value) < 4 {
-		return nil, fmt.Errorf("smsc address TLV too short: %d", len(value))
+		return "", fmt.Errorf("SMSC address TLV too short: %d", len(value))
 	}
 	digitsLen := int(value[3])
 	if len(value) < 4+digitsLen {
-		return nil, fmt.Errorf("smsc address TLV truncated: need %d, have %d", 4+digitsLen, len(value))
+		return "", fmt.Errorf("SMSC address TLV truncated: need %d, have %d", 4+digitsLen, len(value))
 	}
-	return &WMSSMSCAddress{
-		Type:   string(value[:3]),
-		Digits: string(value[4 : 4+digitsLen]),
-	}, nil
+	digits := strings.TrimSpace(string(value[4 : 4+digitsLen]))
+	if digits == "" {
+		return "", errors.New("SMSC address TLV contains an empty address")
+	}
+	addressType := strings.TrimSpace(string(value[:3]))
+	if addressType == "145" && !strings.HasPrefix(digits, "+") {
+		digits = "+" + digits
+	}
+	return digits, nil
 }
 
 func parseRouteList(value []byte) ([]WMSRoute, error) {
