@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		return
 	}
 	generation := m.snapshot.IdentityGeneration()
+	go m.preWarmSMSC(generation)
 	go func(gen uint64) {
 		// 给予足够的超时时间，避免后台抓取时与其他初始化流程抢占导致超时
 		ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
@@ -94,6 +96,27 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		}
 		m.log.WithField("imei", ids.IMEI).WithField("iccid", ids.ICCID).Debug("Device identities pre-warmed")
 	}(generation)
+}
+
+func (m *Manager) preWarmSMSC(generation uint64) {
+	ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	smsc, err := m.queryWMSSMSCWithContext(ctx)
+	if err != nil {
+		m.log.WithError(err).Debug("WMS SMSC pre-warm unavailable")
+		return
+	}
+	smsc = strings.TrimSpace(smsc)
+	if smsc == "" {
+		m.log.Debug("WMS SMSC pre-warm returned an empty address")
+		return
+	}
+	if !m.snapshot.UpdateIdentitiesIfGeneration(DeviceIdentities{SMSC: smsc}, generation) {
+		m.log.WithField("generation", generation).Debug("Skip stale SMSC pre-warm write")
+		return
+	}
+	m.log.Debug("WMS SMSC pre-warmed")
 }
 
 // GetCachedIdentities 提供给上层应用零 IPC 读取当前设备的基础与卡标识。
@@ -353,6 +376,12 @@ func (m *Manager) UIMReadRecord(ctx context.Context, fileID uint16, path []uint8
 
 // UIMReadRecordWithSession 使用指定 session 读取 record 型 EF 文件
 func (m *Manager) UIMReadRecordWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMRecordData, error) {
+		return m.getUIMReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
+	})
+}
+
+func (m *Manager) getUIMReadRecordWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
 	return withUIMRecoveryValue(m, "UIMReadRecordWithSession", func(uim *qmi.UIMService) (*qmi.UIMRecordData, error) {
 		return uim.ReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
 	})
@@ -367,6 +396,12 @@ func (m *Manager) UIMGetFileAttributes(ctx context.Context, fileID uint16, path 
 
 // UIMGetFileAttributesWithSession 使用指定 session 获取 SIM 文件元数据
 func (m *Manager) UIMGetFileAttributesWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMFileAttributes, error) {
+		return m.getUIMGetFileAttributesWithSession(ctx, sessionType, fileID, path)
+	})
+}
+
+func (m *Manager) getUIMGetFileAttributesWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
 	return withUIMRecoveryValue(m, "UIMGetFileAttributesWithSession", func(uim *qmi.UIMService) (*qmi.UIMFileAttributes, error) {
 		return uim.GetFileAttributesWithSession(ctx, sessionType, fileID, path)
 	})
@@ -374,6 +409,12 @@ func (m *Manager) UIMGetFileAttributesWithSession(ctx context.Context, sessionTy
 
 // UIMReadTransparentWithSession 使用指定 session 读取 transparent 型 EF 文件
 func (m *Manager) UIMReadTransparentWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) ([]byte, error) {
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return m.getUIMReadTransparentWithSession(ctx, sessionType, fileID, path)
+	})
+}
+
+func (m *Manager) getUIMReadTransparentWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) ([]byte, error) {
 	return withUIMRecoveryValue(m, "UIMReadTransparentWithSession", func(uim *qmi.UIMService) ([]byte, error) {
 		return uim.ReadTransparentWithSession(ctx, sessionType, fileID, path)
 	})
@@ -778,6 +819,13 @@ func (m *Manager) WMSGetRoutes(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	})
 }
 
+// WMSGetSMSCAddress queries the modem's current SMSC without accessing UIM/APDU.
+func (m *Manager) WMSGetSMSCAddress(ctx context.Context) (string, error) {
+	return withWMSRecoveryValue(m, "WMSGetSMSCAddress", func(wms *qmi.WMSService) (string, error) {
+		return wms.GetSMSCAddress(ctx)
+	})
+}
+
 // WMSSendAck 发送短信 ACK
 func (m *Manager) WMSSendAck(ctx context.Context, req qmi.WMSAckRequest) (*qmi.WMSAckResult, error) {
 	return withWMSRecoveryValue(m, "WMSSendAck", func(wms *qmi.WMSService) (*qmi.WMSAckResult, error) {
@@ -1118,7 +1166,6 @@ type SMSNotReadyError struct {
 	TransportKnown       bool
 	TransportUnsupported bool
 	TransportQueryError  string
-	SMSCAvailable        bool
 	RoutesKnown          bool
 	NASRegistered        *bool
 }
@@ -1129,11 +1176,10 @@ func (e *SMSNotReadyError) Error() string {
 		nasRegistered = fmt.Sprintf("%t", *e.NASRegistered)
 	}
 	return fmt.Sprintf(
-		"QMI 短信未就绪: transport_status=%s transport_known=%t transport_unsupported=%t smsc_available=%t routes_known=%t nas_registered=%s transport_query_error=%q",
+		"QMI 短信未就绪: transport_status=%s transport_known=%t transport_unsupported=%t routes_known=%t nas_registered=%s transport_query_error=%q",
 		e.TransportStatus,
 		e.TransportKnown,
 		e.TransportUnsupported,
-		e.SMSCAvailable,
 		e.RoutesKnown,
 		nasRegistered,
 		e.TransportQueryError,

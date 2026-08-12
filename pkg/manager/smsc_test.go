@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
@@ -246,9 +247,9 @@ func TestGetSMSCFromUIMFilesFallbackToEFPSISMSC(t *testing.T) {
 	}
 }
 
-func TestManagerGetSMSCServiceNotReady(t *testing.T) {
+func TestManagerReadSMSCFromSIMFilesServiceNotReady(t *testing.T) {
 	m := &Manager{}
-	_, err := m.GetSMSC(context.Background())
+	_, err := m.ReadSMSCFromSIMFiles(context.Background())
 	if err == nil {
 		t.Fatal("expected service-not-ready error, got nil")
 	}
@@ -257,7 +258,35 @@ func TestManagerGetSMSCServiceNotReady(t *testing.T) {
 	}
 }
 
-func TestManagerGetSMSCUsesManagerAPDUTransport(t *testing.T) {
+func TestManagerSMSCFileReaderDoesNotReenterCardAccessBarrier(t *testing.T) {
+	m := New(Config{}, nil)
+	release, err := m.BeginIMSCardAccessBarrier(context.Background())
+	if err != nil {
+		t.Fatalf("BeginIMSCardAccessBarrier() error = %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = managerUIMFileReader{m: m}.GetFileAttributesWithSession(
+		ctx,
+		qmi.UIMSessionTypePrimaryGWProvisioning,
+		efSMSP,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected UIM service-not-ready error")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("internal SMSC UIM reader re-entered the card barrier: %v", err)
+	}
+	var notReady *ServiceNotReadyError
+	if !errors.As(err, &notReady) {
+		t.Fatalf("unexpected error = %T %v, want ServiceNotReadyError", err, err)
+	}
+}
+
+func TestManagerReadSMSCFromSIMFilesUsesManagerAPDUTransport(t *testing.T) {
 	record := make([]byte, 0x2A)
 	for i := range record {
 		record[i] = 0xFF
@@ -293,14 +322,14 @@ func TestManagerGetSMSCUsesManagerAPDUTransport(t *testing.T) {
 		return script.send(command)
 	}
 
-	got, err := m.GetSMSC(context.Background())
+	got, err := m.ReadSMSCFromSIMFiles(context.Background())
 	if err != nil {
-		t.Fatalf("GetSMSC() error=%v", err)
+		t.Fatalf("ReadSMSCFromSIMFiles() error=%v", err)
 	}
 	if got != "+447870002308" {
-		t.Fatalf("GetSMSC()=%q want=%q", got, "+447870002308")
+		t.Fatalf("ReadSMSCFromSIMFiles()=%q want=%q", got, "+447870002308")
 	}
 	if sendCalls == 0 {
-		t.Fatal("expected GetSMSC to use manager APDU transport")
+		t.Fatal("expected ReadSMSCFromSIMFiles to use manager APDU transport")
 	}
 }

@@ -420,7 +420,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	// Force replay path to run but fail softly, verifying it does not block main retry success.
 	eventReportCalls := 0
 	indicationCalls := 0
-	smscCalls := 0
 	m.registerWMSEventReport = func(_ context.Context) error {
 		eventReportCalls++
 		return fmt.Errorf("forced register event report failure")
@@ -434,10 +433,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	}
 	m.queryWMSTransportState = func(_ context.Context) (qmi.WMSTransportNetworkRegistration, error) {
 		return 0, fmt.Errorf("forced transport query failure")
-	}
-	m.querySMSC = func(_ context.Context) (string, error) {
-		smscCalls++
-		return "", fmt.Errorf("forced smsc query failure")
 	}
 
 	attempts := 0
@@ -460,9 +455,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	// replay hook path with forced failures should still execute
 	if eventReportCalls == 0 && indicationCalls == 0 {
 		t.Fatal("expected WMS replay path to run after rebind")
-	}
-	if smscCalls == 0 {
-		t.Fatal("expected WMS replay to refresh SMSC diagnostics after rebind")
 	}
 }
 

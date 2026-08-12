@@ -13,7 +13,7 @@ import (
 
 func TestDoRecoverFromModemResetResetsSnapshotImmediately(t *testing.T) {
 	m := newRecoveryTestManager()
-	m.snapshot.UpdateIdentities(DeviceIdentities{ICCID: "old-iccid", IMSI: "old-imsi"})
+	m.snapshot.UpdateIdentities(DeviceIdentities{ICCID: "old-iccid", IMSI: "old-imsi", SMSC: "+447870002308"})
 	m.openClientAndAllocateServicesHook = func(context.Context) error { return nil }
 	m.checkSIMHook = func() error { return nil }
 	m.modemResetQuietWindow = 5 * time.Millisecond
@@ -24,8 +24,8 @@ func TestDoRecoverFromModemResetResetsSnapshotImmediately(t *testing.T) {
 	}
 
 	ids, _ := m.snapshot.Identities()
-	if ids.ICCID != "" || ids.IMSI != "" {
-		t.Fatalf("expected snapshot SIM identities reset, got iccid=%q imsi=%q", ids.ICCID, ids.IMSI)
+	if ids.ICCID != "" || ids.IMSI != "" || ids.SMSC != "" {
+		t.Fatalf("expected snapshot SIM identities reset, got iccid=%q imsi=%q smsc=%q", ids.ICCID, ids.IMSI, ids.SMSC)
 	}
 	if !m.IsCoreReady() {
 		t.Fatal("expected coreReady=true after convergence")

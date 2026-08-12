@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -29,23 +30,51 @@ var (
 	}
 )
 
-// GetSMSC reads SMSC for QMI mode.
+// GetSMSC is the runtime SMSC source of record. It actively queries the
+// modem via WMS Get SMSC Address (0x0034) and, on success, writes the
+// result into DeviceIdentities.SMSC guarded by the SIM identity generation
+// captured before the query — a SIM change (ICCID/IMSI reset) racing the
+// query discards the stale result instead of overwriting the new SIM's
+// state. WMS never touches UIM/APDU, so this call carries none of
+// ReadSMSCFromSIMFiles' card-access-gate cost.
+func (m *Manager) GetSMSC(ctx context.Context) (string, error) {
+	generation := m.snapshot.IdentityGeneration()
+	smsc, err := m.queryWMSSMSCWithContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	smsc = strings.TrimSpace(smsc)
+	if smsc == "" {
+		return "", errors.New("WMS Get SMSC Address returned an empty address")
+	}
+	if !m.snapshot.UpdateIdentitiesIfGeneration(DeviceIdentities{SMSC: smsc}, generation) {
+		return "", errors.New("discarded stale SMSC result after SIM identity changed")
+	}
+	return smsc, nil
+}
+
+// ReadSMSCFromSIMFiles is the only remaining explicit APDU/UIM SMSC entry
+// point. It exists for diagnostics (e.g. comparing the SIM-provisioned
+// EF_SMSP/EF_PSISMSC value against the modem's active WMS SMSC) and does
+// not feed DeviceIdentities.SMSC or any readiness calculation — GetSMSC via
+// WMS 0x0034 is the single runtime SMSC truth.
 //
 // Strategy:
 //  1. APDU on basic channel (reader-style select flow).
 //  2. APDU on USIM logical channel.
 //  3. UIM ReadRecord/ReadTransparent fallback (for modems rejecting UIM SendAPDU 0x003B).
-func (m *Manager) GetSMSC(ctx context.Context) (string, error) {
+func (m *Manager) ReadSMSCFromSIMFiles(ctx context.Context) (string, error) {
+	return withCardAccessValue(m, ctx, func() (string, error) {
+		return m.readSMSCFromSIMFilesUngated(ctx)
+	})
+}
+
+func (m *Manager) readSMSCFromSIMFilesUngated(ctx context.Context) (string, error) {
 	smsc, err := m.querySMSCFromDevice(ctx)
 	if err != nil {
 		return "", err
 	}
-
-	trimmed := strings.TrimSpace(smsc)
-	known := trimmed != ""
-	now := time.Now()
-	m.setWMSSMSCState(trimmed, known, known, false, now, now)
-	return trimmed, nil
+	return strings.TrimSpace(smsc), nil
 }
 
 func (m *Manager) querySMSCFromDevice(ctx context.Context) (string, error) {
@@ -210,15 +239,15 @@ type managerUIMFileReader struct {
 }
 
 func (r managerUIMFileReader) GetFileAttributesWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
-	return r.m.UIMGetFileAttributesWithSession(ctx, sessionType, fileID, path)
+	return r.m.getUIMGetFileAttributesWithSession(ctx, sessionType, fileID, path)
 }
 
 func (r managerUIMFileReader) ReadRecordWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
-	return r.m.UIMReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
+	return r.m.getUIMReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
 }
 
 func (r managerUIMFileReader) ReadTransparentWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) ([]byte, error) {
-	return r.m.UIMReadTransparentWithSession(ctx, sessionType, fileID, path)
+	return r.m.getUIMReadTransparentWithSession(ctx, sessionType, fileID, path)
 }
 
 func getSMSCFromUIMFiles(ctx context.Context, uim uimFileReader) (string, error) {
@@ -670,7 +699,6 @@ func allBytes(buf []byte, value byte) bool {
 
 // CachedSMSC returns the last known good SMSC address, or empty string if unknown.
 func (m *Manager) CachedSMSC() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.wmsSMSCValue
+	ids, _ := m.snapshot.Identities()
+	return strings.TrimSpace(ids.SMSC)
 }

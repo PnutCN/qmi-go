@@ -251,13 +251,6 @@ type Manager struct {
 	wmsTransportQueryError     string
 	wmsLastTransportWarn       string
 	wmsLastTransportWarnAt     time.Time
-	wmsSMSCValue               string
-	wmsSMSCAvailable           bool
-	wmsSMSCKnown               bool
-	wmsSMSCStale               bool
-	wmsSMSCUpdatedAt           time.Time
-	wmsSMSCLastCheckAt         time.Time
-	wmsSMSCRefreshPending      bool
 	wmsRoutesKnown             bool
 	wmsLastNASRegistered       bool
 	wmsLastNASRegisteredKnown  bool
@@ -279,7 +272,7 @@ type Manager struct {
 	queryWMSTransportState            func(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error)
 	queryWMSRoutes                    func(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	setWMSRoutes                      func(ctx context.Context, routes []qmi.WMSRoute, transferStatusReportToClient bool) error
-	querySMSC                         func(ctx context.Context) (string, error)
+	queryWMSSMSC                      func(ctx context.Context) (string, error)
 	queryNASRegistered                func(ctx context.Context) (bool, error)
 	afterFunc                         func(time.Duration, func()) *time.Timer
 	ensureUIMServiceHook              func() (*qmi.UIMService, error)
@@ -331,6 +324,10 @@ type Manager struct {
 
 	// 设备状态快照（由 NAS Indication 事件驱动，供上层零 IPC 读取）
 	snapshot DeviceSnapshot
+
+	// cardAccess protects DMS/UIM card operations from the IMS PDN bring-up
+	// window. IMS AKA APDU operations deliberately remain outside this gate.
+	cardAccess cardAccessGate
 }
 
 // internalEvent represents an internal event for the manager's event loop. / internalEvent 表示管理器事件循环的内部事件。
@@ -402,15 +399,12 @@ const fullCheckJitterRatio = 0.2
 var (
 	smsReadyWaitTimeout   = 8 * time.Second
 	smsReadyPollInterval  = 500 * time.Millisecond
-	smscRefreshCooldown   = 30 * time.Second
 	transportWarnCooldown = 30 * time.Second
 )
 
 type wmsRefreshOptions struct {
 	includeRoutes    bool
 	includeTransport bool
-	includeSMSC      bool
-	forceSMSC        bool
 	allowRouteReplay bool
 	emitSummary      bool
 	quiet            bool
@@ -1368,36 +1362,6 @@ func (m *Manager) setWMSTransportQueryError(err error) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) setWMSSMSCState(value string, known, available, stale bool, updatedAt, checkedAt time.Time) {
-	m.mu.Lock()
-	m.wmsSMSCValue = value
-	m.wmsSMSCKnown = known
-	m.wmsSMSCAvailable = available
-	m.wmsSMSCStale = stale
-	m.wmsSMSCUpdatedAt = updatedAt
-	if checkedAt.IsZero() {
-		checkedAt = updatedAt
-	}
-	m.wmsSMSCLastCheckAt = checkedAt
-	m.mu.Unlock()
-}
-
-func (m *Manager) beginWMSSMSCRefresh() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.wmsSMSCRefreshPending {
-		return false
-	}
-	m.wmsSMSCRefreshPending = true
-	return true
-}
-
-func (m *Manager) endWMSSMSCRefresh() {
-	m.mu.Lock()
-	m.wmsSMSCRefreshPending = false
-	m.mu.Unlock()
-}
-
 func (m *Manager) setWMSRoutesKnown(known bool) {
 	m.mu.Lock()
 	m.wmsRoutesKnown = known
@@ -1433,9 +1397,6 @@ func (m *Manager) markWMSReadinessStale() {
 	m.wmsLastTransportWarnAt = time.Time{}
 	m.wmsLastNASRegisteredKnown = false
 	m.wmsLastNASRegistered = false
-	if m.wmsSMSCKnown {
-		m.wmsSMSCStale = true
-	}
 	m.mu.Unlock()
 }
 
@@ -1445,30 +1406,24 @@ func (m *Manager) cachedWMSRoutes() *qmi.WMSRouteConfig {
 	return copyWMSRouteConfig(m.lastKnownGoodRoutes)
 }
 
-func (m *Manager) wmsReadinessSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported, smscAvailable, routesKnown bool) {
+func (m *Manager) wmsReadinessSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported, routesKnown bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsSMSCAvailable, m.wmsRoutesKnown
+	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsRoutesKnown
 }
 
-func (m *Manager) wmsSMSCSnapshot() (value string, available, known, stale bool, updatedAt, lastCheckAt time.Time, pending bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.wmsSMSCValue, m.wmsSMSCAvailable, m.wmsSMSCKnown, m.wmsSMSCStale, m.wmsSMSCUpdatedAt, m.wmsSMSCLastCheckAt, m.wmsSMSCRefreshPending
-}
-
-func (m *Manager) wmsDiagnosticSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported bool, transportQueryError string, smscValue string, smscAvailable, smscKnown, smscStale bool, smscUpdatedAt time.Time, routesKnown bool, nasRegistered *bool) {
+func (m *Manager) wmsDiagnosticSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported bool, transportQueryError string, routesKnown bool, nasRegistered *bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if m.wmsLastNASRegisteredKnown {
 		nasRegistered = boolPtr(m.wmsLastNASRegistered)
 	}
-	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsTransportQueryError, m.wmsSMSCValue, m.wmsSMSCAvailable, m.wmsSMSCKnown, m.wmsSMSCStale, m.wmsSMSCUpdatedAt, m.wmsRoutesKnown, nasRegistered
+	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsTransportQueryError, m.wmsRoutesKnown, nasRegistered
 }
 
 func (m *Manager) wmsTransportStatusString() string {
-	status, known, unsupported, _, _, _, _, _, _, _, _ := m.wmsDiagnosticSnapshot()
+	status, known, unsupported, _, _, _ := m.wmsDiagnosticSnapshot()
 	if unsupported {
 		return "unsupported"
 	}
@@ -1585,11 +1540,11 @@ func (m *Manager) setWMSRoutesWithContext(ctx context.Context, routes []qmi.WMSR
 	return m.WMSSetRoutes(ctx, routes, transferStatusReportToClient)
 }
 
-func (m *Manager) querySMSCWithContext(ctx context.Context) (string, error) {
-	if m.querySMSC != nil {
-		return m.querySMSC(ctx)
+func (m *Manager) queryWMSSMSCWithContext(ctx context.Context) (string, error) {
+	if m.queryWMSSMSC != nil {
+		return m.queryWMSSMSC(ctx)
 	}
-	return m.querySMSCFromDevice(ctx)
+	return m.WMSGetSMSCAddress(ctx)
 }
 
 func (m *Manager) queryNASRegisteredWithContext(ctx context.Context) (bool, error) {
@@ -1668,60 +1623,15 @@ func (m *Manager) refreshWMSTransportState(ctx context.Context, quiet bool) {
 	}
 }
 
-func (m *Manager) refreshWMSSMSCState(ctx context.Context, force bool, quiet bool) {
-	_, _, _, _, _, cachedLastCheckAt, pending := m.wmsSMSCSnapshot()
-	if pending {
-		return
-	}
-	if !force && !cachedLastCheckAt.IsZero() && time.Since(cachedLastCheckAt) < smscRefreshCooldown {
-		return
-	}
-	if !m.beginWMSSMSCRefresh() {
-		return
-	}
-	defer m.endWMSSMSCRefresh()
-
-	checkedAt := time.Now()
-	smsc, err := m.querySMSCWithContext(ctx)
-	if err != nil {
-		cachedValue, cachedAvailable, cachedKnown, _, cachedUpdatedAt, _, _ := m.wmsSMSCSnapshot()
-		if cachedKnown {
-			m.setWMSSMSCState(cachedValue, true, cachedAvailable, true, cachedUpdatedAt, checkedAt)
-			if !quiet && force {
-				m.log.WithError(err).Debug("WMS SMSC refresh failed, keeping cached SMSC")
-			}
-			return
-		}
-		m.setWMSSMSCState("", false, false, false, time.Time{}, checkedAt)
-		if !quiet {
-			m.log.WithError(err).Debug("WMS SMSC unavailable")
-		}
-		return
-	}
-
-	trimmed := strings.TrimSpace(smsc)
-	known := trimmed != ""
-	m.setWMSSMSCState(trimmed, known, known, false, checkedAt, checkedAt)
-	if !known && !quiet {
-		m.log.Debug("WMS SMSC unavailable: empty result")
-	}
-}
-
 func (m *Manager) logWMSRecoveryState(message string) {
-	_, known, unsupported, transportQueryError, _, smscAvailable, smscKnown, smscStale, smscUpdatedAt, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
+	_, known, unsupported, transportQueryError, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
 	entry := m.log.
 		WithField("transport_status", m.wmsTransportStatusString()).
 		WithField("transport_known", known).
 		WithField("transport_unsupported", unsupported).
-		WithField("smsc_available", smscAvailable).
-		WithField("smsc_known", smscKnown).
-		WithField("smsc_stale", smscStale).
 		WithField("routes_known", routesKnown)
 	if transportQueryError != "" {
 		entry = entry.WithField("transport_query_error", transportQueryError)
-	}
-	if !smscUpdatedAt.IsZero() {
-		entry = entry.WithField("smsc_last_updated_at", smscUpdatedAt)
 	}
 	if nasRegistered != nil {
 		entry = entry.WithField("nas_registered", *nasRegistered)
@@ -1736,14 +1646,10 @@ func (m *Manager) refreshWMSState(ctx context.Context, opts wmsRefreshOptions) {
 	if opts.includeTransport {
 		m.refreshWMSTransportState(ctx, opts.quiet)
 	}
-	if opts.includeSMSC {
-		m.refreshWMSSMSCState(ctx, opts.forceSMSC, opts.quiet)
-	}
-
 	if opts.emitSummary {
-		_, known, unsupported, smscAvailable, routesKnown := m.wmsReadinessSnapshot()
+		_, known, unsupported, routesKnown := m.wmsReadinessSnapshot()
 		switch {
-		case routesKnown && smscAvailable && ((known && m.wmsTransportStatusString() == qmi.WMSTransportNetworkRegistrationFullService.String()) || unsupported):
+		case routesKnown && ((known && m.wmsTransportStatusString() == qmi.WMSTransportNetworkRegistrationFullService.String()) || unsupported):
 			m.logWMSRecoveryState("WMS recovery state ready")
 		default:
 			m.logWMSRecoveryState("WMS recovery state degraded")
@@ -1785,8 +1691,6 @@ func (m *Manager) recoverWMSStateWithContext(parent context.Context) {
 	m.refreshWMSState(ctx, wmsRefreshOptions{
 		includeRoutes:    true,
 		includeTransport: true,
-		includeSMSC:      true,
-		forceSMSC:        true,
 		allowRouteReplay: true,
 		emitSummary:      true,
 		reason:           "recover",
@@ -1818,7 +1722,6 @@ func (m *Manager) maybeRefreshWMSReadiness(reason string) {
 		m.refreshWMSState(ctx, wmsRefreshOptions{
 			includeRoutes:    true,
 			includeTransport: true,
-			includeSMSC:      false,
 			allowRouteReplay: false,
 			emitSummary:      true,
 			reason:           reason,
@@ -1832,23 +1735,17 @@ func (m *Manager) smsReadyWithContext(ctx context.Context) (bool, bool, error) {
 		return false, false, ErrServiceNotReady("WMS")
 	}
 
-	_, _, smscKnown, _, _, _, _ := m.wmsSMSCSnapshot()
 	m.refreshWMSState(ctx, wmsRefreshOptions{
 		includeRoutes:    true,
 		includeTransport: true,
-		includeSMSC:      !smscKnown,
 		allowRouteReplay: false,
 		emitSummary:      false,
 		quiet:            true,
 		reason:           "sms-ready-check",
 	})
 
-	status, known, unsupported, smscAvailable, routesKnown := m.wmsReadinessSnapshot()
+	status, known, unsupported, routesKnown := m.wmsReadinessSnapshot()
 	transportStatus := m.wmsTransportStatusString()
-	if !smscAvailable {
-		m.setWMSLastNASRegistered(nil)
-		return false, false, nil
-	}
 	if known && transportStatus == qmi.WMSTransportNetworkRegistrationFullService.String() {
 		m.setWMSLastNASRegistered(nil)
 		return true, false, nil
@@ -1897,7 +1794,7 @@ func (m *Manager) EnsureSMSReady(ctx context.Context) error {
 }
 
 func (m *Manager) currentSMSReadinessDetails() SMSNotReadyError {
-	status, known, unsupported, transportQueryError, _, smscAvailable, _, _, _, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
+	status, known, unsupported, transportQueryError, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
 	transportStatus := "unknown"
 	switch {
 	case unsupported:
@@ -1910,7 +1807,6 @@ func (m *Manager) currentSMSReadinessDetails() SMSNotReadyError {
 		TransportKnown:       known,
 		TransportUnsupported: unsupported,
 		TransportQueryError:  transportQueryError,
-		SMSCAvailable:        smscAvailable,
 		RoutesKnown:          routesKnown,
 		NASRegistered:        nasRegistered,
 	}
@@ -3061,13 +2957,6 @@ func (m *Manager) cleanup() {
 	m.wmsTransportQueryError = ""
 	m.wmsLastTransportWarn = ""
 	m.wmsLastTransportWarnAt = time.Time{}
-	m.wmsSMSCValue = ""
-	m.wmsSMSCAvailable = false
-	m.wmsSMSCKnown = false
-	m.wmsSMSCStale = false
-	m.wmsSMSCUpdatedAt = time.Time{}
-	m.wmsSMSCLastCheckAt = time.Time{}
-	m.wmsSMSCRefreshPending = false
 	m.wmsRoutesKnown = false
 	m.wmsLastNASRegistered = false
 	m.wmsLastNASRegisteredKnown = false
