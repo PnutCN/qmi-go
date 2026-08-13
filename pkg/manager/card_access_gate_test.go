@@ -194,6 +194,41 @@ func TestCardIOQuietWindowDoesNotBlockNASOrWDS(t *testing.T) {
 	}
 }
 
+// TestCheckSIMRespectsBoundedTimeoutWhenCardAccessGateHeld proves checkSIM
+// bounds its card-access gate wait by the SIMCheck timeout, not just the
+// inner UIM/DMS calls made after the gate is acquired. checkSIM() runs on
+// Manager.Start() and on every modem-reset recovery attempt, both of which
+// rely on a SIMCheck timeout to degrade gracefully ("SIM check failed...
+// Continue anyway") instead of hanging. Acquiring the gate with
+// context.Background() would defeat that: a card IO quiet window held
+// abnormally long (e.g. a stuck IMS PDN bring-up -- the exact firmware-race
+// failure mode this gate exists to guard against) would make checkSIM()
+// block forever instead of returning within the configured timeout.
+func TestCheckSIMRespectsBoundedTimeoutWhenCardAccessGateHeld(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg.Timeouts.SIMCheck = 100 * time.Millisecond
+
+	release, err := m.BeginCardIOQuietWindow(context.Background())
+	if err != nil {
+		t.Fatalf("BeginCardIOQuietWindow() error = %v", err)
+	}
+	defer release()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.checkSIM()
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("checkSIM() error = %v, want context.DeadlineExceeded (bounded by the SIMCheck timeout while the card IO quiet window is held)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkSIM() did not return within a bounded window while the card IO quiet window was held -- gate acquisition ignored the SIMCheck timeout")
+	}
+}
+
 // TestCardIOQuietWindowNestedUngatedHelperDoesNotSelfDeadlock exercises the
 // exact SendAPDUContext/sendAPDUContextUngated pattern every nested card
 // operation must follow: a gated public method's ungated private helper must

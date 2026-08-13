@@ -2882,11 +2882,16 @@ func (m *Manager) checkSIM() error {
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
 	}
-	_, err := withCardAccessValue(m, context.Background(), func() (struct{}, error) {
+	// Bound the whole operation -- including the card-access gate wait --
+	// by the SIMCheck timeout, not just the inner UIM/DMS calls. Otherwise a
+	// card IO quiet window held abnormally long (e.g. a stuck IMS PDN
+	// bring-up) makes checkSIM() hang forever instead of degrading
+	// gracefully, since context.Background() never cancels the gate-wait.
+	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
+	defer cancel()
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
 		status := qmi.SIMAbsent
 		var err error
-		ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
-		defer cancel()
 
 		// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
 		if m.uim != nil {
