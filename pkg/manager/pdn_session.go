@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
@@ -12,6 +13,7 @@ import (
 var (
 	ErrPDNMuxConflict      = errors.New("qmi manager: PDN mux conflict")
 	ErrStalePDNSession     = errors.New("qmi manager: stale PDN session")
+	ErrManagerStopping     = errors.New("qmi manager: manager is stopping")
 	ErrPDNTopologyNotReady = errors.New("qmi manager: QMAP topology is not ready")
 	// ErrPDNStart identifies the modem WDS StartNetworkInterface boundary.
 	// Callers may classify this as an APN/network rejection; topology and
@@ -67,6 +69,8 @@ type pdnOps struct {
 	discoverEndpoint func(string) (uint32, error)
 	prepareUserspace func(string) error
 	bringUp          func(string) error
+	flushRoutes      func(string) error
+	flushAddresses   func(string) error
 	bringDown        func(string) error
 	stop             func(context.Context, *qmi.WDSService, uint32) error
 	releaseWDS       func(*qmi.WDSService) error
@@ -96,6 +100,8 @@ func defaultPDNOps() pdnOps {
 		discoverEndpoint: netcfg.DiscoverDataEndpointInterface,
 		prepareUserspace: netcfg.PrepareUserspaceOnly,
 		bringUp:          netcfg.BringUp,
+		flushRoutes:      netcfg.FlushRoutes,
+		flushAddresses:   netcfg.FlushAddresses,
 		bringDown:        netcfg.BringDown,
 		stop: func(ctx context.Context, wds *qmi.WDSService, handle uint32) error {
 			return wds.StopNetworkInterface(ctx, handle)
@@ -137,6 +143,12 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 	if ops.bringUp == nil {
 		ops.bringUp = defaults.bringUp
 	}
+	if ops.flushRoutes == nil {
+		ops.flushRoutes = defaults.flushRoutes
+	}
+	if ops.flushAddresses == nil {
+		ops.flushAddresses = defaults.flushAddresses
+	}
 	if ops.bringDown == nil {
 		ops.bringDown = defaults.bringDown
 	}
@@ -150,22 +162,47 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 }
 
 type managedPDNSession struct {
-	manager  *Manager
-	snapshot PDNSnapshot
-	master   string
-	muxID    uint8
-	wds      *qmi.WDSService
+	manager       *Manager
+	snapshot      PDNSnapshot
+	master        string
+	muxID         uint8
+	wds           *qmi.WDSService
+	closeInitOnce sync.Once
+	closeOnce     sync.Once
+	closeDone     chan struct{}
+	closeErr      error
 }
 
 func (s *managedPDNSession) Snapshot() PDNSnapshot { return s.snapshot }
+
+func (s *managedPDNSession) initCloseState() {
+	if s == nil {
+		return
+	}
+	s.closeInitOnce.Do(func() {
+		s.closeDone = make(chan struct{})
+	})
+}
 
 // OpenPDN opens a secondary QMAP PDN using the manager's shared QMI client.
 func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	m.mu.RLock()
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if stopping {
+		return nil, ErrManagerStopping
+	}
 	m.dataPlane.mu.Lock()
 	defer m.dataPlane.mu.Unlock()
+	m.mu.RLock()
+	stopping = m.state == StateStopping
+	m.mu.RUnlock()
+	if stopping {
+		return nil, ErrManagerStopping
+	}
 
 	topology := m.dataPlane.snapshot
 	if topology.Generation == 0 || topology.Mode != DataPlaneModeQMAP {
@@ -261,6 +298,7 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	session := &managedPDNSession{manager: m, master: master, muxID: req.MuxID, wds: wds, snapshot: PDNSnapshot{
 		ID: id, Generation: topology.Generation, InterfaceName: iface, Handle: handle, Settings: *settings,
 	}}
+	session.initCloseState()
 	if m.dataPlane.sessions == nil {
 		m.dataPlane.sessions = make(map[uint64]*managedPDNSession)
 	}
@@ -273,24 +311,54 @@ func (s *managedPDNSession) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	m := s.manager
-	m.dataPlane.mu.Lock()
-	defer m.dataPlane.mu.Unlock()
-	current := m.dataPlane.sessions[s.snapshot.ID]
-	if current == nil {
+	if s == nil {
 		return nil
 	}
-	if current != s || m.dataPlane.snapshot.Generation != s.snapshot.Generation {
-		return ErrStalePDNSession
-	}
-	delete(m.dataPlane.sessions, s.snapshot.ID)
-	ops := m.resolvedPDNOps()
-	return errors.Join(
-		ops.bringDown(s.snapshot.InterfaceName),
-		ops.stop(ctx, s.wds, s.snapshot.Handle),
-		ops.releaseWDS(s.wds),
-		ops.deleteMux(s.master, s.muxID),
-	)
+	s.initCloseState()
+	s.closeOnce.Do(func() {
+		m := s.manager
+		if m == nil {
+			s.closeErr = errors.New("qmi manager: PDN session has no manager")
+			close(s.closeDone)
+			return
+		}
+
+		m.dataPlane.mu.Lock()
+		current := m.dataPlane.sessions[s.snapshot.ID]
+		owned := current == s && m.dataPlane.snapshot.Generation == s.snapshot.Generation
+		m.dataPlane.mu.Unlock()
+
+		ops := m.resolvedPDNOps()
+		var cleanupErrs []error
+		if s.snapshot.Handle != 0 {
+			cleanupErrs = append(cleanupErrs, ops.stop(ctx, s.wds, s.snapshot.Handle))
+		}
+		if owned {
+			cleanupErrs = append(cleanupErrs,
+				ops.flushRoutes(s.snapshot.InterfaceName),
+				ops.flushAddresses(s.snapshot.InterfaceName),
+				ops.bringDown(s.snapshot.InterfaceName),
+			)
+		}
+		if s.wds != nil {
+			cleanupErrs = append(cleanupErrs, ops.releaseWDS(s.wds))
+		}
+		if owned {
+			cleanupErrs = append(cleanupErrs, ops.deleteMux(s.master, s.muxID))
+		} else {
+			cleanupErrs = append(cleanupErrs, ErrStalePDNSession)
+		}
+		s.closeErr = errors.Join(cleanupErrs...)
+
+		m.dataPlane.mu.Lock()
+		if m.dataPlane.sessions[s.snapshot.ID] == s {
+			delete(m.dataPlane.sessions, s.snapshot.ID)
+		}
+		m.dataPlane.mu.Unlock()
+		close(s.closeDone)
+	})
+	<-s.closeDone
+	return s.closeErr
 }
 
 func (m *Manager) closeManagedPDNSessions(ctx context.Context) {

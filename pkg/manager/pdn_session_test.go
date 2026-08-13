@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
@@ -71,12 +72,22 @@ func TestStalePDNSessionCloseCannotDeleteNewGenerationMux(t *testing.T) {
 	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
 	m.dataPlane.masterInterface = "wwan0"
 	deleted := false
+	stopped := false
+	released := false
 	m.pdnOps = successfulPDNOps(func(_ string, muxID uint8) error {
 		if muxID == 2 {
 			deleted = true
 		}
 		return nil
 	})
+	m.pdnOps.stop = func(context.Context, *qmi.WDSService, uint32) error {
+		stopped = true
+		return nil
+	}
+	m.pdnOps.releaseWDS = func(*qmi.WDSService) error {
+		released = true
+		return nil
+	}
 
 	old, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV4})
 	if err != nil {
@@ -89,8 +100,145 @@ func TestStalePDNSessionCloseCannotDeleteNewGenerationMux(t *testing.T) {
 	if err := old.Close(context.Background()); !errors.Is(err, ErrStalePDNSession) {
 		t.Fatalf("Close() error = %v, want ErrStalePDNSession", err)
 	}
+	if !stopped {
+		t.Fatal("stale session did not stop its own network handle")
+	}
+	if !released {
+		t.Fatal("stale session did not release its own WDS client")
+	}
 	if deleted {
 		t.Fatal("stale session deleted its mux after a new generation was published")
+	}
+}
+
+func TestPDNSessionCloseIsIdempotentAndFollowsNetworkBeforeWDSOrder(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	var events []string
+	stopErr := errors.New("stop failed")
+	m.pdnOps = successfulPDNOps(func(string, uint8) error {
+		events = append(events, "delete-mux")
+		return errors.New("delete failed")
+	})
+	m.pdnOps.stop = func(context.Context, *qmi.WDSService, uint32) error {
+		events = append(events, "stop-network")
+		return stopErr
+	}
+	m.pdnOps.flushRoutes = func(string) error {
+		events = append(events, "flush-routes")
+		return nil
+	}
+	m.pdnOps.flushAddresses = func(string) error {
+		events = append(events, "flush-addresses")
+		return nil
+	}
+	m.pdnOps.bringDown = func(string) error {
+		events = append(events, "bring-down")
+		return nil
+	}
+	m.pdnOps.releaseWDS = func(*qmi.WDSService) error {
+		events = append(events, "release-wds")
+		return nil
+	}
+
+	session, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV4})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	err1 := session.Close(context.Background())
+	err2 := session.Close(context.Background())
+
+	want := []string{"stop-network", "flush-routes", "flush-addresses", "bring-down", "release-wds", "delete-mux"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("cleanup events = %v, want %v", events, want)
+	}
+	if !errors.Is(err1, stopErr) || !strings.Contains(err1.Error(), "delete failed") {
+		t.Fatalf("first Close() error = %v, want stop and delete errors", err1)
+	}
+	if err1.Error() != err2.Error() {
+		t.Fatalf("repeated Close() errors differ: first=%q second=%q", err1, err2)
+	}
+}
+
+func TestConcurrentPDNSessionCloseWaitsForCleanupBeforeManagerStop(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg.Timeouts.Stop = time.Second
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	stopStarted := make(chan struct{})
+	releaseStop := make(chan struct{})
+	releasedWDS := make(chan struct{}, 1)
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.stop = func(context.Context, *qmi.WDSService, uint32) error {
+		close(stopStarted)
+		<-releaseStop
+		return nil
+	}
+	m.pdnOps.releaseWDS = func(*qmi.WDSService) error {
+		releasedWDS <- struct{}{}
+		return nil
+	}
+
+	session, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV4})
+	if err != nil {
+		t.Fatalf("OpenPDN() error = %v", err)
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- session.Close(context.Background()) }()
+	select {
+	case <-stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("session Close() did not start StopNetwork")
+	}
+
+	managerDone := make(chan error, 1)
+	go func() { managerDone <- m.Stop() }()
+	select {
+	case <-releasedWDS:
+		t.Fatal("Manager.Stop released WDS while another Close() was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseStop)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("session Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session Close() did not finish")
+	}
+	select {
+	case err := <-managerDone:
+		if err != nil {
+			t.Fatalf("Manager.Stop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Manager.Stop() did not wait for managed session cleanup")
+	}
+}
+
+func TestOpenPDNRejectsManagerStoppingBeforeTopologyIO(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.dataPlane.snapshot = DataPlaneSnapshot{Generation: 1, Mode: DataPlaneModeQMAP, DefaultInterface: "wwan0", DefaultMuxID: 1}
+	m.dataPlane.masterInterface = "wwan0"
+	m.mu.Lock()
+	m.state = StateStopping
+	m.mu.Unlock()
+	called := false
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.bringUpMaster = func(string) error {
+		called = true
+		return nil
+	}
+
+	_, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV4})
+	if !errors.Is(err, ErrManagerStopping) {
+		t.Fatalf("OpenPDN() error = %v, want ErrManagerStopping", err)
+	}
+	if called {
+		t.Fatal("OpenPDN() performed data-plane I/O while manager was stopping")
 	}
 }
 
@@ -446,6 +594,8 @@ func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 		},
 		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
 		bringUp:          func(string) error { return nil },
+		flushRoutes:      func(string) error { return nil },
+		flushAddresses:   func(string) error { return nil },
 		bringDown:        func(string) error { return nil },
 		stop:             func(context.Context, *qmi.WDSService, uint32) error { return nil },
 		releaseWDS:       func(*qmi.WDSService) error { return nil },
