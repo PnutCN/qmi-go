@@ -138,7 +138,7 @@ func TestHasActiveManagedPDNTracksSessions(t *testing.T) {
 		t.Fatal("empty sessions must not report an active PDN")
 	}
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
-		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
 	if !m.hasActiveManagedPDN() {
 		t.Fatal("a live session must report an active PDN")
@@ -151,7 +151,7 @@ func TestHasActiveManagedPDNTracksSessions(t *testing.T) {
 func TestResidualMuxReconcileKeepsActiveIMSMux(t *testing.T) {
 	m := newCoexistTestManager(t, "qmimux0", 1)
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
-		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
 
 	m.dataPlane.mu.Lock()
@@ -193,7 +193,7 @@ func TestActiveMuxIDsIncludesDeclaredDefaultBeforePublish(t *testing.T) {
 func TestCurrentDataPlaneSnapshotUsesDefaultInterfaceNotSecondaryPDN(t *testing.T) {
 	m := newCoexistTestManager(t, "qmimux0", 1)
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
-		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
 
 	snapshot, ok := m.CurrentDataPlaneSnapshot()
@@ -327,7 +327,7 @@ func TestConvergeDataPlaneSameGenerationDoesNotRedial(t *testing.T) {
 func TestRotateViaRadioResetRefusesWhileSecondaryPDNActive(t *testing.T) {
 	m := newCoexistTestManager(t, "qmimux0", 1)
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
-		7: {muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
+		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
 
 	err := m.rotateViaRadioReset()

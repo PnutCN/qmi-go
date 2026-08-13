@@ -107,10 +107,11 @@ func TestCleanupReconcilesAllResidualMuxesAfterSecondaryPDNs(t *testing.T) {
 	}
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
 		1: {
-			manager:  m,
-			snapshot: PDNSnapshot{ID: 1, Generation: 1, InterfaceName: "qmimux8", Handle: 1},
-			master:   "wwan0_q_q",
-			muxID:    2,
+			manager:   m,
+			snapshot:  PDNSnapshot{ID: 1, Generation: 1, InterfaceName: "qmimux8", Handle: 1},
+			master:    "wwan0_q_q",
+			muxID:     2,
+			closeDone: make(chan struct{}),
 		},
 	}
 	m.pdnOps = pdnOps{

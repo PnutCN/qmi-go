@@ -162,43 +162,31 @@ func (m *Manager) resolvedPDNOps() pdnOps {
 }
 
 type managedPDNSession struct {
-	manager       *Manager
-	snapshot      PDNSnapshot
-	master        string
-	muxID         uint8
-	wds           *qmi.WDSService
-	closeInitOnce sync.Once
-	closeOnce     sync.Once
-	closeDone     chan struct{}
-	closeErr      error
+	manager   *Manager
+	snapshot  PDNSnapshot
+	master    string
+	muxID     uint8
+	wds       *qmi.WDSService
+	closeOnce sync.Once
+	// closeDone 在 OpenPDN 构造 session 时一并建好（session 只在那一处产生），
+	// 所有 Close 调用方都等它关闭后再读 closeErr。
+	closeDone chan struct{}
+	closeErr  error
 }
 
 func (s *managedPDNSession) Snapshot() PDNSnapshot { return s.snapshot }
-
-func (s *managedPDNSession) initCloseState() {
-	if s == nil {
-		return
-	}
-	s.closeInitOnce.Do(func() {
-		s.closeDone = make(chan struct{})
-	})
-}
 
 // OpenPDN opens a secondary QMAP PDN using the manager's shared QMI client.
 func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	m.mu.RLock()
-	stopping := m.state == StateStopping
-	m.mu.RUnlock()
-	if stopping {
-		return nil, ErrManagerStopping
-	}
 	m.dataPlane.mu.Lock()
 	defer m.dataPlane.mu.Unlock()
+	// 必须在持有 dataPlane.mu 之后判断：否则与 Manager.Stop 之间存在窗口，
+	// 新 session 会在 closeManagedPDNSessions 扫过之后才被登记进注册表。
 	m.mu.RLock()
-	stopping = m.state == StateStopping
+	stopping := m.state == StateStopping
 	m.mu.RUnlock()
 	if stopping {
 		return nil, ErrManagerStopping
@@ -295,10 +283,9 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 		return nil, fmt.Errorf("qmi manager: bring PDN interface up: %w", err)
 	}
 
-	session := &managedPDNSession{manager: m, master: master, muxID: req.MuxID, wds: wds, snapshot: PDNSnapshot{
+	session := &managedPDNSession{manager: m, master: master, muxID: req.MuxID, wds: wds, closeDone: make(chan struct{}), snapshot: PDNSnapshot{
 		ID: id, Generation: topology.Generation, InterfaceName: iface, Handle: handle, Settings: *settings,
 	}}
-	session.initCloseState()
 	if m.dataPlane.sessions == nil {
 		m.dataPlane.sessions = make(map[uint64]*managedPDNSession)
 	}
@@ -314,7 +301,6 @@ func (s *managedPDNSession) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.initCloseState()
 	s.closeOnce.Do(func() {
 		m := s.manager
 		if m == nil {
