@@ -2936,11 +2936,20 @@ func (m *Manager) checkSIM() error {
 func (m *Manager) cleanup() {
 	// Use timeout context for cleanup operations / 使用超时上下文进行清理操作
 	m.stopScheduledTimers()
-	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
-	defer cancel()
+	// Two separate budgets on purpose. Releasing the secondary PDNs is network
+	// I/O and can burn the whole allowance on an unresponsive modem; the
+	// netdev cleanup that follows is what actually removes qmimux interfaces
+	// and must not be left with the leftovers. Sharing one budget starved
+	// exactly the step that has to run (observed on real hardware: both qmap
+	// and netcfg timed out after the PDN close ate the allowance).
+	pdnCtx, cancelPDN := m.opContext(m.cfg.Timeouts.Stop)
 	// Secondary PDNs own independent WDS clients and muxes, but share this
 	// manager's transport. Release them before clearing the shared services.
-	m.closeManagedPDNSessions(cleanupCtx)
+	m.closeManagedPDNSessions(pdnCtx)
+	cancelPDN()
+
+	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
+	defer cancel()
 	m.dataPlane.mu.Lock()
 	m.dataPlane.snapshot = DataPlaneSnapshot{}
 	m.dataPlane.masterInterface = ""
@@ -3005,6 +3014,11 @@ func (m *Manager) cleanup() {
 	if muxIface != "" || masterIface != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "qmap",
+			// 主机侧 netlink 操作，不经 QMI 传输、也无法中途打断，所以这里
+			// 明确不收 ctx：跑到一半被 runCleanupTasks 放弃时它仍会跑完，
+			// 只是调用方不再等。保护它的是上面那份独立预算，不是取消。
+			// 这一步负责移除残留 qmimux，是"退出不留 netdev"的最后防线，
+			// 不能为了早退而中途返回。
 			run: func(context.Context) error {
 				var err error
 				if muxIface != "" {
@@ -3043,6 +3057,7 @@ func (m *Manager) cleanup() {
 	if ifname != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "netcfg",
+			// 同 qmap：主机侧 netlink，不可打断，故意不收 ctx。
 			run: func(context.Context) error {
 				return errors.Join(
 					netcfg.FlushAddresses(ifname),
