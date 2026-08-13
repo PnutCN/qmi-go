@@ -230,6 +230,12 @@ func buildUIMReadinessWithSlotError(status qmi.SIMStatus, details *qmi.CardStatu
 }
 
 func (m *Manager) GetUIMReadiness(ctx context.Context) (UIMReadiness, error) {
+	return withCardAccessValue(m, ctx, func() (UIMReadiness, error) {
+		return m.getUIMReadiness(ctx)
+	})
+}
+
+func (m *Manager) getUIMReadiness(ctx context.Context) (UIMReadiness, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -263,12 +269,12 @@ func (m *Manager) GetUIMReadiness(ctx context.Context) (UIMReadiness, error) {
 
 	ids, _ := m.GetCachedIdentities()
 	if cardErr == nil && strings.TrimSpace(ids.ICCID) == "" {
-		if iccid, err := m.GetICCID(ctx); err == nil {
+		if iccid, err := m.getICCIDStrictLive(ctx); err == nil {
 			ids.ICCID = iccid
 		}
 	}
 	if cardErr == nil && strings.TrimSpace(ids.IMSI) == "" {
-		if imsi, err := m.GetIMSI(ctx); err == nil {
+		if imsi, err := m.getIMSIStrictLive(ctx); err == nil {
 			ids.IMSI = imsi
 		}
 	}

@@ -162,7 +162,11 @@ func (g *cardAccessGate) begin(ctx context.Context) (func(), error) {
 	}
 }
 
-func (m *Manager) BeginIMSCardAccessBarrier(ctx context.Context) (func(), error) {
+// BeginCardIOQuietWindow acquires exclusive ownership of the card-access
+// gate, blocking every gated card I/O operation until release is called.
+// The name deliberately carries no IMS policy: qmi-go only implements the
+// mechanism, callers (e.g. IMS PDN bring-up) decide when to hold it.
+func (m *Manager) BeginCardIOQuietWindow(ctx context.Context) (func(), error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("card access")
 	}
@@ -185,9 +189,11 @@ func (m *Manager) WaitForIMSCardAccessBarrier(ctx context.Context) error {
 	return m.cardAccess.waitBarrierIdle(ctx)
 }
 
-// withCardAccessValue serializes one non-IMS card operation with the IMS PDN
-// barrier. APDU operations use the same gate at their public entry points;
-// callers must not hold this gate while invoking another gated method.
+// withCardAccessValue serializes one card I/O operation with any held
+// BeginCardIOQuietWindow window. APDU operations use the same gate at their
+// public entry points; callers must not hold this gate while invoking
+// another gated method -- gated public methods must call the private
+// ...Ungated helper of any other gated operation they need instead.
 func withCardAccessValue[T any](m *Manager, ctx context.Context, fn func() (T, error)) (T, error) {
 	var zero T
 	if m == nil {

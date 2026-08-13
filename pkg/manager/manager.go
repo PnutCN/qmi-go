@@ -1993,6 +1993,12 @@ func (m *Manager) OpenLogicalChannel(slot uint8, aid []byte) (byte, error) {
 
 // OpenLogicalChannelContext opens a UIM logical channel using the caller context.
 func (m *Manager) OpenLogicalChannelContext(ctx context.Context, slot uint8, aid []byte) (byte, error) {
+	return withCardAccessValue(m, ctx, func() (byte, error) {
+		return m.openLogicalChannelContextUngated(ctx, slot, aid)
+	})
+}
+
+func (m *Manager) openLogicalChannelContextUngated(ctx context.Context, slot uint8, aid []byte) (byte, error) {
 	if m.openLogicalChannelHook != nil {
 		return m.openLogicalChannelHook(ctx, slot, aid)
 	}
@@ -2010,6 +2016,13 @@ func (m *Manager) CloseLogicalChannel(slot uint8, channel uint8) error {
 
 // CloseLogicalChannelContext closes a UIM logical channel using the caller context.
 func (m *Manager) CloseLogicalChannelContext(ctx context.Context, slot uint8, channel uint8) error {
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.closeLogicalChannelContextUngated(ctx, slot, channel)
+	})
+	return err
+}
+
+func (m *Manager) closeLogicalChannelContextUngated(ctx context.Context, slot uint8, channel uint8) error {
 	if m.closeLogicalChannelHook != nil {
 		return m.closeLogicalChannelHook(ctx, slot, channel)
 	}
@@ -2027,6 +2040,12 @@ func (m *Manager) SendAPDU(slot uint8, channel uint8, command []byte) ([]byte, e
 
 // SendAPDUContext transmits a raw APDU using the caller context.
 func (m *Manager) SendAPDUContext(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return m.sendAPDUContextUngated(ctx, slot, channel, command)
+	})
+}
+
+func (m *Manager) sendAPDUContextUngated(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
 	if m.sendAPDUHook != nil {
 		return m.sendAPDUHook(ctx, slot, channel, command)
 	}
@@ -2037,26 +2056,34 @@ func (m *Manager) SendAPDUContext(ctx context.Context, slot uint8, channel uint8
 
 // GetNativeMCCMNC 获取原生归属地 MCC 和 MNC
 func (m *Manager) GetNativeSPN(ctx context.Context) (string, error) {
-	return withUIMRecoveryValue(m, "GetNativeSPN", func(uim *qmi.UIMService) (string, error) {
-		return uim.GetNativeSPN(ctx)
+	return withCardAccessValue(m, ctx, func() (string, error) {
+		return withUIMRecoveryValue(m, "GetNativeSPN", func(uim *qmi.UIMService) (string, error) {
+			return uim.GetNativeSPN(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetSIMMetadata(ctx context.Context) (*qmi.SIMMetadata, error) {
-	return withUIMRecoveryValue(m, "GetSIMMetadata", func(uim *qmi.UIMService) (*qmi.SIMMetadata, error) {
-		return uim.GetSIMMetadata(ctx)
+	return withCardAccessValue(m, ctx, func() (*qmi.SIMMetadata, error) {
+		return withUIMRecoveryValue(m, "GetSIMMetadata", func(uim *qmi.UIMService) (*qmi.SIMMetadata, error) {
+			return uim.GetSIMMetadata(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetUSIMAID(ctx context.Context) ([]byte, error) {
-	return withUIMRecoveryValue(m, "GetUSIMAID", func(uim *qmi.UIMService) ([]byte, error) {
-		return uim.GetUSIMAID(ctx)
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return withUIMRecoveryValue(m, "GetUSIMAID", func(uim *qmi.UIMService) ([]byte, error) {
+			return uim.GetUSIMAID(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetISIMAID(ctx context.Context) ([]byte, error) {
-	return withUIMRecoveryValue(m, "GetISIMAID", func(uim *qmi.UIMService) ([]byte, error) {
-		return uim.GetISIMAID(ctx)
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return withUIMRecoveryValue(m, "GetISIMAID", func(uim *qmi.UIMService) ([]byte, error) {
+			return uim.GetISIMAID(ctx)
+		})
 	})
 }
 
@@ -2065,12 +2092,14 @@ func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err err
 		mcc string
 		mnc string
 	}
-	location, err := withUIMRecoveryValue(m, "GetNativeMCCMNC", func(uim *qmi.UIMService) (nativeLocation, error) {
-		localMCC, localMNC, callErr := uim.GetNativeMCCMNC(ctx)
-		return nativeLocation{
-			mcc: localMCC,
-			mnc: localMNC,
-		}, callErr
+	location, err := withCardAccessValue(m, ctx, func() (nativeLocation, error) {
+		return withUIMRecoveryValue(m, "GetNativeMCCMNC", func(uim *qmi.UIMService) (nativeLocation, error) {
+			localMCC, localMNC, callErr := uim.GetNativeMCCMNC(ctx)
+			return nativeLocation{
+				mcc: localMCC,
+				mnc: localMNC,
+			}, callErr
+		})
 	})
 	if err != nil {
 		return "", "", err
@@ -2853,47 +2882,50 @@ func (m *Manager) checkSIM() error {
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
 	}
-	status := qmi.SIMAbsent
-	var err error
-	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
-	defer cancel()
+	_, err := withCardAccessValue(m, context.Background(), func() (struct{}, error) {
+		status := qmi.SIMAbsent
+		var err error
+		ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
+		defer cancel()
 
-	// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
-	if m.uim != nil {
-		status, err = m.uim.GetCardStatus(ctx)
-		if err == nil {
-			m.log.Infof("SIM status (UIM): %s", status)
+		// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
+		if m.uim != nil {
+			status, err = m.uim.GetCardStatus(ctx)
+			if err == nil {
+				m.log.Infof("SIM status (UIM): %s", status)
+			}
 		}
-	}
 
-	// Fallback to DMS if UIM failed or not ready / 如果UIM失败或未就绪，回退到DMS
-	if err != nil || status != qmi.SIMReady {
-		dmsStatus, dmsErr := withDMSRecoveryValue(m, "checkSIM.GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
-			return dms.GetSIMStatus(ctx)
-		})
-		if dmsErr == nil {
-			status = dmsStatus
-			m.log.Infof("SIM status (DMS): %s", status)
-		} else if err == nil {
-			err = dmsErr
+		// Fallback to DMS if UIM failed or not ready / 如果UIM失败或未就绪，回退到DMS
+		if err != nil || status != qmi.SIMReady {
+			dmsStatus, dmsErr := withDMSRecoveryValue(m, "checkSIM.GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
+				return dms.GetSIMStatus(ctx)
+			})
+			if dmsErr == nil {
+				status = dmsStatus
+				m.log.Infof("SIM status (DMS): %s", status)
+			} else if err == nil {
+				err = dmsErr
+			}
 		}
-	}
 
-	if err != nil {
-		return err
-	}
-
-	if status == qmi.SIMPINRequired && m.cfg.PINCode != "" {
-		m.log.Info("Verifying PIN...")
-		if err := m.withDMSRecovery("checkSIM.VerifyPIN", func(dms *qmi.DMSService) error {
-			return dms.VerifyPIN(ctx, m.cfg.PINCode)
-		}); err != nil {
-			return fmt.Errorf("PIN verification failed: %w", err)
+		if err != nil {
+			return struct{}{}, err
 		}
-		m.log.Info("PIN verified successfully")
-	}
 
-	return nil
+		if status == qmi.SIMPINRequired && m.cfg.PINCode != "" {
+			m.log.Info("Verifying PIN...")
+			if err := m.withDMSRecovery("checkSIM.VerifyPIN", func(dms *qmi.DMSService) error {
+				return dms.VerifyPIN(ctx, m.cfg.PINCode)
+			}); err != nil {
+				return struct{}{}, fmt.Errorf("PIN verification failed: %w", err)
+			}
+			m.log.Info("PIN verified successfully")
+		}
+
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (m *Manager) cleanup() {

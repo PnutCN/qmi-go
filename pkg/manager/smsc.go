@@ -96,7 +96,7 @@ func (m *Manager) querySMSCFromDevice(ctx context.Context) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return m.SendAPDUContext(ctx, smscAPDUSlot, 0, command)
+		return m.sendAPDUContextUngated(ctx, smscAPDUSlot, 0, command)
 	}
 	smsc, errBasic := getSMSCFromUIM(txBasic)
 	if strings.TrimSpace(smsc) != "" {
@@ -202,21 +202,21 @@ func selectUSIMOrFallback(tx apduSender) error {
 }
 
 func (m *Manager) getSMSCFromUIMLogicalChannel(ctx context.Context) (string, error) {
-	channel, err := m.OpenLogicalChannelContext(ctx, smscAPDUSlot, genericUSIMAID)
+	channel, err := m.openLogicalChannelContextUngated(ctx, smscAPDUSlot, genericUSIMAID)
 	if err != nil {
 		return "", fmt.Errorf("open USIM logical channel failed: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = m.CloseLogicalChannelContext(closeCtx, smscAPDUSlot, channel)
+		_ = m.closeLogicalChannelContextUngated(closeCtx, smscAPDUSlot, channel)
 	}()
 
 	tx := func(command []byte) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return m.SendAPDUContext(ctx, smscAPDUSlot, channel, command)
+		return m.sendAPDUContextUngated(ctx, smscAPDUSlot, channel, command)
 	}
 	smsc, err := getSMSCFromSelectedFiles(tx)
 	if strings.TrimSpace(smsc) != "" {

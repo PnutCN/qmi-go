@@ -260,9 +260,9 @@ func TestManagerReadSMSCFromSIMFilesServiceNotReady(t *testing.T) {
 
 func TestManagerSMSCFileReaderDoesNotReenterCardAccessBarrier(t *testing.T) {
 	m := New(Config{}, nil)
-	release, err := m.BeginIMSCardAccessBarrier(context.Background())
+	release, err := m.BeginCardIOQuietWindow(context.Background())
 	if err != nil {
-		t.Fatalf("BeginIMSCardAccessBarrier() error = %v", err)
+		t.Fatalf("BeginCardIOQuietWindow() error = %v", err)
 	}
 	defer release()
 
@@ -283,6 +283,78 @@ func TestManagerSMSCFileReaderDoesNotReenterCardAccessBarrier(t *testing.T) {
 	var notReady *ServiceNotReadyError
 	if !errors.As(err, &notReady) {
 		t.Fatalf("unexpected error = %T %v, want ServiceNotReadyError", err, err)
+	}
+}
+
+// TestManagerSMSCAPDUHelpersDoNotReenterCardAccessBarrier is the logical-
+// channel/APDU counterpart of the UIM-file regression above: now that
+// SendAPDUContext/OpenLogicalChannelContext/CloseLogicalChannelContext are
+// themselves gated, ReadSMSCFromSIMFiles' internal helpers must go through
+// the private ...Ungated variants, not the public gated wrappers, or holding
+// the barrier here would make them hang until the context deadline.
+func TestManagerSMSCAPDUHelpersDoNotReenterCardAccessBarrier(t *testing.T) {
+	m := New(Config{}, nil)
+	release, err := m.BeginCardIOQuietWindow(context.Background())
+	if err != nil {
+		t.Fatalf("BeginCardIOQuietWindow() error = %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if _, err := m.sendAPDUContextUngated(ctx, smscAPDUSlot, 0, []byte{0x00, 0xA4}); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("sendAPDUContextUngated re-entered the card barrier: %v", err)
+	}
+	if _, err := m.openLogicalChannelContextUngated(ctx, smscAPDUSlot, genericUSIMAID); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("openLogicalChannelContextUngated re-entered the card barrier: %v", err)
+	}
+	if err := m.closeLogicalChannelContextUngated(ctx, smscAPDUSlot, 1); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closeLogicalChannelContextUngated re-entered the card barrier: %v", err)
+	}
+}
+
+// TestManagerReadSMSCFromSIMFilesDoesNotSelfDeadlock proves the full
+// ReadSMSCFromSIMFiles call -- which now exercises the gated basic-channel
+// APDU path, the gated logical-channel APDU path, and the gated UIM file
+// fallback -- completes on its own held gate instead of hanging until a
+// context deadline.
+func TestManagerReadSMSCFromSIMFilesDoesNotSelfDeadlock(t *testing.T) {
+	record := make([]byte, 0x2A)
+	for i := range record {
+		record[i] = 0xFF
+	}
+	copy(record[13:], encodeAddress("+447870002308"))
+	fcp := []byte{
+		0x62, 0x1E,
+		0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x01,
+		0x83, 0x02, 0x6F, 0x42,
+		0xA5, 0x03, 0x80, 0x01, 0x61,
+		0x8A, 0x01, 0x05,
+		0x8B, 0x03, 0x6F, 0x06, 0x05,
+		0x80, 0x02, 0x00, 0x7E,
+		0x88, 0x00,
+	}
+	script := &apduScript{
+		responses: map[string][][]byte{
+			"00A40004026F42": {append(append([]byte{}, fcp...), 0x90, 0x00)},
+			"00B201042A":     {append(append([]byte{}, record...), 0x90, 0x00)},
+		},
+	}
+
+	m := newRecoveryTestManager()
+	m.sendAPDUHook = func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
+		return script.send(command)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	got, err := m.ReadSMSCFromSIMFiles(ctx)
+	if err != nil {
+		t.Fatalf("ReadSMSCFromSIMFiles() error=%v (a self-deadlock would surface as a context deadline error here)", err)
+	}
+	if got != "+447870002308" {
+		t.Fatalf("ReadSMSCFromSIMFiles()=%q want=%q", got, "+447870002308")
 	}
 }
 
