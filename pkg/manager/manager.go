@@ -1003,9 +1003,20 @@ func (m *Manager) emitQMIIndicationEvent(eventType EventType, evt qmi.Event) {
 	m.emitEvent(m.qmiIndicationEvent(eventType, evt))
 }
 
-func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) {
+// emitSignalUpdate 更新信号快照并广播事件，返回是否真的采信了这份读数。
+//
+// 唯一的判断点：不携带测量结果的读数（射频刚恢复时 legacy API 返回的 -125 哨兵）
+// 一律丢弃，绝不能进快照。快照的 RSSI 只由显式查询写入——NAS Event Report 指示当前
+// 未被解析，而数据未连接时 doStatusCheck 会直接早退——所以一旦写进一个假值，
+// 它可能长期没有任何机会被覆盖。
+func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) bool {
 	if sig == nil {
-		return
+		return false
+	}
+	if !sig.HasMeasurement() {
+		m.log.WithField("rssi", sig.RSSI).
+			Debug("Signal strength has no measurement yet, not caching")
+		return false
 	}
 	// 原地更新快照，供上层零 IPC 读取信号强度
 	m.snapshot.updateSignal(sig)
@@ -1014,6 +1025,7 @@ func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) {
 		State:  m.State(),
 		Signal: sig,
 	})
+	return true
 }
 
 func packetTLVMeta(packet *qmi.Packet) []qmi.TLVMeta {
@@ -1969,11 +1981,12 @@ func (m *Manager) doPostRegistrationRefresh(reason string) {
 		})
 	}
 
+	// 本次刷新在驻网跃迁后 defaultPostRegRefreshDelay(800ms) 就触发，射频若刚从 RFOff
+	// 恢复，模组往往还没做完测量；emitSignalUpdate 会把这种读数挡掉并返回 false。
 	if sig, err := m.getSignalStrength(ctx); err != nil {
 		m.log.WithError(err).Debug("Post-reg refresh: failed to query signal strength")
-	} else if sig != nil {
-		rssiUpdated = true
-		m.emitSignalUpdate(sig)
+	} else {
+		rssiUpdated = m.emitSignalUpdate(sig)
 	}
 
 	m.log.WithField("reason", reason).
@@ -4422,6 +4435,14 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 		}
 		m.emitEvent(event)
 
+	// 已知缺口：本分支只转发 TLV 元数据，**不解析其中的信号强度**，因此
+	// NAS Event Report 无法刷新 snapshot 的 RSSI。加上 doStatusCheck 在
+	// StateDisconnected 时直接早退（数据未连接的 VoLTE 场景恒成立），RSSI 快照实际上
+	// 只由驻网跃迁后的 doPostRegistrationRefresh 写一次。emitSignalUpdate 的
+	// HasMeasurement 守卫保证那一次不会写进假值，但"指示驱动的持续刷新"仍然缺失。
+	//
+	// 补齐它需要按 NAS_EVENT_REPORT_IND 解析信号 TLV（注意 0x10 是有符号 dBm、
+	// 0x14 是无符号幅值，符号约定必须实机核对），目前无硬件可验证，故未实现。
 	case qmi.EventNASEventReport:
 		if isEmptyNASEventReport(evt) {
 			return
