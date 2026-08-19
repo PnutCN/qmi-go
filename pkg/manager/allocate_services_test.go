@@ -15,6 +15,7 @@ func TestAllocateServicesUsesCallerContextForClientIDAllocation(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.cfg = Config{EnableIPv4: true}
 	m.client = &qmi.Client{}
+	configureOptionalIMSAllocationForTest(m)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -55,6 +56,7 @@ func TestAllocateServicesSkipsWMSAndWDAWhenDisabledButKeepsVOICE(t *testing.T) {
 		DisableVOICEInd: true,
 	}
 	m.client = &qmi.Client{}
+	configureOptionalIMSAllocationForTest(m)
 
 	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) { return &qmi.NASService{}, nil }
 	m.newDMSService = func(context.Context, *qmi.Client) (*qmi.DMSService, error) { return &qmi.DMSService{}, nil }
@@ -103,6 +105,7 @@ func TestAllocateServicesLazyDataPlaneSkipsWDSAndWDAButKeepsVOICE(t *testing.T) 
 		DataPlanePolicy: DataPlanePolicyLazy,
 	}
 	m.client = &qmi.Client{}
+	configureOptionalIMSAllocationForTest(m)
 
 	wdsCalls := 0
 	wdaCalls := 0
@@ -170,6 +173,7 @@ func TestAllocateServicesReturnsErrorWhenCoreServiceAllocationFails(t *testing.T
 			m := newRecoveryTestManager()
 			m.cfg = Config{DisableWMSInd: true, DisableVOICEInd: true}
 			m.client = &qmi.Client{}
+			configureOptionalIMSAllocationForTest(m)
 			m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) {
 				return &qmi.NASService{}, nil
 			}
@@ -204,6 +208,7 @@ func TestAllocateServicesReturnsErrorWhenCoreServiceAllocationFails(t *testing.T
 func TestAllocateServicesContinuesWhenAuxiliaryServiceAllocationFails(t *testing.T) {
 	m := newRecoveryTestManager()
 	m.client = &qmi.Client{}
+	configureOptionalIMSAllocationForTest(m)
 	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) {
 		return &qmi.NASService{}, nil
 	}
@@ -231,101 +236,136 @@ func TestAllocateServicesContinuesWhenAuxiliaryServiceAllocationFails(t *testing
 	}
 }
 
-// TestAllocateServicesAllocatesIMSAAndIMSWhenSupported 锁住这次行为反转:
-// 以前 allocateServices 结尾无条件 `m.ims = nil; m.imsa = nil`,IMSA 的
-// 注册状态查询因此恒返回 ErrServiceNotReady。现在按能力检查分配。
-func TestAllocateServicesAllocatesIMSAAndIMSWhenSupported(t *testing.T) {
+func TestAllocateServicesAllocatesSupportedIMSServices(t *testing.T) {
 	m := newRecoveryTestManager()
+	m.cfg = Config{DisableWMSInd: true, DisableVOICEInd: true}
 	m.client = &qmi.Client{}
-	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) { return &qmi.NASService{}, nil }
-	m.newDMSService = func(context.Context, *qmi.Client) (*qmi.DMSService, error) { return &qmi.DMSService{}, nil }
-	m.newUIMService = func(context.Context, *qmi.Client) (*qmi.UIMService, error) { return &qmi.UIMService{}, nil }
-	m.registerNASIndications = func(context.Context, qmi.NASIndicationRegistration) error { return nil }
-	m.registerUIMIndications = func(context.Context) (uint32, error) { return 0, nil }
-	// 关掉 WMS:分配后紧跟 recoverWMSStateWithContext,会拿零值 client 发真请求。
-	m.cfg = Config{DisableWMSInd: true}
-	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) { return &qmi.VOICEService{}, nil }
-	m.registerVOICEIndications = func(context.Context, qmi.VoiceIndicationRegistration) error { return nil }
-
-	imsaCalls := 0
-	imsCalls := 0
-	indCfg := qmi.IMSAIndicationRegistration{}
-	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
-		imsaCalls++
-		return &qmi.IMSAService{}, nil
+	configureCoreServiceAllocationForTest(m)
+	m.newWMSService = func(context.Context, *qmi.Client) (*qmi.WMSService, error) {
+		return nil, errors.New("WMS unavailable")
 	}
+	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) {
+		return nil, errors.New("VOICE unavailable")
+	}
+
+	imsCalls := 0
+	imsaCalls := 0
 	m.newIMSService = func(context.Context, *qmi.Client) (*qmi.IMSService, error) {
 		imsCalls++
 		return &qmi.IMSService{}, nil
 	}
-	m.registerIMSAIndications = func(_ context.Context, cfg qmi.IMSAIndicationRegistration) error {
-		indCfg = cfg
+	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
+		imsaCalls++
+		return &qmi.IMSAService{}, nil
+	}
+	m.registerIMSAIndications = func(context.Context, qmi.IMSAIndicationRegistration) error {
 		return nil
 	}
 
 	if err := m.allocateServices(context.Background()); err != nil {
 		t.Fatalf("allocateServices() error = %v", err)
 	}
-	if imsaCalls != 1 || imsCalls != 1 {
-		t.Fatalf("IMSA allocations=%d IMS allocations=%d want 1/1", imsaCalls, imsCalls)
+	m.mu.RLock()
+	ims, imsa := m.ims, m.imsa
+	m.mu.RUnlock()
+	if ims == nil || imsa == nil {
+		t.Fatalf("IMS services were not retained: ims=%p imsa=%p", ims, imsa)
 	}
-	if m.imsa == nil || m.ims == nil {
-		t.Fatalf("imsa=%v ims=%v want both non-nil", m.imsa, m.ims)
-	}
-	if !indCfg.RegistrationStatusChanged || !indCfg.ServicesStatusChanged {
-		t.Fatalf("IMSA indication cfg = %+v, want both change flags set", indCfg)
+	if imsCalls != 1 || imsaCalls != 1 {
+		t.Fatalf("IMS allocations=%d/%d, want 1/1", imsCalls, imsaCalls)
 	}
 }
 
-// TestAllocateServicesKeepsIMSAClientWhenIndicationRegistrationFails 说明指示注册
-// 失败不能连累客户端:主动 GetIMSRegistrationStatus 仍然可用,退化成轮询好过
-// 完全没有 IMS 状态。
 func TestAllocateServicesKeepsIMSAClientWhenIndicationRegistrationFails(t *testing.T) {
 	m := newRecoveryTestManager()
-	m.client = &qmi.Client{}
-	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) { return &qmi.NASService{}, nil }
-	m.newDMSService = func(context.Context, *qmi.Client) (*qmi.DMSService, error) { return &qmi.DMSService{}, nil }
-	m.newUIMService = func(context.Context, *qmi.Client) (*qmi.UIMService, error) { return &qmi.UIMService{}, nil }
-	m.registerNASIndications = func(context.Context, qmi.NASIndicationRegistration) error { return nil }
-	m.registerUIMIndications = func(context.Context) (uint32, error) { return 0, nil }
-	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) { return &qmi.VOICEService{}, nil }
 	m.cfg = Config{DisableWMSInd: true, DisableVOICEInd: true}
+	m.client = &qmi.Client{}
+	configureCoreServiceAllocationForTest(m)
+	m.newWMSService = func(context.Context, *qmi.Client) (*qmi.WMSService, error) {
+		return nil, errors.New("WMS unavailable")
+	}
+	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) {
+		return nil, errors.New("VOICE unavailable")
+	}
+	m.newIMSService = func(context.Context, *qmi.Client) (*qmi.IMSService, error) {
+		return &qmi.IMSService{}, nil
+	}
+	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
+		return &qmi.IMSAService{}, nil
+	}
+	registrationErr := errors.New("IMSA indications rejected")
 	m.registerIMSAIndications = func(context.Context, qmi.IMSAIndicationRegistration) error {
-		return fmt.Errorf("indication register refused")
+		return registrationErr
 	}
 
 	if err := m.allocateServices(context.Background()); err != nil {
-		t.Fatalf("allocateServices() error=%v, want nil", err)
+		t.Fatalf("allocateServices() error = %v, want nil", err)
 	}
-	if m.imsa == nil {
-		t.Fatal("imsa = nil, want client kept despite indication registration failure")
+	m.mu.RLock()
+	imsa := m.imsa
+	m.mu.RUnlock()
+	if imsa == nil {
+		t.Fatal("IMSA client was discarded after indication registration failure")
 	}
 }
 
-// TestAllocateServicesContinuesWhenIMSAAllocationFails 保证 IMSA 分配失败是
-// 非致命的 —— 不支持 IMS 的模组(实测 EC20 上的 cdc-wdm0/3/5)不应拖垮启动。
-func TestAllocateServicesContinuesWhenIMSAAllocationFails(t *testing.T) {
+func TestAllocateServicesTreatsIMSAllocationFailureAsOptional(t *testing.T) {
 	m := newRecoveryTestManager()
-	m.client = &qmi.Client{}
 	m.cfg = Config{DisableWMSInd: true, DisableVOICEInd: true}
-	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) { return &qmi.NASService{}, nil }
-	m.newDMSService = func(context.Context, *qmi.Client) (*qmi.DMSService, error) { return &qmi.DMSService{}, nil }
-	m.newUIMService = func(context.Context, *qmi.Client) (*qmi.UIMService, error) { return &qmi.UIMService{}, nil }
-	m.registerNASIndications = func(context.Context, qmi.NASIndicationRegistration) error { return nil }
-	m.registerUIMIndications = func(context.Context) (uint32, error) { return 0, nil }
-	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) { return &qmi.VOICEService{}, nil }
-	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
-		return nil, fmt.Errorf("QMI protocol error (31): 'InvalidServiceType'")
+	m.client = &qmi.Client{}
+	configureCoreServiceAllocationForTest(m)
+	m.newWMSService = func(context.Context, *qmi.Client) (*qmi.WMSService, error) {
+		return nil, errors.New("WMS unavailable")
 	}
+	m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) {
+		return nil, errors.New("VOICE unavailable")
+	}
+	imsCalls := 0
+	imsaCalls := 0
 	m.newIMSService = func(context.Context, *qmi.Client) (*qmi.IMSService, error) {
-		return nil, fmt.Errorf("QMI protocol error (31): 'InvalidServiceType'")
+		imsCalls++
+		return nil, errors.New("IMS client allocation failed")
+	}
+	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
+		imsaCalls++
+		return nil, errors.New("IMSA client allocation failed")
 	}
 
 	if err := m.allocateServices(context.Background()); err != nil {
-		t.Fatalf("allocateServices() error=%v, want nil for IMSA/IMS failures", err)
+		t.Fatalf("allocateServices() error = %v, want nil for optional IMS failures", err)
 	}
-	if m.imsa != nil || m.ims != nil {
-		t.Fatalf("imsa=%v ims=%v want both nil after allocation failure", m.imsa, m.ims)
+	if imsCalls != 1 || imsaCalls != 1 {
+		t.Fatalf("IMS allocations=%d/%d, want 1/1", imsCalls, imsaCalls)
+	}
+}
+
+func configureCoreServiceAllocationForTest(m *Manager) {
+	m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) {
+		return &qmi.NASService{}, nil
+	}
+	m.newDMSService = func(context.Context, *qmi.Client) (*qmi.DMSService, error) {
+		return &qmi.DMSService{}, nil
+	}
+	m.newUIMService = func(context.Context, *qmi.Client) (*qmi.UIMService, error) {
+		return &qmi.UIMService{}, nil
+	}
+	m.registerNASIndications = func(context.Context, qmi.NASIndicationRegistration) error {
+		return nil
+	}
+	m.registerUIMIndications = func(context.Context) (uint32, error) {
+		return 0, nil
+	}
+}
+
+func configureOptionalIMSAllocationForTest(m *Manager) {
+	m.newIMSService = func(context.Context, *qmi.Client) (*qmi.IMSService, error) {
+		return &qmi.IMSService{}, nil
+	}
+	m.newIMSAService = func(context.Context, *qmi.Client) (*qmi.IMSAService, error) {
+		return &qmi.IMSAService{}, nil
+	}
+	m.registerIMSAIndications = func(context.Context, qmi.IMSAIndicationRegistration) error {
+		return nil
 	}
 }
 

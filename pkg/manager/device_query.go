@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		return
 	}
 	generation := m.snapshot.IdentityGeneration()
+	go m.preWarmSMSC(generation)
 	go func(gen uint64) {
 		// 给予足够的超时时间，避免后台抓取时与其他初始化流程抢占导致超时
 		ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
@@ -94,6 +96,27 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		}
 		m.log.WithField("imei", ids.IMEI).WithField("iccid", ids.ICCID).Debug("Device identities pre-warmed")
 	}(generation)
+}
+
+func (m *Manager) preWarmSMSC(generation uint64) {
+	ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	smsc, err := m.queryWMSSMSCWithContext(ctx)
+	if err != nil {
+		m.log.WithError(err).Debug("WMS SMSC pre-warm unavailable")
+		return
+	}
+	smsc = strings.TrimSpace(smsc)
+	if smsc == "" {
+		m.log.Debug("WMS SMSC pre-warm returned an empty address")
+		return
+	}
+	if !m.snapshot.UpdateIdentitiesIfGeneration(DeviceIdentities{SMSC: smsc}, generation) {
+		m.log.WithField("generation", generation).Debug("Skip stale SMSC pre-warm write")
+		return
+	}
+	m.log.Debug("WMS SMSC pre-warmed")
 }
 
 // GetCachedIdentities 提供给上层应用零 IPC 读取当前设备的基础与卡标识。
@@ -276,6 +299,12 @@ func (m *Manager) GetIMSI(ctx context.Context) (string, error) {
 
 // GetIMSIStrictLive 严格实时读取 IMSI（不依赖 snapshot 缓存）。
 func (m *Manager) GetIMSIStrictLive(ctx context.Context) (string, error) {
+	return withCardAccessValue(m, ctx, func() (string, error) {
+		return m.getIMSIStrictLive(ctx)
+	})
+}
+
+func (m *Manager) getIMSIStrictLive(ctx context.Context) (string, error) {
 	if m != nil && m.getIMSIStrictHook != nil {
 		return m.getIMSIStrictHook(ctx)
 	}
@@ -308,6 +337,12 @@ func (m *Manager) GetICCID(ctx context.Context) (string, error) {
 
 // GetICCIDStrictLive 严格实时读取 ICCID（不依赖 snapshot 缓存）。
 func (m *Manager) GetICCIDStrictLive(ctx context.Context) (string, error) {
+	return withCardAccessValue(m, ctx, func() (string, error) {
+		return m.getICCIDStrictLive(ctx)
+	})
+}
+
+func (m *Manager) getICCIDStrictLive(ctx context.Context) (string, error) {
 	if m != nil && m.getICCIDStrictHook != nil {
 		return m.getICCIDStrictHook(ctx)
 	}
@@ -332,20 +367,31 @@ func (m *Manager) GetICCIDStrictLive(ctx context.Context) (string, error) {
 
 // UIMGetSlotStatus 获取物理/逻辑卡槽状态
 func (m *Manager) UIMGetSlotStatus(ctx context.Context) (*qmi.UIMSlotStatus, error) {
-	return withUIMRecoveryValue(m, "UIMGetSlotStatus", func(uim *qmi.UIMService) (*qmi.UIMSlotStatus, error) {
-		return uim.GetSlotStatus(ctx)
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMSlotStatus, error) {
+		return withUIMRecoveryValue(m, "UIMGetSlotStatus", func(uim *qmi.UIMService) (*qmi.UIMSlotStatus, error) {
+			return uim.GetSlotStatus(ctx)
+		})
 	})
 }
 
 // UIMSwitchSlot 切换逻辑 slot 到目标物理 slot
 func (m *Manager) UIMSwitchSlot(ctx context.Context, logicalSlot uint8, physicalSlot uint32) error {
-	return m.withUIMRecovery("UIMSwitchSlot", func(uim *qmi.UIMService) error {
-		return uim.SwitchSlot(ctx, logicalSlot, physicalSlot)
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.withUIMRecovery("UIMSwitchSlot", func(uim *qmi.UIMService) error {
+			return uim.SwitchSlot(ctx, logicalSlot, physicalSlot)
+		})
 	})
+	return err
 }
 
 // UIMReadRecord 读取 record 型 EF 文件
 func (m *Manager) UIMReadRecord(ctx context.Context, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMRecordData, error) {
+		return m.getUIMReadRecord(ctx, fileID, path, recordNumber, recordLength)
+	})
+}
+
+func (m *Manager) getUIMReadRecord(ctx context.Context, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
 	return withUIMRecoveryValue(m, "UIMReadRecord", func(uim *qmi.UIMService) (*qmi.UIMRecordData, error) {
 		return uim.ReadRecord(ctx, fileID, path, recordNumber, recordLength)
 	})
@@ -353,6 +399,12 @@ func (m *Manager) UIMReadRecord(ctx context.Context, fileID uint16, path []uint8
 
 // UIMReadRecordWithSession 使用指定 session 读取 record 型 EF 文件
 func (m *Manager) UIMReadRecordWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMRecordData, error) {
+		return m.getUIMReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
+	})
+}
+
+func (m *Manager) getUIMReadRecordWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8, recordNumber uint16, recordLength uint16) (*qmi.UIMRecordData, error) {
 	return withUIMRecoveryValue(m, "UIMReadRecordWithSession", func(uim *qmi.UIMService) (*qmi.UIMRecordData, error) {
 		return uim.ReadRecordWithSession(ctx, sessionType, fileID, path, recordNumber, recordLength)
 	})
@@ -360,6 +412,12 @@ func (m *Manager) UIMReadRecordWithSession(ctx context.Context, sessionType uint
 
 // UIMGetFileAttributes 获取 SIM 文件元数据
 func (m *Manager) UIMGetFileAttributes(ctx context.Context, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMFileAttributes, error) {
+		return m.getUIMGetFileAttributes(ctx, fileID, path)
+	})
+}
+
+func (m *Manager) getUIMGetFileAttributes(ctx context.Context, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
 	return withUIMRecoveryValue(m, "UIMGetFileAttributes", func(uim *qmi.UIMService) (*qmi.UIMFileAttributes, error) {
 		return uim.GetFileAttributes(ctx, fileID, path)
 	})
@@ -367,6 +425,12 @@ func (m *Manager) UIMGetFileAttributes(ctx context.Context, fileID uint16, path 
 
 // UIMGetFileAttributesWithSession 使用指定 session 获取 SIM 文件元数据
 func (m *Manager) UIMGetFileAttributesWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
+	return withCardAccessValue(m, ctx, func() (*qmi.UIMFileAttributes, error) {
+		return m.getUIMGetFileAttributesWithSession(ctx, sessionType, fileID, path)
+	})
+}
+
+func (m *Manager) getUIMGetFileAttributesWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
 	return withUIMRecoveryValue(m, "UIMGetFileAttributesWithSession", func(uim *qmi.UIMService) (*qmi.UIMFileAttributes, error) {
 		return uim.GetFileAttributesWithSession(ctx, sessionType, fileID, path)
 	})
@@ -374,19 +438,30 @@ func (m *Manager) UIMGetFileAttributesWithSession(ctx context.Context, sessionTy
 
 // UIMReadTransparentWithSession 使用指定 session 读取 transparent 型 EF 文件
 func (m *Manager) UIMReadTransparentWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) ([]byte, error) {
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return m.getUIMReadTransparentWithSession(ctx, sessionType, fileID, path)
+	})
+}
+
+func (m *Manager) getUIMReadTransparentWithSession(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) ([]byte, error) {
 	return withUIMRecoveryValue(m, "UIMReadTransparentWithSession", func(uim *qmi.UIMService) ([]byte, error) {
 		return uim.ReadTransparentWithSession(ctx, sessionType, fileID, path)
 	})
 }
 
-// UIMRegisterEvents 注册 UIM 事件掩码
+// UIMRegisterEvents 注册 UIM 事件掩码。这是 UIM indication 注册操作（QMI UIM
+// Register Events），与「refresh-complete acknowledgement、indication 注册」
+// 一样必须留在 card IO quiet window 之外，否则 IMS PDN bring-up 期间会把
+// modem 自己想发的 indication 订阅请求也一并卡住。
 func (m *Manager) UIMRegisterEvents(ctx context.Context, mask uint32) (uint32, error) {
 	return withUIMRecoveryValue(m, "UIMRegisterEvents", func(uim *qmi.UIMService) (uint32, error) {
 		return uim.RegisterEvents(ctx, mask)
 	})
 }
 
-// UIMGetSupportedMessages 获取 UIM service 支持的消息 ID
+// UIMGetSupportedMessages 获取 UIM service 支持的消息 ID。这是服务能力发现，
+// 不是卡片数据读写，比照 WMSGetSupportedMessages/VOICEGetSupportedMessages
+// 留在 gate 之外。
 func (m *Manager) UIMGetSupportedMessages(ctx context.Context) ([]uint8, error) {
 	return withUIMRecoveryValue(m, "UIMGetSupportedMessages", func(uim *qmi.UIMService) ([]uint8, error) {
 		return uim.GetSupportedMessages(ctx)
@@ -395,30 +470,42 @@ func (m *Manager) UIMGetSupportedMessages(ctx context.Context) ([]uint8, error) 
 
 // UIMReset 重置 UIM service 状态
 func (m *Manager) UIMReset(ctx context.Context) error {
-	return m.withUIMRecovery("UIMReset", func(uim *qmi.UIMService) error {
-		return uim.Reset(ctx)
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.withUIMRecovery("UIMReset", func(uim *qmi.UIMService) error {
+			return uim.Reset(ctx)
+		})
 	})
+	return err
 }
 
 // UIMPowerOffSIM 关闭指定 slot 的 SIM 电源
 func (m *Manager) UIMPowerOffSIM(ctx context.Context, slot uint8) error {
-	return m.withUIMRecovery("UIMPowerOffSIM", func(uim *qmi.UIMService) error {
-		return uim.PowerOffSIM(ctx, slot)
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.withUIMRecovery("UIMPowerOffSIM", func(uim *qmi.UIMService) error {
+			return uim.PowerOffSIM(ctx, slot)
+		})
 	})
+	return err
 }
 
 // UIMPowerOnSIM 打开指定 slot 的 SIM 电源
 func (m *Manager) UIMPowerOnSIM(ctx context.Context, slot uint8) error {
-	return m.withUIMRecovery("UIMPowerOnSIM", func(uim *qmi.UIMService) error {
-		return uim.PowerOnSIM(ctx, slot)
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.withUIMRecovery("UIMPowerOnSIM", func(uim *qmi.UIMService) error {
+			return uim.PowerOnSIM(ctx, slot)
+		})
 	})
+	return err
 }
 
 // UIMChangeProvisioningSession 切换 UIM provisioning session
 func (m *Manager) UIMChangeProvisioningSession(ctx context.Context, req qmi.UIMChangeProvisioningSessionRequest) error {
-	return m.withUIMRecovery("UIMChangeProvisioningSession", func(uim *qmi.UIMService) error {
-		return uim.ChangeProvisioningSession(ctx, req)
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.withUIMRecovery("UIMChangeProvisioningSession", func(uim *qmi.UIMService) error {
+			return uim.ChangeProvisioningSession(ctx, req)
+		})
 	})
+	return err
 }
 
 type UIMPostSwitchReloadOptions struct {
@@ -534,21 +621,25 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// UIMRefreshRegister 注册 UIM refresh 文件列表
+// UIMRefreshRegister 注册 UIM refresh 文件列表。这是 refresh indication 的
+// 注册操作，按「indication 注册」规则留在 quiet window 之外。
 func (m *Manager) UIMRefreshRegister(ctx context.Context, req qmi.UIMRefreshRegisterRequest) error {
 	return m.withUIMRecovery("UIMRefreshRegister", func(uim *qmi.UIMService) error {
 		return uim.RefreshRegister(ctx, req)
 	})
 }
 
-// UIMRefreshComplete 上报 UIM refresh 处理完成
+// UIMRefreshComplete 上报 UIM refresh 处理完成。这正是计划里点名的
+// 「refresh-complete acknowledgement」，必须留在 quiet window 之外——否则
+// 卡在等待这个 ACK 的 SIM 会在 IMS PDN bring-up 期间被晾住。
 func (m *Manager) UIMRefreshComplete(ctx context.Context, req qmi.UIMRefreshCompleteRequest) error {
 	return m.withUIMRecovery("UIMRefreshComplete", func(uim *qmi.UIMService) error {
 		return uim.RefreshComplete(ctx, req)
 	})
 }
 
-// UIMRefreshRegisterAll 注册 UIM 全文件 refresh
+// UIMRefreshRegisterAll 注册 UIM 全文件 refresh。同 UIMRefreshRegister，是
+// indication 注册操作，留在 quiet window 之外。
 func (m *Manager) UIMRefreshRegisterAll(ctx context.Context, req qmi.UIMRefreshRegisterAllRequest) error {
 	return m.withUIMRecovery("UIMRefreshRegisterAll", func(uim *qmi.UIMService) error {
 		return uim.RefreshRegisterAll(ctx, req)
@@ -557,8 +648,10 @@ func (m *Manager) UIMRefreshRegisterAll(ctx context.Context, req qmi.UIMRefreshR
 
 // GetSIMStatus 获取 SIM 卡状态
 func (m *Manager) GetSIMStatus(ctx context.Context) (qmi.SIMStatus, error) {
-	return withDMSRecoveryValue(m, "GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
-		return dms.GetSIMStatus(ctx)
+	return withCardAccessValue(m, ctx, func() (qmi.SIMStatus, error) {
+		return withDMSRecoveryValue(m, "GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
+			return dms.GetSIMStatus(ctx)
+		})
 	})
 }
 
@@ -778,6 +871,13 @@ func (m *Manager) WMSGetRoutes(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	})
 }
 
+// WMSGetSMSCAddress queries the modem's current SMSC without accessing UIM/APDU.
+func (m *Manager) WMSGetSMSCAddress(ctx context.Context) (string, error) {
+	return withWMSRecoveryValue(m, "WMSGetSMSCAddress", func(wms *qmi.WMSService) (string, error) {
+		return wms.GetSMSCAddress(ctx)
+	})
+}
+
 // WMSSendAck 发送短信 ACK
 func (m *Manager) WMSSendAck(ctx context.Context, req qmi.WMSAckRequest) (*qmi.WMSAckResult, error) {
 	return withWMSRecoveryValue(m, "WMSSendAck", func(wms *qmi.WMSService) (*qmi.WMSAckResult, error) {
@@ -921,79 +1021,51 @@ func (m *Manager) WDSDiscoverIMSProfileIndex(ctx context.Context, apnHint string
 
 // IMSABind 显式绑定 IMSA 到指定 subscription/binding
 func (m *Manager) IMSABind(ctx context.Context, binding uint32) error {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return ErrServiceNotReady("IMSA")
-	}
-	return imsa.Bind(ctx, binding)
+	return m.withIMSARecovery("IMSABind", func(imsa *qmi.IMSAService) error {
+		return imsa.Bind(ctx, binding)
+	})
 }
 
 // IMSAGetIMSRegistrationStatus 获取 IMS 注册状态
 func (m *Manager) IMSAGetIMSRegistrationStatus(ctx context.Context) (*qmi.IMSARegistrationStatus, error) {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return nil, ErrServiceNotReady("IMSA")
-	}
-	return imsa.GetIMSRegistrationStatus(ctx)
+	return withIMSARecoveryValue(m, "IMSAGetIMSRegistrationStatus", func(imsa *qmi.IMSAService) (*qmi.IMSARegistrationStatus, error) {
+		return imsa.GetIMSRegistrationStatus(ctx)
+	})
 }
 
 // IMSAGetIMSServicesStatus 获取 IMS 各业务可用状态
 func (m *Manager) IMSAGetIMSServicesStatus(ctx context.Context) (*qmi.IMSAServicesStatus, error) {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return nil, ErrServiceNotReady("IMSA")
-	}
-	return imsa.GetIMSServicesStatus(ctx)
+	return withIMSARecoveryValue(m, "IMSAGetIMSServicesStatus", func(imsa *qmi.IMSAService) (*qmi.IMSAServicesStatus, error) {
+		return imsa.GetIMSServicesStatus(ctx)
+	})
 }
 
 // IMSARegisterIndications 注册 IMSA 指示开关
 func (m *Manager) IMSARegisterIndications(ctx context.Context, cfg qmi.IMSAIndicationRegistration) error {
-	m.mu.RLock()
-	imsa := m.imsa
-	m.mu.RUnlock()
-	if imsa == nil {
-		return ErrServiceNotReady("IMSA")
-	}
-	return imsa.RegisterIndications(ctx, cfg)
+	return m.withIMSARecovery("IMSARegisterIndications", func(imsa *qmi.IMSAService) error {
+		return imsa.RegisterIndications(ctx, cfg)
+	})
 }
 
 // IMSBind 显式绑定 IMS settings service
 func (m *Manager) IMSBind(ctx context.Context, binding uint32) error {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return ErrServiceNotReady("IMS")
-	}
-	return ims.Bind(ctx, binding)
+	return m.withIMSRecovery("IMSBind", func(ims *qmi.IMSService) error {
+		return ims.Bind(ctx, binding)
+	})
 }
 
 // IMSGetServicesEnabledSetting 获取 IMS enable setting
 func (m *Manager) IMSGetServicesEnabledSetting(ctx context.Context) (*qmi.IMSServicesEnabledSettings, error) {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return nil, ErrServiceNotReady("IMS")
-	}
-	return ims.GetServicesEnabledSetting(ctx)
+	return withIMSRecoveryValue(m, "IMSGetServicesEnabledSetting", func(ims *qmi.IMSService) (*qmi.IMSServicesEnabledSettings, error) {
+		return ims.GetServicesEnabledSetting(ctx)
+	})
 }
 
 // IMSSetServicesEnabledSetting 显式修改 IMS enable setting
 func (m *Manager) IMSSetServicesEnabledSetting(ctx context.Context, update qmi.IMSServicesEnabledSettingsUpdate) error {
-	m.mu.RLock()
-	ims := m.ims
-	m.mu.RUnlock()
-	if ims == nil {
-		return ErrServiceNotReady("IMS")
-	}
-	return ims.SetServicesEnabledSetting(ctx, update)
+	return m.withIMSRecovery("IMSSetServicesEnabledSetting", func(ims *qmi.IMSService) error {
+		return ims.SetServicesEnabledSetting(ctx, update)
+	})
 }
 
 // IMSPGetEnablerState 获取 IMSP enabler 状态
@@ -1146,7 +1218,6 @@ type SMSNotReadyError struct {
 	TransportKnown       bool
 	TransportUnsupported bool
 	TransportQueryError  string
-	SMSCAvailable        bool
 	RoutesKnown          bool
 	NASRegistered        *bool
 }
@@ -1157,11 +1228,10 @@ func (e *SMSNotReadyError) Error() string {
 		nasRegistered = fmt.Sprintf("%t", *e.NASRegistered)
 	}
 	return fmt.Sprintf(
-		"QMI 短信未就绪: transport_status=%s transport_known=%t transport_unsupported=%t smsc_available=%t routes_known=%t nas_registered=%s transport_query_error=%q",
+		"QMI 短信未就绪: transport_status=%s transport_known=%t transport_unsupported=%t routes_known=%t nas_registered=%s transport_query_error=%q",
 		e.TransportStatus,
 		e.TransportKnown,
 		e.TransportUnsupported,
-		e.SMSCAvailable,
 		e.RoutesKnown,
 		nasRegistered,
 		e.TransportQueryError,

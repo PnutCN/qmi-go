@@ -30,7 +30,6 @@ const (
 	EventNASCellLocationInfoChanged                      // NAS cell location info / NAS 小区信息变化
 	EventModemReset                                      // CTL revoke client ID (modem reset) / CTL撤销客户端ID (modem重置)
 	EventNewMessage                                      // WMS new message / WMS新消息
-	EventWMSSMSCAddress                                  // WMS SMSC address indication / WMS 短信中心地址指示
 	EventWMSTransportNetworkRegistrationStatus           // WMS transport network registration status indication / WMS 传输网络注册状态指示
 	EventIMSRegistrationStatus                           // IMSA registration status changed / IMSA 注册状态变化
 	EventIMSServicesStatus                               // IMSA services status changed / IMSA 业务状态变化
@@ -852,8 +851,6 @@ func (c *Client) dispatchIndication(p *Packet) {
 		eventType = EventNASCellLocationInfoChanged
 	case p.ServiceType == ServiceWMS && p.MessageID == WMSEventReportInd:
 		eventType = EventNewMessage
-	case p.ServiceType == ServiceWMS && p.MessageID == WMSSMSCAddressInd:
-		eventType = EventWMSSMSCAddress
 	case p.ServiceType == ServiceWMS && p.MessageID == WMSTransportNetworkRegistrationStatusInd:
 		eventType = EventWMSTransportNetworkRegistrationStatus
 	case p.ServiceType == ServiceIMSA && p.MessageID == IMSARegistrationStatusChanged:

@@ -51,6 +51,68 @@ func TestServiceNotSupportedDoesNotTriggerRecovery(t *testing.T) {
 	}
 }
 
+func TestWithIMSARecoveryRebindsAndRetries(t *testing.T) {
+	m := newRecoveryTestManager()
+	first := &qmi.IMSAService{}
+	second := &qmi.IMSAService{}
+	ensureCalls := 0
+	rebindCalls := 0
+	m.ensureIMSAServiceHook = func() (*qmi.IMSAService, error) {
+		ensureCalls++
+		return first, nil
+	}
+	m.rebindIMSAServiceHook = func(string) (*qmi.IMSAService, error) {
+		rebindCalls++
+		return second, nil
+	}
+
+	attempts := 0
+	err := m.withIMSARecovery("IMSA.GetIMSRegistrationStatus", func(service *qmi.IMSAService) error {
+		if service == nil {
+			t.Fatal("recovery callback received nil IMSA service")
+		}
+		attempts++
+		if attempts == 1 {
+			return recoverableQMIError(qmi.ServiceIMSA, qmi.IMSAGetIMSRegistrationStatus)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withIMSARecovery() error = %v", err)
+	}
+	if ensureCalls != 1 || rebindCalls != 1 || attempts != 2 {
+		t.Fatalf("ensure/rebind/attempts=%d/%d/%d, want 1/1/2", ensureCalls, rebindCalls, attempts)
+	}
+}
+
+func TestWithIMSRecoveryRebindsAndRetries(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.ensureIMSServiceHook = func() (*qmi.IMSService, error) {
+		return &qmi.IMSService{}, nil
+	}
+	m.rebindIMSServiceHook = func(string) (*qmi.IMSService, error) {
+		return &qmi.IMSService{}, nil
+	}
+
+	attempts := 0
+	err := m.withIMSRecovery("IMS.GetServicesEnabledSetting", func(service *qmi.IMSService) error {
+		if service == nil {
+			t.Fatal("recovery callback received nil IMS service")
+		}
+		attempts++
+		if attempts == 1 {
+			return recoverableQMIError(qmi.ServiceIMS, qmi.IMSGetServicesEnabledSetting)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withIMSRecovery() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want 2", attempts)
+	}
+}
+
 func recoverableQMIError(service uint16, msg uint16) error {
 	return &qmi.QMIError{
 		Service:   service,
@@ -370,7 +432,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	// Force replay path to run but fail softly, verifying it does not block main retry success.
 	eventReportCalls := 0
 	indicationCalls := 0
-	smscCalls := 0
 	m.registerWMSEventReport = func(_ context.Context) error {
 		eventReportCalls++
 		return fmt.Errorf("forced register event report failure")
@@ -384,10 +445,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	}
 	m.queryWMSTransportState = func(_ context.Context) (qmi.WMSTransportNetworkRegistration, error) {
 		return 0, fmt.Errorf("forced transport query failure")
-	}
-	m.querySMSC = func(_ context.Context) (string, error) {
-		smscCalls++
-		return "", fmt.Errorf("forced smsc query failure")
 	}
 
 	attempts := 0
@@ -410,9 +467,6 @@ func TestWMSRecoveryRebindThenRetrySuccessAndReplay(t *testing.T) {
 	// replay hook path with forced failures should still execute
 	if eventReportCalls == 0 && indicationCalls == 0 {
 		t.Fatal("expected WMS replay path to run after rebind")
-	}
-	if smscCalls == 0 {
-		t.Fatal("expected WMS replay to refresh SMSC diagnostics after rebind")
 	}
 }
 

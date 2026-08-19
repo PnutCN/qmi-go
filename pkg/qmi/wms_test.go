@@ -399,31 +399,40 @@ func TestParseTransportNetworkRegistrationStatusResponseShortTLV(t *testing.T) {
 	}
 }
 
-func TestParseWMSSMSCAddressIndication(t *testing.T) {
-	packet := &Packet{
-		TLVs: []TLV{
-			{Type: 0x01, Value: []byte{'I', 'P', 'V', 0x05, '1', '0', '0', '8', '6'}},
-		},
-	}
-
-	info, err := ParseWMSSMSCAddressIndication(packet)
+func TestParseGetSMSCAddressResponse(t *testing.T) {
+	resp := &Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: 0x01, Value: []byte{'1', '4', '5', 0x0d, '+', '4', '4', '7', '8', '7', '0', '0', '0', '2', '3', '0', '8'}},
+	}}
+	got, err := parseGetSMSCAddressResponse(resp)
 	if err != nil {
-		t.Fatalf("ParseWMSSMSCAddressIndication returned error: %v", err)
+		t.Fatalf("parseGetSMSCAddressResponse() error = %v", err)
 	}
-	if info == nil || info.Type != "IPV" || info.Digits != "10086" {
-		t.Fatalf("unexpected SMSC indication payload: %+v", info)
+	if got != "+447870002308" {
+		t.Fatalf("parseGetSMSCAddressResponse() = %q, want %q", got, "+447870002308")
 	}
 }
 
-func TestParseWMSSMSCAddressIndicationTruncated(t *testing.T) {
-	packet := &Packet{
-		TLVs: []TLV{
-			{Type: 0x01, Value: []byte{'I', 'P', 'V', 0x05, '1', '0'}},
-		},
+func TestParseGetSMSCAddressResponseRejectsMissingAndTruncatedTLV(t *testing.T) {
+	for _, resp := range []*Packet{
+		{TLVs: []TLV{successResultTLV()}},
+		{TLVs: []TLV{successResultTLV(), {Type: 0x01, Value: []byte{'1', '4', '5', 0x00}}}},
+		{TLVs: []TLV{successResultTLV(), {Type: 0x01, Value: []byte{'1', '4', '5', 0x05, '1', '0'}}}},
+	} {
+		if _, err := parseGetSMSCAddressResponse(resp); err == nil {
+			t.Fatalf("parseGetSMSCAddressResponse(%+v) unexpectedly succeeded", resp.TLVs)
+		}
 	}
+}
 
-	if _, err := ParseWMSSMSCAddressIndication(packet); err == nil {
-		t.Fatal("expected ParseWMSSMSCAddressIndication to fail on truncated payload")
+func TestParseGetSMSCAddressResponseNormalizesInternationalType(t *testing.T) {
+	resp := &Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: 0x01, Value: []byte{'1', '4', '5', 0x0c, '4', '4', '7', '8', '7', '0', '0', '0', '2', '3', '0', '8'}},
+	}}
+	got, err := parseGetSMSCAddressResponse(resp)
+	if err != nil || got != "+447870002308" {
+		t.Fatalf("parseGetSMSCAddressResponse() = %q, %v", got, err)
 	}
 }
 
@@ -473,7 +482,7 @@ func TestDispatchWMSIndications(t *testing.T) {
 		want  EventType
 	}{
 		{msgID: WMSEventReportInd, want: EventNewMessage},
-		{msgID: WMSSMSCAddressInd, want: EventWMSSMSCAddress},
+		{msgID: 0x0046, want: EventUnknown},
 		{msgID: WMSTransportNetworkRegistrationStatusInd, want: EventWMSTransportNetworkRegistrationStatus},
 		{msgID: 0x0044, want: EventUnknown},
 	}

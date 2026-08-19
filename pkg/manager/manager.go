@@ -231,6 +231,8 @@ type Manager struct {
 	wmsRecoveryMu           sync.Mutex
 	wmsReplayMu             sync.Mutex
 	voiceRecoveryMu         sync.Mutex
+	imsRecoveryMu           sync.Mutex
+	imsaRecoveryMu          sync.Mutex
 	uimLastRecoverSignal    time.Time
 	uimRecoverCooldown      time.Duration
 	wmsReplayInProgress     bool
@@ -249,13 +251,6 @@ type Manager struct {
 	wmsTransportQueryError     string
 	wmsLastTransportWarn       string
 	wmsLastTransportWarnAt     time.Time
-	wmsSMSCValue               string
-	wmsSMSCAvailable           bool
-	wmsSMSCKnown               bool
-	wmsSMSCStale               bool
-	wmsSMSCUpdatedAt           time.Time
-	wmsSMSCLastCheckAt         time.Time
-	wmsSMSCRefreshPending      bool
 	wmsRoutesKnown             bool
 	wmsLastNASRegistered       bool
 	wmsLastNASRegisteredKnown  bool
@@ -277,7 +272,7 @@ type Manager struct {
 	queryWMSTransportState            func(ctx context.Context) (qmi.WMSTransportNetworkRegistration, error)
 	queryWMSRoutes                    func(ctx context.Context) (*qmi.WMSRouteConfig, error)
 	setWMSRoutes                      func(ctx context.Context, routes []qmi.WMSRoute, transferStatusReportToClient bool) error
-	querySMSC                         func(ctx context.Context) (string, error)
+	queryWMSSMSC                      func(ctx context.Context) (string, error)
 	queryNASRegistered                func(ctx context.Context) (bool, error)
 	afterFunc                         func(time.Duration, func()) *time.Timer
 	ensureUIMServiceHook              func() (*qmi.UIMService, error)
@@ -290,6 +285,10 @@ type Manager struct {
 	rebindWMSServiceHook              func(reason string) (*qmi.WMSService, error)
 	ensureVOICEServiceHook            func() (*qmi.VOICEService, error)
 	rebindVOICEServiceHook            func(reason string) (*qmi.VOICEService, error)
+	ensureIMSServiceHook              func() (*qmi.IMSService, error)
+	rebindIMSServiceHook              func(reason string) (*qmi.IMSService, error)
+	ensureIMSAServiceHook             func() (*qmi.IMSAService, error)
+	rebindIMSAServiceHook             func(reason string) (*qmi.IMSAService, error)
 	openLogicalChannelHook            func(ctx context.Context, slot uint8, aid []byte) (byte, error)
 	closeLogicalChannelHook           func(ctx context.Context, slot uint8, channel uint8) error
 	sendAPDUHook                      func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error)
@@ -300,8 +299,8 @@ type Manager struct {
 	newWDAService                     func(ctx context.Context, client *qmi.Client) (*qmi.WDAService, error)
 	newWMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WMSService, error)
 	newVOICEService                   func(ctx context.Context, client *qmi.Client) (*qmi.VOICEService, error)
-	newIMSAService                    func(ctx context.Context, client *qmi.Client) (*qmi.IMSAService, error)
 	newIMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.IMSService, error)
+	newIMSAService                    func(ctx context.Context, client *qmi.Client) (*qmi.IMSAService, error)
 	enableRawIPHook                   func(ctx context.Context) error
 	getDataFormatFn                   func(ctx context.Context) (*qmi.DataFormat, error)
 	setDataFormatFn                   func(ctx context.Context, f qmi.DataFormat) error
@@ -325,6 +324,10 @@ type Manager struct {
 
 	// 设备状态快照（由 NAS Indication 事件驱动，供上层零 IPC 读取）
 	snapshot DeviceSnapshot
+
+	// cardAccess protects DMS/UIM card operations from the IMS PDN bring-up
+	// window. IMS AKA APDU operations deliberately remain outside this gate.
+	cardAccess cardAccessGate
 }
 
 // internalEvent represents an internal event for the manager's event loop. / internalEvent 表示管理器事件循环的内部事件。
@@ -396,15 +399,12 @@ const fullCheckJitterRatio = 0.2
 var (
 	smsReadyWaitTimeout   = 8 * time.Second
 	smsReadyPollInterval  = 500 * time.Millisecond
-	smscRefreshCooldown   = 30 * time.Second
 	transportWarnCooldown = 30 * time.Second
 )
 
 type wmsRefreshOptions struct {
 	includeRoutes    bool
 	includeTransport bool
-	includeSMSC      bool
-	forceSMSC        bool
 	allowRouteReplay bool
 	emitSummary      bool
 	quiet            bool
@@ -1003,9 +1003,20 @@ func (m *Manager) emitQMIIndicationEvent(eventType EventType, evt qmi.Event) {
 	m.emitEvent(m.qmiIndicationEvent(eventType, evt))
 }
 
-func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) {
+// emitSignalUpdate 更新信号快照并广播事件，返回是否真的采信了这份读数。
+//
+// 唯一的判断点：不携带测量结果的读数（射频刚恢复时 legacy API 返回的 -125 哨兵）
+// 一律丢弃，绝不能进快照。快照的 RSSI 只由显式查询写入——NAS Event Report 指示当前
+// 未被解析，而数据未连接时 doStatusCheck 会直接早退——所以一旦写进一个假值，
+// 它可能长期没有任何机会被覆盖。
+func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) bool {
 	if sig == nil {
-		return
+		return false
+	}
+	if !sig.HasMeasurement() {
+		m.log.WithField("rssi", sig.RSSI).
+			Debug("Signal strength has no measurement yet, not caching")
+		return false
 	}
 	// 原地更新快照，供上层零 IPC 读取信号强度
 	m.snapshot.updateSignal(sig)
@@ -1014,6 +1025,7 @@ func (m *Manager) emitSignalUpdate(sig *qmi.SignalStrength) {
 		State:  m.State(),
 		Signal: sig,
 	})
+	return true
 }
 
 func packetTLVMeta(packet *qmi.Packet) []qmi.TLVMeta {
@@ -1196,18 +1208,18 @@ func (m *Manager) createVOICEService(ctx context.Context) (*qmi.VOICEService, er
 	return qmi.NewVOICEServiceWithContext(ctx, m.client)
 }
 
-func (m *Manager) createIMSAService(ctx context.Context) (*qmi.IMSAService, error) {
-	if m.newIMSAService != nil {
-		return m.newIMSAService(ctx, m.client)
-	}
-	return qmi.NewIMSAServiceWithContext(ctx, m.client)
-}
-
 func (m *Manager) createIMSService(ctx context.Context) (*qmi.IMSService, error) {
 	if m.newIMSService != nil {
 		return m.newIMSService(ctx, m.client)
 	}
 	return qmi.NewIMSServiceWithContext(ctx, m.client)
+}
+
+func (m *Manager) createIMSAService(ctx context.Context) (*qmi.IMSAService, error) {
+	if m.newIMSAService != nil {
+		return m.newIMSAService(ctx, m.client)
+	}
+	return qmi.NewIMSAServiceWithContext(ctx, m.client)
 }
 
 func (m *Manager) shouldAllocateWDA() bool {
@@ -1362,36 +1374,6 @@ func (m *Manager) setWMSTransportQueryError(err error) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) setWMSSMSCState(value string, known, available, stale bool, updatedAt, checkedAt time.Time) {
-	m.mu.Lock()
-	m.wmsSMSCValue = value
-	m.wmsSMSCKnown = known
-	m.wmsSMSCAvailable = available
-	m.wmsSMSCStale = stale
-	m.wmsSMSCUpdatedAt = updatedAt
-	if checkedAt.IsZero() {
-		checkedAt = updatedAt
-	}
-	m.wmsSMSCLastCheckAt = checkedAt
-	m.mu.Unlock()
-}
-
-func (m *Manager) beginWMSSMSCRefresh() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.wmsSMSCRefreshPending {
-		return false
-	}
-	m.wmsSMSCRefreshPending = true
-	return true
-}
-
-func (m *Manager) endWMSSMSCRefresh() {
-	m.mu.Lock()
-	m.wmsSMSCRefreshPending = false
-	m.mu.Unlock()
-}
-
 func (m *Manager) setWMSRoutesKnown(known bool) {
 	m.mu.Lock()
 	m.wmsRoutesKnown = known
@@ -1427,9 +1409,6 @@ func (m *Manager) markWMSReadinessStale() {
 	m.wmsLastTransportWarnAt = time.Time{}
 	m.wmsLastNASRegisteredKnown = false
 	m.wmsLastNASRegistered = false
-	if m.wmsSMSCKnown {
-		m.wmsSMSCStale = true
-	}
 	m.mu.Unlock()
 }
 
@@ -1439,30 +1418,24 @@ func (m *Manager) cachedWMSRoutes() *qmi.WMSRouteConfig {
 	return copyWMSRouteConfig(m.lastKnownGoodRoutes)
 }
 
-func (m *Manager) wmsReadinessSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported, smscAvailable, routesKnown bool) {
+func (m *Manager) wmsReadinessSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported, routesKnown bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsSMSCAvailable, m.wmsRoutesKnown
+	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsRoutesKnown
 }
 
-func (m *Manager) wmsSMSCSnapshot() (value string, available, known, stale bool, updatedAt, lastCheckAt time.Time, pending bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.wmsSMSCValue, m.wmsSMSCAvailable, m.wmsSMSCKnown, m.wmsSMSCStale, m.wmsSMSCUpdatedAt, m.wmsSMSCLastCheckAt, m.wmsSMSCRefreshPending
-}
-
-func (m *Manager) wmsDiagnosticSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported bool, transportQueryError string, smscValue string, smscAvailable, smscKnown, smscStale bool, smscUpdatedAt time.Time, routesKnown bool, nasRegistered *bool) {
+func (m *Manager) wmsDiagnosticSnapshot() (status qmi.WMSTransportNetworkRegistration, known, unsupported bool, transportQueryError string, routesKnown bool, nasRegistered *bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if m.wmsLastNASRegisteredKnown {
 		nasRegistered = boolPtr(m.wmsLastNASRegistered)
 	}
-	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsTransportQueryError, m.wmsSMSCValue, m.wmsSMSCAvailable, m.wmsSMSCKnown, m.wmsSMSCStale, m.wmsSMSCUpdatedAt, m.wmsRoutesKnown, nasRegistered
+	return m.wmsTransportStatus, m.wmsTransportKnown, m.wmsTransportUnsupported, m.wmsTransportQueryError, m.wmsRoutesKnown, nasRegistered
 }
 
 func (m *Manager) wmsTransportStatusString() string {
-	status, known, unsupported, _, _, _, _, _, _, _, _ := m.wmsDiagnosticSnapshot()
+	status, known, unsupported, _, _, _ := m.wmsDiagnosticSnapshot()
 	if unsupported {
 		return "unsupported"
 	}
@@ -1552,6 +1525,11 @@ func (m *Manager) registerIMSAIndicationsWithContext(ctx context.Context, imsa *
 	if m.registerIMSAIndications != nil {
 		return m.registerIMSAIndications(ctx, cfg)
 	}
+	// 注入 hook 时 imsa 允许为 nil（测试就这么用），但真实路径上解引用 nil
+	// 会 panic 在库里 —— 分配失败已改成"继续但不带这个服务"，nil 因此是常态。
+	if imsa == nil {
+		return ErrServiceNotReady("IMSA")
+	}
 	return imsa.RegisterIndications(ctx, cfg)
 }
 
@@ -1576,11 +1554,11 @@ func (m *Manager) setWMSRoutesWithContext(ctx context.Context, routes []qmi.WMSR
 	return m.WMSSetRoutes(ctx, routes, transferStatusReportToClient)
 }
 
-func (m *Manager) querySMSCWithContext(ctx context.Context) (string, error) {
-	if m.querySMSC != nil {
-		return m.querySMSC(ctx)
+func (m *Manager) queryWMSSMSCWithContext(ctx context.Context) (string, error) {
+	if m.queryWMSSMSC != nil {
+		return m.queryWMSSMSC(ctx)
 	}
-	return m.querySMSCFromDevice(ctx)
+	return m.WMSGetSMSCAddress(ctx)
 }
 
 func (m *Manager) queryNASRegisteredWithContext(ctx context.Context) (bool, error) {
@@ -1659,60 +1637,15 @@ func (m *Manager) refreshWMSTransportState(ctx context.Context, quiet bool) {
 	}
 }
 
-func (m *Manager) refreshWMSSMSCState(ctx context.Context, force bool, quiet bool) {
-	_, _, _, _, _, cachedLastCheckAt, pending := m.wmsSMSCSnapshot()
-	if pending {
-		return
-	}
-	if !force && !cachedLastCheckAt.IsZero() && time.Since(cachedLastCheckAt) < smscRefreshCooldown {
-		return
-	}
-	if !m.beginWMSSMSCRefresh() {
-		return
-	}
-	defer m.endWMSSMSCRefresh()
-
-	checkedAt := time.Now()
-	smsc, err := m.querySMSCWithContext(ctx)
-	if err != nil {
-		cachedValue, cachedAvailable, cachedKnown, _, cachedUpdatedAt, _, _ := m.wmsSMSCSnapshot()
-		if cachedKnown {
-			m.setWMSSMSCState(cachedValue, true, cachedAvailable, true, cachedUpdatedAt, checkedAt)
-			if !quiet && force {
-				m.log.WithError(err).Debug("WMS SMSC refresh failed, keeping cached SMSC")
-			}
-			return
-		}
-		m.setWMSSMSCState("", false, false, false, time.Time{}, checkedAt)
-		if !quiet {
-			m.log.WithError(err).Debug("WMS SMSC unavailable")
-		}
-		return
-	}
-
-	trimmed := strings.TrimSpace(smsc)
-	known := trimmed != ""
-	m.setWMSSMSCState(trimmed, known, known, false, checkedAt, checkedAt)
-	if !known && !quiet {
-		m.log.Debug("WMS SMSC unavailable: empty result")
-	}
-}
-
 func (m *Manager) logWMSRecoveryState(message string) {
-	_, known, unsupported, transportQueryError, _, smscAvailable, smscKnown, smscStale, smscUpdatedAt, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
+	_, known, unsupported, transportQueryError, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
 	entry := m.log.
 		WithField("transport_status", m.wmsTransportStatusString()).
 		WithField("transport_known", known).
 		WithField("transport_unsupported", unsupported).
-		WithField("smsc_available", smscAvailable).
-		WithField("smsc_known", smscKnown).
-		WithField("smsc_stale", smscStale).
 		WithField("routes_known", routesKnown)
 	if transportQueryError != "" {
 		entry = entry.WithField("transport_query_error", transportQueryError)
-	}
-	if !smscUpdatedAt.IsZero() {
-		entry = entry.WithField("smsc_last_updated_at", smscUpdatedAt)
 	}
 	if nasRegistered != nil {
 		entry = entry.WithField("nas_registered", *nasRegistered)
@@ -1727,14 +1660,10 @@ func (m *Manager) refreshWMSState(ctx context.Context, opts wmsRefreshOptions) {
 	if opts.includeTransport {
 		m.refreshWMSTransportState(ctx, opts.quiet)
 	}
-	if opts.includeSMSC {
-		m.refreshWMSSMSCState(ctx, opts.forceSMSC, opts.quiet)
-	}
-
 	if opts.emitSummary {
-		_, known, unsupported, smscAvailable, routesKnown := m.wmsReadinessSnapshot()
+		_, known, unsupported, routesKnown := m.wmsReadinessSnapshot()
 		switch {
-		case routesKnown && smscAvailable && ((known && m.wmsTransportStatusString() == qmi.WMSTransportNetworkRegistrationFullService.String()) || unsupported):
+		case routesKnown && ((known && m.wmsTransportStatusString() == qmi.WMSTransportNetworkRegistrationFullService.String()) || unsupported):
 			m.logWMSRecoveryState("WMS recovery state ready")
 		default:
 			m.logWMSRecoveryState("WMS recovery state degraded")
@@ -1776,8 +1705,6 @@ func (m *Manager) recoverWMSStateWithContext(parent context.Context) {
 	m.refreshWMSState(ctx, wmsRefreshOptions{
 		includeRoutes:    true,
 		includeTransport: true,
-		includeSMSC:      true,
-		forceSMSC:        true,
 		allowRouteReplay: true,
 		emitSummary:      true,
 		reason:           "recover",
@@ -1809,7 +1736,6 @@ func (m *Manager) maybeRefreshWMSReadiness(reason string) {
 		m.refreshWMSState(ctx, wmsRefreshOptions{
 			includeRoutes:    true,
 			includeTransport: true,
-			includeSMSC:      false,
 			allowRouteReplay: false,
 			emitSummary:      true,
 			reason:           reason,
@@ -1823,23 +1749,17 @@ func (m *Manager) smsReadyWithContext(ctx context.Context) (bool, bool, error) {
 		return false, false, ErrServiceNotReady("WMS")
 	}
 
-	_, _, smscKnown, _, _, _, _ := m.wmsSMSCSnapshot()
 	m.refreshWMSState(ctx, wmsRefreshOptions{
 		includeRoutes:    true,
 		includeTransport: true,
-		includeSMSC:      !smscKnown,
 		allowRouteReplay: false,
 		emitSummary:      false,
 		quiet:            true,
 		reason:           "sms-ready-check",
 	})
 
-	status, known, unsupported, smscAvailable, routesKnown := m.wmsReadinessSnapshot()
+	status, known, unsupported, routesKnown := m.wmsReadinessSnapshot()
 	transportStatus := m.wmsTransportStatusString()
-	if !smscAvailable {
-		m.setWMSLastNASRegistered(nil)
-		return false, false, nil
-	}
 	if known && transportStatus == qmi.WMSTransportNetworkRegistrationFullService.String() {
 		m.setWMSLastNASRegistered(nil)
 		return true, false, nil
@@ -1888,7 +1808,7 @@ func (m *Manager) EnsureSMSReady(ctx context.Context) error {
 }
 
 func (m *Manager) currentSMSReadinessDetails() SMSNotReadyError {
-	status, known, unsupported, transportQueryError, _, smscAvailable, _, _, _, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
+	status, known, unsupported, transportQueryError, routesKnown, nasRegistered := m.wmsDiagnosticSnapshot()
 	transportStatus := "unknown"
 	switch {
 	case unsupported:
@@ -1901,7 +1821,6 @@ func (m *Manager) currentSMSReadinessDetails() SMSNotReadyError {
 		TransportKnown:       known,
 		TransportUnsupported: unsupported,
 		TransportQueryError:  transportQueryError,
-		SMSCAvailable:        smscAvailable,
 		RoutesKnown:          routesKnown,
 		NASRegistered:        nasRegistered,
 	}
@@ -2064,11 +1983,12 @@ func (m *Manager) doPostRegistrationRefresh(reason string) {
 		})
 	}
 
+	// 本次刷新在驻网跃迁后 defaultPostRegRefreshDelay(800ms) 就触发，射频若刚从 RFOff
+	// 恢复，模组往往还没做完测量；emitSignalUpdate 会把这种读数挡掉并返回 false。
 	if sig, err := m.getSignalStrength(ctx); err != nil {
 		m.log.WithError(err).Debug("Post-reg refresh: failed to query signal strength")
-	} else if sig != nil {
-		rssiUpdated = true
-		m.emitSignalUpdate(sig)
+	} else {
+		rssiUpdated = m.emitSignalUpdate(sig)
 	}
 
 	m.log.WithField("reason", reason).
@@ -2088,6 +2008,12 @@ func (m *Manager) OpenLogicalChannel(slot uint8, aid []byte) (byte, error) {
 
 // OpenLogicalChannelContext opens a UIM logical channel using the caller context.
 func (m *Manager) OpenLogicalChannelContext(ctx context.Context, slot uint8, aid []byte) (byte, error) {
+	return withCardAccessValue(m, ctx, func() (byte, error) {
+		return m.openLogicalChannelContextUngated(ctx, slot, aid)
+	})
+}
+
+func (m *Manager) openLogicalChannelContextUngated(ctx context.Context, slot uint8, aid []byte) (byte, error) {
 	if m.openLogicalChannelHook != nil {
 		return m.openLogicalChannelHook(ctx, slot, aid)
 	}
@@ -2105,6 +2031,13 @@ func (m *Manager) CloseLogicalChannel(slot uint8, channel uint8) error {
 
 // CloseLogicalChannelContext closes a UIM logical channel using the caller context.
 func (m *Manager) CloseLogicalChannelContext(ctx context.Context, slot uint8, channel uint8) error {
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		return struct{}{}, m.closeLogicalChannelContextUngated(ctx, slot, channel)
+	})
+	return err
+}
+
+func (m *Manager) closeLogicalChannelContextUngated(ctx context.Context, slot uint8, channel uint8) error {
 	if m.closeLogicalChannelHook != nil {
 		return m.closeLogicalChannelHook(ctx, slot, channel)
 	}
@@ -2122,6 +2055,12 @@ func (m *Manager) SendAPDU(slot uint8, channel uint8, command []byte) ([]byte, e
 
 // SendAPDUContext transmits a raw APDU using the caller context.
 func (m *Manager) SendAPDUContext(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return m.sendAPDUContextUngated(ctx, slot, channel, command)
+	})
+}
+
+func (m *Manager) sendAPDUContextUngated(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
 	if m.sendAPDUHook != nil {
 		return m.sendAPDUHook(ctx, slot, channel, command)
 	}
@@ -2132,26 +2071,34 @@ func (m *Manager) SendAPDUContext(ctx context.Context, slot uint8, channel uint8
 
 // GetNativeMCCMNC 获取原生归属地 MCC 和 MNC
 func (m *Manager) GetNativeSPN(ctx context.Context) (string, error) {
-	return withUIMRecoveryValue(m, "GetNativeSPN", func(uim *qmi.UIMService) (string, error) {
-		return uim.GetNativeSPN(ctx)
+	return withCardAccessValue(m, ctx, func() (string, error) {
+		return withUIMRecoveryValue(m, "GetNativeSPN", func(uim *qmi.UIMService) (string, error) {
+			return uim.GetNativeSPN(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetSIMMetadata(ctx context.Context) (*qmi.SIMMetadata, error) {
-	return withUIMRecoveryValue(m, "GetSIMMetadata", func(uim *qmi.UIMService) (*qmi.SIMMetadata, error) {
-		return uim.GetSIMMetadata(ctx)
+	return withCardAccessValue(m, ctx, func() (*qmi.SIMMetadata, error) {
+		return withUIMRecoveryValue(m, "GetSIMMetadata", func(uim *qmi.UIMService) (*qmi.SIMMetadata, error) {
+			return uim.GetSIMMetadata(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetUSIMAID(ctx context.Context) ([]byte, error) {
-	return withUIMRecoveryValue(m, "GetUSIMAID", func(uim *qmi.UIMService) ([]byte, error) {
-		return uim.GetUSIMAID(ctx)
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return withUIMRecoveryValue(m, "GetUSIMAID", func(uim *qmi.UIMService) ([]byte, error) {
+			return uim.GetUSIMAID(ctx)
+		})
 	})
 }
 
 func (m *Manager) GetISIMAID(ctx context.Context) ([]byte, error) {
-	return withUIMRecoveryValue(m, "GetISIMAID", func(uim *qmi.UIMService) ([]byte, error) {
-		return uim.GetISIMAID(ctx)
+	return withCardAccessValue(m, ctx, func() ([]byte, error) {
+		return withUIMRecoveryValue(m, "GetISIMAID", func(uim *qmi.UIMService) ([]byte, error) {
+			return uim.GetISIMAID(ctx)
+		})
 	})
 }
 
@@ -2160,12 +2107,14 @@ func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err err
 		mcc string
 		mnc string
 	}
-	location, err := withUIMRecoveryValue(m, "GetNativeMCCMNC", func(uim *qmi.UIMService) (nativeLocation, error) {
-		localMCC, localMNC, callErr := uim.GetNativeMCCMNC(ctx)
-		return nativeLocation{
-			mcc: localMCC,
-			mnc: localMNC,
-		}, callErr
+	location, err := withCardAccessValue(m, ctx, func() (nativeLocation, error) {
+		return withUIMRecoveryValue(m, "GetNativeMCCMNC", func(uim *qmi.UIMService) (nativeLocation, error) {
+			localMCC, localMNC, callErr := uim.GetNativeMCCMNC(ctx)
+			return nativeLocation{
+				mcc: localMCC,
+				mnc: localMNC,
+			}, callErr
+		})
 	})
 	if err != nil {
 		return "", "", err
@@ -2475,10 +2424,13 @@ func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks 
 // hasQMIService 检查底层 Client 是否声明支持该服务。
 // 仅在 client 初始化完成后调用有效。
 func (m *Manager) hasQMIService(service uint16) bool {
-	if m.client == nil {
+	m.mu.RLock()
+	client := m.client
+	m.mu.RUnlock()
+	if client == nil {
 		return false
 	}
-	return m.client.HasService(service)
+	return client.HasService(service)
 }
 
 func (m *Manager) allocateServices(ctx context.Context) error {
@@ -2570,6 +2522,12 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		return err
 	}
 
+	m.mu.Lock()
+	m.ims = nil
+	m.imsa = nil
+	m.imsp = nil
+	m.mu.Unlock()
+
 	auxTasks := []startupServiceTask{
 		{
 			run: func(taskCtx context.Context) error {
@@ -2627,6 +2585,32 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		},
 		{
 			run: func(taskCtx context.Context) error {
+				// IMS(0x12)是"IMS 各业务使能设置"服务,与 IMSA 的注册状态是两回事。
+				// EC20 上 Get IMS Services Enabled Setting 会回 QMI error 3(Internal),
+				// 所以调用方不能把它当作必然可用 —— 但客户端本身分配得起来,
+				// 留着它才有机会在支持的模组上读写 VoLTE/VoWiFi 使能位。
+				if !m.hasQMIService(qmi.ServiceIMS) {
+					m.log.Debug("Skipping IMS client allocation (modem not supported)")
+					return nil
+				}
+				m.log.Debug("Allocating IMS client...")
+				ims, err := m.createIMSService(taskCtx)
+				if err != nil {
+					// 分配失败不算错:这批任务本来就以 fatal=false 跑,报错也只是被
+					// 丢弃。返回 nil 并在日志里写明"继续但不带这个服务",比返回一个
+					// 没人看的 error 诚实。
+					m.log.WithError(err).Warn("Failed to allocate IMS client; continuing without IMS control service")
+					return nil
+				}
+				m.log.Debug("Allocated IMS client")
+				m.mu.Lock()
+				m.ims = ims
+				m.mu.Unlock()
+				return nil
+			},
+		},
+		{
+			run: func(taskCtx context.Context) error {
 				// IMSA 是 VoLTE/VoWiFi 注册状态的唯一 QMI 来源(Get IMS Registration
 				// Status / Get IMS Services Status),Technology 字段区分 wwan/wlan。
 				//
@@ -2647,49 +2631,25 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 				m.log.Debug("Allocating IMSA client...")
 				imsa, err := m.createIMSAService(taskCtx)
 				if err != nil {
-					m.log.WithError(err).Warn("Failed to allocate IMSA client")
-					return err
+					m.log.WithError(err).Warn("Failed to allocate IMSA client; continuing without IMSA control service")
+					return nil
 				}
 				m.log.Debug("Allocated IMSA client")
 				m.mu.Lock()
 				m.imsa = imsa
 				m.mu.Unlock()
 
-				cfg, ok := m.imsaIndicationRegistration()
-				if !ok {
+				if cfg, ok := m.imsaIndicationRegistration(); ok {
+					indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
+					defer cancel()
+					// 指示注册失败不回滚客户端:主动查询(GetIMSRegistrationStatus)仍然
+					// 可用,退化成轮询比彻底没有 IMS 状态好。
+					if err := m.registerIMSAIndicationsWithContext(indCtx, imsa, cfg); err != nil {
+						m.log.WithError(err).Warn("Failed to register IMSA indications; retaining IMSA client")
+					}
+				} else {
 					m.log.Debug("IMSA indications disabled by config")
-					return nil
 				}
-				indCtx, cancel := contextWithMaxTimeout(taskCtx, m.cfg.Timeouts.IndicationRegister)
-				defer cancel()
-				// 指示注册失败不回滚客户端:主动查询(GetIMSRegistrationStatus)仍然可用,
-				// 退化成轮询比彻底没有 IMS 状态好。
-				if err := m.registerIMSAIndicationsWithContext(indCtx, imsa, cfg); err != nil {
-					m.log.WithError(err).Warn("Failed to register IMSA indications")
-				}
-				return nil
-			},
-		},
-		{
-			run: func(taskCtx context.Context) error {
-				// IMS(0x12)是"IMS 各业务使能设置"服务,与 IMSA 的注册状态是两回事。
-				// EC20 上 Get IMS Services Enabled Setting 会回 QMI error 3(Internal),
-				// 所以调用方不能把它当作必然可用 —— 但客户端本身分配得起来,
-				// 留着它才有机会在支持的模组上读写 VoLTE/VoWiFi 使能位。
-				if !m.hasQMIService(qmi.ServiceIMS) {
-					m.log.Debug("Skipping IMS client allocation (modem not supported)")
-					return nil
-				}
-				m.log.Debug("Allocating IMS client...")
-				ims, err := m.createIMSService(taskCtx)
-				if err != nil {
-					m.log.WithError(err).Warn("Failed to allocate IMS client")
-					return err
-				}
-				m.log.Debug("Allocated IMS client")
-				m.mu.Lock()
-				m.ims = ims
-				m.mu.Unlock()
 				return nil
 			},
 		},
@@ -2959,57 +2919,74 @@ func (m *Manager) checkSIM() error {
 	if m != nil && m.checkSIMHook != nil {
 		return m.checkSIMHook()
 	}
-	status := qmi.SIMAbsent
-	var err error
+	// Bound the whole operation -- including the card-access gate wait --
+	// by the SIMCheck timeout, not just the inner UIM/DMS calls. Otherwise a
+	// card IO quiet window held abnormally long (e.g. a stuck IMS PDN
+	// bring-up) makes checkSIM() hang forever instead of degrading
+	// gracefully, since context.Background() never cancels the gate-wait.
 	ctx, cancel := m.opContext(m.cfg.Timeouts.SIMCheck)
 	defer cancel()
+	_, err := withCardAccessValue(m, ctx, func() (struct{}, error) {
+		status := qmi.SIMAbsent
+		var err error
 
-	// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
-	if m.uim != nil {
-		status, err = m.uim.GetCardStatus(ctx)
-		if err == nil {
-			m.log.Infof("SIM status (UIM): %s", status)
+		// Try UIM service first (modern modems) / 优先尝试UIM服务 (现代modem)
+		if m.uim != nil {
+			status, err = m.uim.GetCardStatus(ctx)
+			if err == nil {
+				m.log.Infof("SIM status (UIM): %s", status)
+			}
 		}
-	}
 
-	// Fallback to DMS if UIM failed or not ready / 如果UIM失败或未就绪，回退到DMS
-	if err != nil || status != qmi.SIMReady {
-		dmsStatus, dmsErr := withDMSRecoveryValue(m, "checkSIM.GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
-			return dms.GetSIMStatus(ctx)
-		})
-		if dmsErr == nil {
-			status = dmsStatus
-			m.log.Infof("SIM status (DMS): %s", status)
-		} else if err == nil {
-			err = dmsErr
+		// Fallback to DMS if UIM failed or not ready / 如果UIM失败或未就绪，回退到DMS
+		if err != nil || status != qmi.SIMReady {
+			dmsStatus, dmsErr := withDMSRecoveryValue(m, "checkSIM.GetSIMStatus", func(dms *qmi.DMSService) (qmi.SIMStatus, error) {
+				return dms.GetSIMStatus(ctx)
+			})
+			if dmsErr == nil {
+				status = dmsStatus
+				m.log.Infof("SIM status (DMS): %s", status)
+			} else if err == nil {
+				err = dmsErr
+			}
 		}
-	}
 
-	if err != nil {
-		return err
-	}
-
-	if status == qmi.SIMPINRequired && m.cfg.PINCode != "" {
-		m.log.Info("Verifying PIN...")
-		if err := m.withDMSRecovery("checkSIM.VerifyPIN", func(dms *qmi.DMSService) error {
-			return dms.VerifyPIN(ctx, m.cfg.PINCode)
-		}); err != nil {
-			return fmt.Errorf("PIN verification failed: %w", err)
+		if err != nil {
+			return struct{}{}, err
 		}
-		m.log.Info("PIN verified successfully")
-	}
 
-	return nil
+		if status == qmi.SIMPINRequired && m.cfg.PINCode != "" {
+			m.log.Info("Verifying PIN...")
+			if err := m.withDMSRecovery("checkSIM.VerifyPIN", func(dms *qmi.DMSService) error {
+				return dms.VerifyPIN(ctx, m.cfg.PINCode)
+			}); err != nil {
+				return struct{}{}, fmt.Errorf("PIN verification failed: %w", err)
+			}
+			m.log.Info("PIN verified successfully")
+		}
+
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func (m *Manager) cleanup() {
 	// Use timeout context for cleanup operations / 使用超时上下文进行清理操作
 	m.stopScheduledTimers()
-	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
-	defer cancel()
+	// Two separate budgets on purpose. Releasing the secondary PDNs is network
+	// I/O and can burn the whole allowance on an unresponsive modem; the
+	// netdev cleanup that follows is what actually removes qmimux interfaces
+	// and must not be left with the leftovers. Sharing one budget starved
+	// exactly the step that has to run (observed on real hardware: both qmap
+	// and netcfg timed out after the PDN close ate the allowance).
+	pdnCtx, cancelPDN := m.opContext(m.cfg.Timeouts.Stop)
 	// Secondary PDNs own independent WDS clients and muxes, but share this
 	// manager's transport. Release them before clearing the shared services.
-	m.closeManagedPDNSessions(cleanupCtx)
+	m.closeManagedPDNSessions(pdnCtx)
+	cancelPDN()
+
+	cleanupCtx, cancel := m.opContext(m.cfg.Timeouts.Stop)
+	defer cancel()
 	m.dataPlane.mu.Lock()
 	m.dataPlane.snapshot = DataPlaneSnapshot{}
 	m.dataPlane.masterInterface = ""
@@ -3063,13 +3040,6 @@ func (m *Manager) cleanup() {
 	m.wmsTransportQueryError = ""
 	m.wmsLastTransportWarn = ""
 	m.wmsLastTransportWarnAt = time.Time{}
-	m.wmsSMSCValue = ""
-	m.wmsSMSCAvailable = false
-	m.wmsSMSCKnown = false
-	m.wmsSMSCStale = false
-	m.wmsSMSCUpdatedAt = time.Time{}
-	m.wmsSMSCLastCheckAt = time.Time{}
-	m.wmsSMSCRefreshPending = false
 	m.wmsRoutesKnown = false
 	m.wmsLastNASRegistered = false
 	m.wmsLastNASRegisteredKnown = false
@@ -3081,6 +3051,11 @@ func (m *Manager) cleanup() {
 	if muxIface != "" || masterIface != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "qmap",
+			// 主机侧 netlink 操作，不经 QMI 传输、也无法中途打断，所以这里
+			// 明确不收 ctx：跑到一半被 runCleanupTasks 放弃时它仍会跑完，
+			// 只是调用方不再等。保护它的是上面那份独立预算，不是取消。
+			// 这一步负责移除残留 qmimux，是"退出不留 netdev"的最后防线，
+			// 不能为了早退而中途返回。
 			run: func(context.Context) error {
 				var err error
 				if muxIface != "" {
@@ -3119,6 +3094,7 @@ func (m *Manager) cleanup() {
 	if ifname != "" {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "netcfg",
+			// 同 qmap：主机侧 netlink，不可打断，故意不收 ctx。
 			run: func(context.Context) error {
 				return errors.Join(
 					netcfg.FlushAddresses(ifname),
@@ -4483,6 +4459,14 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 		}
 		m.emitEvent(event)
 
+	// 已知缺口：本分支只转发 TLV 元数据，**不解析其中的信号强度**，因此
+	// NAS Event Report 无法刷新 snapshot 的 RSSI。加上 doStatusCheck 在
+	// StateDisconnected 时直接早退（数据未连接的 VoLTE 场景恒成立），RSSI 快照实际上
+	// 只由驻网跃迁后的 doPostRegistrationRefresh 写一次。emitSignalUpdate 的
+	// HasMeasurement 守卫保证那一次不会写进假值，但"指示驱动的持续刷新"仍然缺失。
+	//
+	// 补齐它需要按 NAS_EVENT_REPORT_IND 解析信号 TLV（注意 0x10 是有符号 dBm、
+	// 0x14 是无符号幅值，符号约定必须实机核对），目前无硬件可验证，故未实现。
 	case qmi.EventNASEventReport:
 		if isEmptyNASEventReport(evt) {
 			return
@@ -4716,22 +4700,6 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 			} else {
 				m.snapshot.updateUIMSlotStatus(info)
 				event.UIMSlotStatus = info
-			}
-		}
-		m.emitEvent(event)
-
-	case qmi.EventWMSSMSCAddress:
-		event := m.qmiIndicationEvent(EventWMSSMSCAddress, evt)
-		if evt.Packet != nil {
-			info, err := qmi.ParseWMSSMSCAddressIndication(evt.Packet)
-			if err != nil {
-				m.log.WithError(err).Warn("Failed to parse WMS SMSC address indication")
-			} else {
-				event.WMSSMSCAddress = info
-				digits := strings.TrimSpace(info.Digits)
-				known := digits != ""
-				now := time.Now()
-				m.setWMSSMSCState(digits, known, known, false, now, now)
 			}
 		}
 		m.emitEvent(event)

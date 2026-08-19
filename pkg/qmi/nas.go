@@ -620,6 +620,27 @@ type SignalStrength struct {
 	SNR  int16 // dB * 10 (for LTE) / dB * 10 (用于LTE)
 }
 
+// NoMeasurementRSSIdBm 是 NAS Get Signal Strength 在"尚无测量结果"时返回的哨兵值。
+const NoMeasurementRSSIdBm int8 = -125
+
+// HasMeasurement 报告这份读数是否真的携带测量结果。
+//
+// 射频刚从 RFOff 恢复时模组还没做完 LTE 测量，NAS Get Signal Strength(0x0020) 仍会
+// **成功**返回，但 RSSI 是 -125 哨兵、且响应里根本没有 RSRP/RSRQ/SNR 的 TLV。同一时刻
+// 更现代的 NAS Get Signal Info(0x004F) 是诚实报 QMI_ERR_INFO_UNAVAILABLE 的——两个 API
+// 的失败语义不对等，把 legacy 的哨兵当成读数缓存下来，界面就会长期显示"无信号"。
+//
+// 判据是"哨兵 RSSI 且无任何伴随字段"：真实弱信号场景下 RSRP/RSRQ/SNR 至少有一个非零。
+func (s *SignalStrength) HasMeasurement() bool {
+	if s == nil {
+		return false
+	}
+	if s.RSSI != NoMeasurementRSSIdBm {
+		return true
+	}
+	return s.RSRP != 0 || s.RSRQ != 0 || s.SNR != 0
+}
+
 // GetSignalStrength queries current signal strength / GetSignalStrength查询当前信号强度
 func (n *NASService) GetSignalStrength(ctx context.Context) (*SignalStrength, error) {
 	resp, err := n.client.SendRequest(ctx, ServiceNAS, n.clientID, NASGetSignalStrength, nil)

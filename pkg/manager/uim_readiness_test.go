@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/iniwex5/qmi-go/pkg/qmi"
@@ -178,6 +179,62 @@ func TestGetUIMReadinessReturnsNilErrorForNonFatalSlotStatusFailure(t *testing.T
 	}
 	if got.Err == nil || !strings.Contains(got.Err.Error(), slotErr.Error()) {
 		t.Fatalf("diagnostic err=%v, want slot status error", got.Err)
+	}
+}
+
+// TestGetUIMReadinessDoesNotReenterCardAccessBarrier is the GetUIMReadiness
+// counterpart of TestManagerSMSCFileReaderDoesNotReenterCardAccessBarrier
+// (smsc_test.go): it holds the card-access gate externally via
+// BeginCardIOQuietWindow, then calls the private getUIMReadiness helper --
+// the function GetUIMReadiness's own withCardAccessValue wraps -- directly,
+// the same way the SMSC test calls its internal file reader directly rather
+// than the top-level gated ReadSMSCFromSIMFiles. getUIMReadiness resolves
+// missing ICCID/IMSI via the private m.getICCIDStrictLive/m.getIMSIStrictLive
+// helpers, not the public gated GetICCID/GetIMSI wrappers, so it must not
+// re-enter the barrier. A future "simplification" back to the public
+// wrappers would deadlock here: the outer BeginCardIOQuietWindow holder
+// would never release, and a nested withCardAccessValue call queued behind
+// it would never be admitted -- surfacing as a context.DeadlineExceeded
+// error instead of completing within the bounded context below.
+func TestGetUIMReadinessDoesNotReenterCardAccessBarrier(t *testing.T) {
+	var calls int
+	m := &Manager{}
+	// First ensureUIMService call (GetCardStatusDetails) must succeed so
+	// cardErr == nil and getUIMReadiness actually reaches the ICCID/IMSI
+	// fallback branch below -- otherwise this test would pass vacuously
+	// without ever exercising the identity lookup this finding is about.
+	// The second call (GetSlotStatus) can fail; slot errors don't gate the
+	// identity fallback.
+	m.ensureUIMServiceHook = func() (*qmi.UIMService, error) {
+		calls++
+		if calls == 1 {
+			return newUIMReadinessTestService(t, func(req *qmi.Packet) (*qmi.Packet, error) {
+				if req.MessageID != qmi.UIMGetCardStatus {
+					return nil, errors.New("unexpected UIM card status request")
+				}
+				return uimReadinessCardStatusPacket(0x01), nil
+			}), nil
+		}
+		return nil, errors.New("slot status unavailable")
+	}
+	m.getICCIDStrictHook = func(context.Context) (string, error) { return "8985203103011907194", nil }
+	m.getIMSIStrictHook = func(context.Context) (string, error) { return "460011234567890", nil }
+
+	release, err := m.BeginCardIOQuietWindow(context.Background())
+	if err != nil {
+		t.Fatalf("BeginCardIOQuietWindow() error = %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	got, err := m.getUIMReadiness(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("getUIMReadiness reentered the card access barrier: %v", err)
+	}
+	if got.ICCID != "8985203103011907194" || got.IMSI != "460011234567890" {
+		t.Fatalf("getUIMReadiness() identities = %+v, want ICCID/IMSI resolved via the ungated strict-live helpers (proves the identity-fallback branch actually ran)", got)
 	}
 }
 
@@ -492,5 +549,72 @@ func TestBuildUIMReadinessCarriesActivePhysicalSlot(t *testing.T) {
 	}
 	if !out.PhysicalSlotKnown || out.ActivePhysicalSlot != 2 {
 		t.Fatalf("ActivePhysicalSlot=%d PhysicalSlotKnown=%v, want 2/true", out.ActivePhysicalSlot, out.PhysicalSlotKnown)
+	}
+}
+
+// TestBuildUIMReadinessCarriesCardAndPINState CardState 与 PIN1State 必须透传：
+// qmi.SIMBlocked 同时承载「卡错误(CardState=2)」与「PIN 永久锁死」两种语义，
+// 上层只拿 SIMStatus 无从区分，会把瞬态卡错误误报成 PUK 锁定。
+func TestBuildUIMReadinessCarriesCardAndPINState(t *testing.T) {
+	cases := []struct {
+		name          string
+		details       *qmi.CardStatusDetails
+		status        qmi.SIMStatus
+		wantCardState uint8
+		wantPIN1      qmi.PINStatus
+		wantKnown     bool
+	}{
+		{
+			name:          "卡错误",
+			details:       &qmi.CardStatusDetails{CardState: 0x02},
+			status:        qmi.SIMBlocked,
+			wantCardState: 0x02,
+			wantPIN1:      qmi.PINStatusNotInit,
+			wantKnown:     true,
+		},
+		{
+			name: "PIN 被锁需要 PUK",
+			details: &qmi.CardStatusDetails{
+				CardState: 0x01, PIN1State: qmi.PINStatusBlocked, PUK1Retries: 10,
+			},
+			status:        qmi.SIMPUKRequired,
+			wantCardState: 0x01,
+			wantPIN1:      qmi.PINStatusBlocked,
+			wantKnown:     true,
+		},
+		{
+			name: "PIN 永久锁死",
+			details: &qmi.CardStatusDetails{
+				CardState: 0x01, PIN1State: qmi.PINStatusPermBlocked,
+			},
+			status:        qmi.SIMBlocked,
+			wantCardState: 0x01,
+			wantPIN1:      qmi.PINStatusPermBlocked,
+			wantKnown:     true,
+		},
+		{
+			name:      "details 为 nil 时不得声称已知",
+			details:   nil,
+			status:    qmi.SIMNotReady,
+			wantKnown: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := buildUIMReadiness(c.status, c.details, nil, DeviceIdentities{ICCID: "8964"}, nil)
+			if out.CardDetailsKnown != c.wantKnown {
+				t.Fatalf("CardDetailsKnown=%v want %v", out.CardDetailsKnown, c.wantKnown)
+			}
+			if !c.wantKnown {
+				return
+			}
+			if out.CardState != c.wantCardState {
+				t.Errorf("CardState=%#x want %#x", out.CardState, c.wantCardState)
+			}
+			if out.PIN1State != c.wantPIN1 {
+				t.Errorf("PIN1State=%d want %d", out.PIN1State, c.wantPIN1)
+			}
+		})
 	}
 }

@@ -27,6 +27,7 @@ var qmapMuxCreateMu sync.Mutex
 var (
 	netlinkLinkByName = netlink.LinkByName
 	netlinkAddrList   = netlink.AddrList
+	netlinkAddrAdd    = netlink.AddrAdd
 	netlinkAddrDel    = netlink.AddrDel
 	netlinkRouteList  = netlink.RouteList
 	netlinkRouteDel   = netlink.RouteDel
@@ -42,42 +43,54 @@ func NewLinuxConfigurator() *LinuxConfigurator {
 }
 
 func (l *LinuxConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
-	link, err := netlink.LinkByName(ifname)
+	link, err := netlinkLinkByName(ifname)
 	if err != nil {
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	ipNet := &net.IPNet{
-		IP:   ip,
-		Mask: net.CIDRMask(prefixLen, 32),
-	}
-
-	addr := &netlink.Addr{IPNet: ipNet}
-
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add address: %w", err)
-		}
+	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(prefixLen, 32)}}
+	if err := replaceAddress(link, netlink.FAMILY_V4, addr); err != nil {
+		return fmt.Errorf("failed to add address: %w", err)
 	}
 	return nil
 }
 
 func (l *LinuxConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen int) error {
-	link, err := netlink.LinkByName(ifname)
+	link, err := netlinkLinkByName(ifname)
 	if err != nil {
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	ipNet := &net.IPNet{
-		IP:   ip,
-		Mask: net.CIDRMask(prefixLen, 128),
+	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(prefixLen, 128)}}
+	if err := replaceAddress(link, netlink.FAMILY_V6, addr); err != nil {
+		return fmt.Errorf("failed to add IPv6 address: %w", err)
 	}
+	return nil
+}
 
-	addr := &netlink.Addr{IPNet: ipNet}
-
-	if err := netlink.AddrAdd(link, addr); err != nil {
+// replaceAddress makes addr the only non-link-local address of its family on
+// link. A session reconnect (MBIM/QMI handing back a different address than
+// last time) previously left the stale address in place forever: AddrAdd
+// only reports "exists" for an identical address, so a *different* one just
+// accumulated alongside it. Link-local addresses are left alone -- they're
+// kernel-autoconfigured, not ours to manage.
+func replaceAddress(link netlink.Link, family int, addr *netlink.Addr) error {
+	existing, err := netlinkAddrList(link, family)
+	if err != nil {
+		return fmt.Errorf("list existing addresses: %w", err)
+	}
+	for _, old := range existing {
+		old := old
+		if old.Scope == int(netlink.SCOPE_LINK) || old.Equal(*addr) {
+			continue
+		}
+		if err := netlinkAddrDel(link, &old); err != nil {
+			return fmt.Errorf("remove stale address %s: %w", old.IPNet, err)
+		}
+	}
+	if err := netlinkAddrAdd(link, addr); err != nil {
 		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add IPv6 address: %w", err)
+			return err
 		}
 	}
 	return nil

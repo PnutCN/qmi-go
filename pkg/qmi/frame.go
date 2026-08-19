@@ -80,7 +80,6 @@ const (
 	WMSRawRead                               uint16 = 0x0022 // QMIWMS_RAW_READ_REQ
 	WMSDelete                                uint16 = 0x0024 // QMIWMS_DELETE_REQ
 	WMSListMessages                          uint16 = 0x0031 // QMIWMS_LIST_MESSAGES_REQ
-	WMSSMSCAddressInd                        uint16 = 0x0046 // QMIWMS_SMSC_ADDRESS_IND
 	WMSTransportNetworkRegistrationStatusInd uint16 = 0x004B // QMIWMS_TRANSPORT_NW_REG_STATUS_IND
 )
 

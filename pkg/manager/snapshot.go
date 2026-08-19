@@ -23,6 +23,7 @@ type DeviceIdentities struct {
 	IMEI             string
 	ICCID            string
 	IMSI             string
+	SMSC             string
 	FirmwareRevision string
 	HardwareRevision string
 	Manufacturer     string
@@ -547,6 +548,9 @@ func (s *DeviceSnapshot) updateIdentitiesLocked(ids DeviceIdentities) {
 	if ids.IMSI != "" {
 		s.identities.IMSI = ids.IMSI
 	}
+	if ids.SMSC != "" {
+		s.identities.SMSC = ids.SMSC
+	}
 	if ids.FirmwareRevision != "" {
 		s.identities.FirmwareRevision = ids.FirmwareRevision
 	}
@@ -595,6 +599,7 @@ func (s *DeviceSnapshot) ResetIdentities(clearAll bool) {
 		// 仅清空卡强相关字段
 		s.identities.ICCID = ""
 		s.identities.IMSI = ""
+		s.identities.SMSC = ""
 		s.identities.SimInserted = nil
 		s.identitiesSIMReady = false
 	}
@@ -657,6 +662,7 @@ func (s *DeviceSnapshot) Reset() {
 	// 清空卡关连信息，但可保留硬件坚固信息
 	s.identities.ICCID = ""
 	s.identities.IMSI = ""
+	s.identities.SMSC = ""
 	s.identities.SimInserted = nil
 	s.identitiesSIMReady = false
 	s.identitiesGeneration++

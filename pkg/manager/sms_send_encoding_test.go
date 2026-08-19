@@ -49,3 +49,14 @@ func TestEncodeSMSKeepsAutoEncodingByDefault(t *testing.T) {
 		t.Fatalf("DCS=0x%02x want auto GSM7 0x00", byte(pdu.DCS))
 	}
 }
+
+func TestQMISendUsesModemDefaultSMSCWhenIdentitySMSCEmpty(t *testing.T) {
+	m := &Manager{}
+	pdu, err := m.encodeSMS("10086", "hello")
+	if err != nil {
+		t.Fatalf("encodeSMS() error = %v", err)
+	}
+	if len(pdu) == 0 || pdu[0] != 0x00 {
+		t.Fatalf("PDU SMSC prefix = %x, want 00 (modem default SMSC)", pdu)
+	}
+}
