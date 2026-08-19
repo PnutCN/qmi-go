@@ -11,27 +11,26 @@
 // dual-APN IMS feature rests on. This probe is a throwaway hardware
 // diagnostic to check it, not a production tool.
 //
-// # 已知限制：模组已被另一个进程接管时，这个探针建不起 PDN
+// # 用之前先确认两件事：控制口对不对，profile index 是不是这台的
 //
-// 2026-08-19，EC20 / 中国电信 / wwan5(cdc-wdm5)，射频开着、LTE 驻网、
-// AT+CGATT=1、模组自带 VoLTE voice_ready。同一时刻交替跑两轮：
+// 2026-08-19 在一组 EC20 上排查了大半天，最后发现两个错都出在**入参**，
+// 与 qmi-go 无关。记在这里，免得下一个人重走：
 //
-//	本探针（经 qmi-proxy）              → 每次 CallFailed，
-//	                                      verbose call end (3,2001) = [cm] no-service
-//	同宿主上 vopive 进程内的同一段 qmi-go → 每次成功，各拿到不同的 IPv6 与 P-CSCF
+//	(3,2001) [cm] no-service    打错设备了。那台在跑 VoWiFi、射频是 RFOff，
+//	                            蜂窝 PDN 当然建不起来。**cdc-wdm 的编号与上层
+//	                            的设备名毫无关系** —— 那组机器上 cdc-wdm5 属于
+//	                            名为 "tmo_ec25" 的设备，而名为 "wwan5" 的设备
+//	                            用的是 cdc-wdm4。先用 --nas-get-serving-system
+//	                            确认这个控制口后面是不是你以为的那张卡。
 //
-// 两边的入参逐字相同：同一个 profile index(2，DiscoverIMSProfileIndex 找的)、
-// APN 留空、ip-family=6、都经 qmi-proxy、都用 DefaultClientOptions。逐项排除过
-// QMAP 数据格式（切到 QMAP 期间 vopive 那条路照样成功）、BindMuxDataPort
-// （-skip-mux-bind 也一样失败）、SetClientIPFamilyPref 的先后、APN 字符串是否
-// 与 profile 同时下发 —— 用 qmicli 独立复现，结论一致。
+//	(2,235) invalid-profile-id  profile index 是**每台设备各不相同**的。同一组
+//	                            机器上，一台的 IMS profile 在下标 2、另一台在 5。
+//	                            别把在 A 上查到的下标拿到 B 上用 —— 用
+//	                            -auto-ims-profile-b 让它现查。
 //
-// 也就是说：**这台模组只把数据呼叫的能力给了持有其常驻 QMI 会话的那个控制点**，
-// 另开一个控制点即便参数一模一样也拿不到，且错误码 (3,2001) 完全指不到真因
-// （vopive 自己的注释里把这个码归给"射频关着"，此处射频是开的）。
-//
-// 后果：要验证「IMS PDN 与数据 PDN 共存」，必须在**持有该设备的那个进程内**跑，
-// 本探针只在模组空闲（没有别的进程管着它）时才有意义。
+// 两个都纠正之后，外部进程建 IMS PDN 一次就成（qmicli 与本探针都是）。
+// 早先"这台模组只把数据呼叫能力给持有常驻会话的控制点"那个结论是错的，
+// 已删除：那两轮对比里，失败的一边和成功的一边根本不是同一台模组。
 package main
 
 import (
