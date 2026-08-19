@@ -199,6 +199,22 @@ func (m *Manager) OpenPDN(ctx context.Context, req PDNRequest) (PDNSession, erro
 	if req.MuxID == 0 || req.MuxID == topology.DefaultMuxID {
 		return nil, fmt.Errorf("%w: mux ID %d", ErrPDNMuxConflict, req.MuxID)
 	}
+	// **已建立的 session 占着的 mux 必须在这里挡住。**
+	//
+	// 下面那道 reservedMuxes 检查挡不住它：reservedMuxes 只在本函数执行期内有效
+	// （紧跟着就是 defer delete），而 OpenPDN 全程持有 dataPlane.mu，并发的
+	// OpenPDN 根本不存在 —— 那道检查因此恒为假。真正会发生的是「同一个 mux 被
+	// 第二次开 PDN」：上层重连/恢复路径再调一次 OpenPDN，而第一条还活着。
+	//
+	// 漏过去的后果不是"多开一条"，是**删掉正在用的那条**：netcfg.AddQMAPMux 在
+	// 网卡已存在时返回成功（写 add_mux 失败后回落到查已有网卡），于是第二次调用
+	// 一路走到 muxCreated = true；此后任一步失败，defer 里的 deleteMux 就把第一条
+	// PDN 的网卡摘掉 —— 而那条上面可能正跑着 IMS 注册与通话。
+	for _, session := range m.dataPlane.sessions {
+		if session != nil && session.muxID == req.MuxID {
+			return nil, fmt.Errorf("%w: mux ID %d is in use by PDN session %d", ErrPDNMuxConflict, req.MuxID, session.snapshot.ID)
+		}
+	}
 	if m.dataPlane.reservedMuxes == nil {
 		m.dataPlane.reservedMuxes = make(map[uint8]uint64)
 	}
