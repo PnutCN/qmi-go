@@ -17,9 +17,21 @@ func main() {
 	qmapInBand := flag.Int("qmap-inband", 0, "QMAP InBandFlowControl for set-qmap (0/1)")
 	replicate := flag.Uint("replicate", 0, "Replication factor for loopback-on")
 	useQRTR := flag.Bool("qrtr", false, "Use native QRTR (AF_QIPCRTR) transport instead of a cdc-wdm device")
+	// 读数据格式是诊断动作，而最需要它的时刻恰恰是「设备正被别的进程用着」——
+	// cdc-wdm 允许多次 open 却只把响应投给一个读者，直接开会和对方互相偷答复
+	// （现象是两边都超时、事务号对不上，不是干净的 EBUSY）。
+	useProxy := flag.Bool("proxy", false, "use qmi-proxy instead of opening the QMI control device directly")
+	proxyPath := flag.String("proxy-path", "", "qmi-proxy socket path (default: qmi-proxy)")
+	proxyExecutable := flag.String("proxy-executable", "", "qmi-proxy executable used only when the socket is unavailable")
 	flag.Parse()
 
-	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{UseQRTR: *useQRTR})
+	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{
+		UseQRTR:            *useQRTR,
+		UseProxy:           *useProxy,
+		ProxyPath:          *proxyPath,
+		ProxyExecutable:    *proxyExecutable,
+		ProxyFallbackToRaw: false,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create QMI client: %v", err)
 	}

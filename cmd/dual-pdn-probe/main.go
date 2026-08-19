@@ -10,6 +10,28 @@
 // second mux at the same time. That coexistence is the assumption the whole
 // dual-APN IMS feature rests on. This probe is a throwaway hardware
 // diagnostic to check it, not a production tool.
+//
+// # 已知限制：模组已被另一个进程接管时，这个探针建不起 PDN
+//
+// 2026-08-19，EC20 / 中国电信 / wwan5(cdc-wdm5)，射频开着、LTE 驻网、
+// AT+CGATT=1、模组自带 VoLTE voice_ready。同一时刻交替跑两轮：
+//
+//	本探针（经 qmi-proxy）              → 每次 CallFailed，
+//	                                      verbose call end (3,2001) = [cm] no-service
+//	同宿主上 vopive 进程内的同一段 qmi-go → 每次成功，各拿到不同的 IPv6 与 P-CSCF
+//
+// 两边的入参逐字相同：同一个 profile index(2，DiscoverIMSProfileIndex 找的)、
+// APN 留空、ip-family=6、都经 qmi-proxy、都用 DefaultClientOptions。逐项排除过
+// QMAP 数据格式（切到 QMAP 期间 vopive 那条路照样成功）、BindMuxDataPort
+// （-skip-mux-bind 也一样失败）、SetClientIPFamilyPref 的先后、APN 字符串是否
+// 与 profile 同时下发 —— 用 qmicli 独立复现，结论一致。
+//
+// 也就是说：**这台模组只把数据呼叫的能力给了持有其常驻 QMI 会话的那个控制点**，
+// 另开一个控制点即便参数一模一样也拿不到，且错误码 (3,2001) 完全指不到真因
+// （vopive 自己的注释里把这个码归给"射频关着"，此处射频是开的）。
+//
+// 后果：要验证「IMS PDN 与数据 PDN 共存」，必须在**持有该设备的那个进程内**跑，
+// 本探针只在模组空闲（没有别的进程管着它）时才有意义。
 package main
 
 import (
@@ -62,13 +84,57 @@ func run() error {
 		"automatically either, so confirm it on real hardware and adjust this flag if BindMuxDataPort "+
 		"fails for either PDN. 4 is the common USB interface number for Quectel QMI endpoints (EC20/EC25).")
 
+	// Starting a PDN by 3GPP profile index is not the same as starting it by
+	// APN string: the PCO request bits that make the network return a P-CSCF
+	// live in the profile (put there by the operator MBN), and an APN-string
+	// call carries none of them. For the IMS PDN, profile index is the form
+	// that actually works.
+	profileA := flag.Uint("profile-a", 0, "3GPP profile index for PDN A; 0 = start by APN string instead")
+	autoProfileA := flag.Bool("auto-ims-profile-a", false, "discover PDN A's profile index from the modem (IMCN flag first, -apn-a as fallback)")
+	profileB := flag.Uint("profile-b", 0, "3GPP profile index for PDN B; 0 = start by APN string instead")
+	autoProfileB := flag.Bool("auto-ims-profile-b", false, "discover PDN B's profile index from the modem (IMCN flag first, -apn-b as fallback)")
+
+	skipMuxBind := flag.Bool("skip-mux-bind", false, "skip QMAP mux creation and BindMuxDataPort for BOTH PDNs, leaving only the data-format switch. Diagnostic: isolates whether a start-network failure is caused by the mux binding or by the QMAP data format itself. No mux means no netdev, so nothing can carry traffic in this mode.")
+
 	hold := flag.Duration("hold", 30*time.Second, "how long to hold both PDNs up")
+	// Proxy flags mirror ims-probe's. Going through qmi-proxy is REQUIRED
+	// whenever another process (e.g. a running device manager) already holds
+	// the control device: cdc-wdm allows several opens but delivers each
+	// response to a single reader, so two direct openers steal each other's
+	// replies. That shows up as timeouts and mismatched transaction IDs on
+	// BOTH sides, never as a clean EBUSY -- so it is worth being deliberate.
+	verbose := flag.Bool("verbose", false, "log QMI wire traffic (request/response frames and TLVs)")
+	useProxy := flag.Bool("proxy", false, "use qmi-proxy instead of opening the QMI control device directly")
+	proxyPath := flag.String("proxy-path", "", "qmi-proxy socket path (default: qmi-proxy)")
+	proxyExecutable := flag.String("proxy-executable", "", "qmi-proxy executable used only when the socket is unavailable")
 	flag.Parse()
 
 	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
+	// Start from DefaultClientOptions, not a zero ClientOptions: the zero value
+	// leaves SyncOnOpen and QueryVersionOnOpen off and every timeout/queue size
+	// at 0. A probe that talks to the modem differently from the production
+	// client is not measuring the production path, which is the whole point of
+	// running it.
+	clientOpts := qmi.DefaultClientOptions()
+	clientOpts.UseProxy = *useProxy
+	if *proxyPath != "" {
+		clientOpts.ProxyPath = *proxyPath
+	}
+	if *proxyExecutable != "" {
+		clientOpts.ProxyExecutable = *proxyExecutable
+	}
+	clientOpts.ProxyFallbackToRaw = false
+	if *verbose {
+		// Wire-level logging. When a PDN that comes up fine from another
+		// process fails here, the request bytes are the only thing that
+		// settles whether this probe is really sending what it thinks it is.
+		clientOpts.Logf = func(level qmi.ClientLogLevel, format string, args ...any) {
+			log.Printf("[qmi:%s] "+format, append([]any{string(level)}, args...)...)
+		}
+	}
+	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, clientOpts)
 	if err != nil {
 		return fmt.Errorf("open QMI client: %w", err)
 	}
@@ -165,11 +231,13 @@ func run() error {
 	// attempting PDN B (knowing whether B works alone is useful data too),
 	// and a failure on PDN B can never skip PDN A's teardown: defer cleanupA
 	// below is registered unconditionally, before PDN B is even attempted.
-	cfgA := pdnConfig{label: "A", apn: *apnA, muxID: uint8(*muxA), ipFamily: uint8(*ipFamilyA)}
+	cfgA := pdnConfig{label: "A", apn: *apnA, muxID: uint8(*muxA), ipFamily: uint8(*ipFamilyA),
+		profileIndex: uint8(*profileA), autoIMSProfile: *autoProfileA, skipMuxBind: *skipMuxBind}
 	resA, cleanupA := bringUpPDN(ctx, client, *iface, epTypeU32, epIfaceU32, cfgA)
 	defer cleanupA()
 
-	cfgB := pdnConfig{label: "B", apn: *apnB, muxID: uint8(*muxB), ipFamily: uint8(*ipFamilyB)}
+	cfgB := pdnConfig{label: "B", apn: *apnB, muxID: uint8(*muxB), ipFamily: uint8(*ipFamilyB),
+		profileIndex: uint8(*profileB), autoIMSProfile: *autoProfileB, skipMuxBind: *skipMuxBind}
 	resB, cleanupB := bringUpPDN(ctx, client, *iface, epTypeU32, epIfaceU32, cfgB)
 	defer cleanupB()
 
@@ -197,6 +265,23 @@ type pdnConfig struct {
 	apn      string
 	muxID    uint8
 	ipFamily uint8 // raw flag value, 4 or 6; convert to the QMI wire value with ipFamilyWire
+	// profileIndex, when non-zero, is sent as the 3GPP profile index and the
+	// modem takes the APN (and everything else) from that profile.
+	//
+	// This is NOT interchangeable with passing the APN string. The PCO request
+	// bits that make the network hand back a P-CSCF live in the WDS profile,
+	// put there by the operator MBN -- an APN-string call carries none of them.
+	// Measured earlier on this same hardware: starting the IMS APN by string
+	// yields no P-CSCF, by profile index it does. On some carriers the
+	// string form does not come up at all.
+	profileIndex uint8
+	// autoIMSProfile discovers the profile index instead of hardcoding it:
+	// each card puts its IMS profile at a different index (measured: wwan5 at
+	// 5, wwan3 at 2), so a fixed number is wrong on the next card.
+	autoIMSProfile bool
+	// skipMuxBind skips both the QMAP mux creation and BindMuxDataPort, to
+	// isolate whether those are what a failing StartNetworkInterface trips on.
+	skipMuxBind bool
 }
 
 // pdnResult captures what happened bringing up one PDN, for the per-PDN
@@ -238,17 +323,28 @@ func bringUpPDN(ctx context.Context, client *qmi.Client, masterIface string, epT
 		return res, cleanup
 	}
 
-	muxIface, err := netcfg.AddQMAPMux(masterIface, cfg.muxID)
-	if err != nil {
-		res.stage = "mux"
-		res.err = fmt.Errorf("PDN %s: create QMAP mux %d failed: %w", cfg.label, cfg.muxID, err)
-		return res, cleanup
-	}
-	res.muxIface = muxIface
-	fmt.Printf("PDN %s: mux interface %s (mux id %d)\n", cfg.label, muxIface, cfg.muxID)
-	cleanup = func() {
-		if err := netcfg.DelQMAPMux(masterIface, cfg.muxID); err != nil {
-			log.Printf("WARNING: PDN %s: leaked mux %d: %v", cfg.label, cfg.muxID, err)
+	// -skip-mux-bind splits the two things this probe normally does together:
+	// switching the modem's data format to QMAP, and binding the WDS client to
+	// a mux. When a PDN that comes up fine on the default data endpoint fails
+	// here, that pair is the only remaining difference -- and the two halves
+	// have to be separable to tell which one is responsible. Without the mux
+	// there is no netdev to carry traffic, so this mode answers exactly one
+	// question: does StartNetworkInterface still succeed?
+	if cfg.skipMuxBind {
+		fmt.Printf("PDN %s: -skip-mux-bind — no QMAP mux, no BindMuxDataPort (start-network only)\n", cfg.label)
+	} else {
+		muxIface, err := netcfg.AddQMAPMux(masterIface, cfg.muxID)
+		if err != nil {
+			res.stage = "mux"
+			res.err = fmt.Errorf("PDN %s: create QMAP mux %d failed: %w", cfg.label, cfg.muxID, err)
+			return res, cleanup
+		}
+		res.muxIface = muxIface
+		fmt.Printf("PDN %s: mux interface %s (mux id %d)\n", cfg.label, muxIface, cfg.muxID)
+		cleanup = func() {
+			if err := netcfg.DelQMAPMux(masterIface, cfg.muxID); err != nil {
+				log.Printf("WARNING: PDN %s: leaked mux %d: %v", cfg.label, cfg.muxID, err)
+			}
 		}
 	}
 
@@ -266,24 +362,58 @@ func bringUpPDN(ctx context.Context, client *qmi.Client, masterIface string, epT
 		deleteMux()
 	}
 
-	binding := qmi.MuxBinding{
-		EpType:     epType,
-		EpIfID:     epIface,
-		MuxID:      cfg.muxID,
-		ClientType: 0x01, // QMI_WDS_CLIENT_TYPE_TETHERED
+	if !cfg.skipMuxBind {
+		binding := qmi.MuxBinding{
+			EpType:     epType,
+			EpIfID:     epIface,
+			MuxID:      cfg.muxID,
+			ClientType: 0x01, // QMI_WDS_CLIENT_TYPE_TETHERED
+		}
+		if err := wds.BindMuxDataPort(ctx, binding); err != nil {
+			res.stage = "bind"
+			res.err = fmt.Errorf("PDN %s: bind mux data port failed: %w", cfg.label, err)
+			return res, cleanup
+		}
+		fmt.Printf("PDN %s: bound WDS client to mux %d\n", cfg.label, cfg.muxID)
 	}
-	if err := wds.BindMuxDataPort(ctx, binding); err != nil {
-		res.stage = "bind"
-		res.err = fmt.Errorf("PDN %s: bind mux data port failed: %w", cfg.label, err)
-		return res, cleanup
+
+	// Resolve the profile index before starting: an explicit -profile wins,
+	// otherwise -auto-ims-profile asks the modem which of its profiles is the
+	// IMS one (IMCN flag first, APN string only as a fallback).
+	if cfg.profileIndex != 0 {
+		wds.ProfileIndex = cfg.profileIndex
+		fmt.Printf("PDN %s: using 3GPP profile index %d (APN comes from the profile)\n", cfg.label, cfg.profileIndex)
+	} else if cfg.autoIMSProfile {
+		idx, found, err := wds.DiscoverIMSProfileIndex(ctx, qmi.WDSProfileType3GPP, cfg.apn)
+		if err != nil {
+			res.stage = "discover-ims-profile"
+			res.err = fmt.Errorf("PDN %s: discover IMS profile index: %w", cfg.label, err)
+			return res, cleanup
+		}
+		if !found {
+			res.stage = "discover-ims-profile"
+			res.err = fmt.Errorf("PDN %s: no IMS profile found (looked for the IMCN flag, then APN %q)", cfg.label, cfg.apn)
+			return res, cleanup
+		}
+		wds.ProfileIndex = idx
+		fmt.Printf("PDN %s: discovered IMS profile index %d (APN comes from the profile)\n", cfg.label, idx)
 	}
-	fmt.Printf("PDN %s: bound WDS client to mux %d\n", cfg.label, cfg.muxID)
+
+	// With a profile index in hand the APN string must be left OUT, not sent
+	// alongside it. ProbeIMSPDNSettings (the one path measured working on this
+	// hardware) does exactly that, and its comment says why: re-sending the APN
+	// can override bits inside the profile that we cannot see but that matter,
+	// the PCO request being one of them.
+	startAPN := cfg.apn
+	if wds.ProfileIndex > 0 {
+		startAPN = ""
+	}
 
 	family := ipFamilyWire(cfg.ipFamily)
-	handle, err := wds.StartNetworkInterface(ctx, cfg.apn, "", "", 0, family)
+	handle, err := wds.StartNetworkInterface(ctx, startAPN, "", "", 0, family)
 	if err != nil {
 		res.stage = "start-network"
-		res.err = fmt.Errorf("PDN %s: start network on APN %q failed: %w", cfg.label, cfg.apn, err)
+		res.err = fmt.Errorf("PDN %s: start network (apn=%q profile-index=%d) failed: %w", cfg.label, startAPN, wds.ProfileIndex, err)
 		return res, cleanup
 	}
 	res.up = true
