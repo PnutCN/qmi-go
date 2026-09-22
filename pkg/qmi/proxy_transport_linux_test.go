@@ -138,6 +138,91 @@ func TestOpenProxyTransportRetriesUntilProxyIsReady(t *testing.T) {
 	}
 }
 
+func TestWaitForProxyStartRetriesWithWaiterContextAfterOwnerTimeout(t *testing.T) {
+	oldDial := dialProxyHook
+	oldRetryDelay := proxyRetryDelay
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		proxyRetryDelay = oldRetryDelay
+	})
+
+	attempts := 0
+	var serverConn net.Conn
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, errors.New("proxy socket not ready")
+		}
+		clientConn, peerConn := net.Pipe()
+		serverConn = peerConn
+		return clientConn, nil
+	}
+	proxyRetryDelay = time.Millisecond
+
+	attempt := &proxyStartAttempt{
+		done: make(chan struct{}),
+		err:  context.DeadlineExceeded,
+	}
+	close(attempt.done)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	conn, err := waitForProxyStart(ctx, "@qmi-proxy", attempt)
+	if err != nil {
+		t.Fatalf("waitForProxyStart() error = %v, want proxy connection", err)
+	}
+	defer conn.Close()
+	if serverConn != nil {
+		defer serverConn.Close()
+	}
+	if attempts < 3 {
+		t.Fatalf("dial attempts=%d, want at least 3 attempts after owner timeout", attempts)
+	}
+}
+
+func TestWaitForProxyStartJoinsOwnerAndWaiterErrorsOnTimeout(t *testing.T) {
+	oldDial := dialProxyHook
+	oldRetryDelay := proxyRetryDelay
+	t.Cleanup(func() {
+		dialProxyHook = oldDial
+		proxyRetryDelay = oldRetryDelay
+	})
+
+	ownerErr := errors.New("owner startup failed")
+	waiterDialErr := errors.New("waiter dial failed")
+	attempts := 0
+	dialProxyHook = func(context.Context, string) (qmiTransport, error) {
+		attempts++
+		return nil, waiterDialErr
+	}
+	proxyRetryDelay = time.Millisecond
+
+	attempt := &proxyStartAttempt{
+		done: make(chan struct{}),
+		err:  ownerErr,
+	}
+	close(attempt.done)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := waitForProxyStart(ctx, "@qmi-proxy", attempt)
+	if err == nil {
+		t.Fatal("waitForProxyStart() error = nil, want owner and waiter failure reasons")
+	}
+	if !errors.Is(err, ownerErr) {
+		t.Fatalf("waitForProxyStart() error = %v, want owner error %q", err, ownerErr)
+	}
+	if !errors.Is(err, waiterDialErr) {
+		t.Fatalf("waitForProxyStart() error = %v, want last waiter dial error %q", err, waiterDialErr)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForProxyStart() error = %v, want waiter context deadline", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("dial attempts=%d, want repeated waiter dials", attempts)
+	}
+}
+
 func TestOpenProxyTransportDoesNotForkDuringProxyReadinessWindow(t *testing.T) {
 	proxyExecutable := filepath.Join(t.TempDir(), "qmi-proxy")
 	if err := os.WriteFile(proxyExecutable, []byte("#!/bin/sh\n"), 0o755); err != nil {

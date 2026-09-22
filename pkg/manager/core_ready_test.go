@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iniwex5/qmi-go/pkg/netcfg"
 	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
@@ -29,6 +30,55 @@ func TestDoRecoverFromModemResetResetsSnapshotImmediately(t *testing.T) {
 	}
 	if !m.IsCoreReady() {
 		t.Fatal("expected coreReady=true after convergence")
+	}
+}
+
+func TestDoRecoverFromModemResetRebuildsDeclaredQMAPWithoutDesiredConnection(t *testing.T) {
+	m := newRecoveryTestManager()
+	m.cfg = Config{
+		Device:          ModemDevice{NetInterface: "wwan-recovery-test"},
+		DataPlanePolicy: DataPlanePolicyLazy,
+		DataPlane:       DataPlaneSpec{Mode: DataPlaneModeQMAP, DefaultMuxID: 1},
+	}
+	m.netcfgOps = netcfgOps{
+		flushAddresses: func(string) error { return nil },
+		flushRoutes:    func(string) error { return nil },
+		bringDown:      func(string) error { return nil },
+	}
+	m.openClientAndAllocateServicesHook = func(context.Context) error {
+		// The real lazy startup skips WDA allocation; recovery must allocate it
+		// when it explicitly re-converges the declared data-plane topology.
+		m.wda = &qmi.WDAService{}
+		return nil
+	}
+	m.checkSIMHook = func() error { return nil }
+	m.modemResetQuietWindow = time.Millisecond
+	m.getICCIDStrictHook = func(context.Context) (string, error) { return "new-iccid", nil }
+	m.getDataFormatFn = func(context.Context) (*qmi.DataFormat, error) {
+		got := dataFormatTargetForMux(1)
+		return &got, nil
+	}
+	discoverCalls := 0
+	m.dataPlaneOps = dataPlaneOps{
+		discoverQMAPTopology: func(string) (netcfg.QMAPTopology, error) {
+			discoverCalls++
+			return netcfg.QMAPTopology{MasterInterface: "wwan-recovery-test", MuxInterfaces: map[uint8]string{}}, nil
+		},
+		enableRawIP: func(string) error { return nil },
+		addQMAPMux:  func(string, uint8) (string, error) { return "qmimux-recovery-test", nil },
+	}
+
+	// NoDial/recovery intentionally leaves desiredConnection false. The data
+	// plane still has to be rebuilt because VoLTE owns a secondary PDN on it.
+	if ok := m.doRecoverFromModemReset(); !ok {
+		t.Fatal("expected recover to succeed")
+	}
+	snapshot, ready := m.CurrentDataPlaneSnapshot()
+	if !ready || snapshot.Mode != DataPlaneModeQMAP || snapshot.DefaultMuxID != 1 {
+		t.Fatalf("data-plane snapshot = %+v ready=%v, want QMAP mux 1", snapshot, ready)
+	}
+	if discoverCalls != 1 {
+		t.Fatalf("QMAP discovery calls = %d, want 1 during reset recovery", discoverCalls)
 	}
 }
 

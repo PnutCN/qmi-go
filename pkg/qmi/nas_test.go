@@ -225,6 +225,29 @@ func TestGetLTEDuplexModeFromCellLocation(t *testing.T) {
 	}
 }
 
+func TestGetLTEDuplexModeFromEARFCNUsesServingBandRanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		earfcn uint32
+		want   string
+	}{
+		{name: "band 3 fdd", earfcn: 1300, want: "FDD"},
+		{name: "band 38 tdd", earfcn: 38000, want: "TDD"},
+		{name: "band 48 tdd", earfcn: 55240, want: "TDD"},
+		{name: "band 65 fdd", earfcn: 65536, want: "FDD"},
+		{name: "reserved gap", earfcn: 4950, want: ""},
+		{name: "unknown", earfcn: 70000, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := GetLTEDuplexModeFromEARFCN(tt.earfcn); got != tt.want {
+				t.Fatalf("GetLTEDuplexModeFromEARFCN(%d)=%q want=%q", tt.earfcn, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRFBandInfoResponse(t *testing.T) {
 	extended := []byte{
 		0x02,
@@ -568,7 +591,7 @@ func TestParseCellLocationInfoResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseCellLocationInfoResponse returned error: %v", err)
 	}
-	if info.LTE == nil || info.LTE.MCC != "310" || info.LTE.MNC != "260" || info.LTE.TAC != 100 || info.LTE.GlobalCellID != 0x12345678 {
+	if info.LTE == nil || info.LTE.MCC != "310" || info.LTE.MNC != "260" || info.LTE.TAC != 100 || info.LTE.GlobalCellID != 0x12345678 || !info.LTE.HasEARFCN {
 		t.Fatalf("unexpected LTE cell info: %+v", info.LTE)
 	}
 	if !info.LTE.HasTimingAdvance || info.LTE.TimingAdvance != 42 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -92,8 +93,9 @@ func cardStatusPacketWithISIMAID(aid []byte) *Packet {
 }
 
 type cardStatusTestApp struct {
-	appType uint8
-	aid     []byte
+	appType  uint8
+	appState uint8
+	aid      []byte
 }
 
 func cardStatusPacketWithApps(apps ...cardStatusTestApp) *Packet {
@@ -107,9 +109,13 @@ func cardStatusPacketWithApps(apps ...cardStatusTestApp) *Packet {
 	value[10] = byte(PINStatusDisabled) // UPIN state
 	value[14] = byte(len(apps))         // number of applications
 	for _, app := range apps {
+		appState := app.appState
+		if appState == 0 {
+			appState = UIMAppStateDetected
+		}
 		value = append(value,
 			app.appType, // app type
-			0x01,        // app state
+			appState,    // app state
 			0x00,        // personalization state
 			0x00,        // personalization feature
 			0x00,        // personalization retries
@@ -188,6 +194,31 @@ func TestUIMServiceGetISIMAIDUsesFullCardStatusAID(t *testing.T) {
 	}
 	if !sameBytes(got, aid) {
 		t.Fatalf("GetISIMAID() = %X, want %X", got, aid)
+	}
+}
+
+func TestUIMServiceListApplicationsPreservesStateAndFullAID(t *testing.T) {
+	usim := []byte{0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xF2, 0x30, 0xFF, 0x01, 0x89}
+	isim := []byte{0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04, 0xF2, 0x30, 0xFF, 0x01, 0x89}
+	client := newUIMUnitTestClient()
+	stop := serveUIMUnitTestRequests(t, client, func(req *Packet) *Packet {
+		return cardStatusPacketWithApps(
+			cardStatusTestApp{appType: UIMAppTypeUSIM, appState: UIMAppStateReady, aid: usim},
+			cardStatusTestApp{appType: UIMAppTypeISIM, appState: UIMAppStateDetected, aid: isim},
+		)
+	})
+	defer stop()
+	uim := &UIMService{client: client, clientID: 1}
+
+	got, err := uim.ListApplications(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].State != UIMAppStateReady || got[1].State != UIMAppStateDetected {
+		t.Fatalf("applications=%+v", got)
+	}
+	if !sameBytes(got[0].AID, usim) || !sameBytes(got[1].AID, isim) {
+		t.Fatalf("AIDs=%X/%X", got[0].AID, got[1].AID)
 	}
 }
 
@@ -474,6 +505,25 @@ func TestGetSIMServiceTableDoesNotRepeatSuccessfulEmptyRead(t *testing.T) {
 	}
 	if transparentReads != 1 {
 		t.Fatalf("expected one transparent read, got %d", transparentReads)
+	}
+}
+
+func TestReadTransparentRequiresReadResult(t *testing.T) {
+	c := newUIMUnitTestClient()
+	u := &UIMService{client: c, clientID: 1}
+	defer serveUIMUnitTestRequests(t, c, func(req *Packet) *Packet {
+		if req.MessageID != UIMReadTransparent {
+			t.Errorf("unexpected message 0x%04x", req.MessageID)
+		}
+		return &Packet{TLVs: []TLV{
+			successResultTLV(),
+			{Type: 0x10, Value: []byte{0x90, 0x00}},
+		}}
+	})()
+
+	_, err := u.ReadTransparentWithSession(context.Background(), UIMSessionTypePrimaryGWProvisioning, 0x6F3E, []byte{0x00, 0x3F, 0xFF, 0x7F})
+	if err == nil || !strings.Contains(err.Error(), "read result missing") {
+		t.Fatalf("ReadTransparentWithSession() error=%v, want missing read result", err)
 	}
 }
 

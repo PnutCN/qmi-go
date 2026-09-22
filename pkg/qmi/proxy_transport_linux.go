@@ -93,21 +93,40 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 // error 抄给所有等待者,会让一台设备的短超时把并发初始化的其余几台一起判死,
 // 即便 proxy 在那之后立刻就绪。那正是当初"六台里三台一起掉线"的形态。
 //
-// 所以 owner 失败后,只要自己的 ctx 还有余量,就自己再 dial 一次:proxy 多半
-// 已经被 owner fork 起来了,只是没赶上它的截止时间。仍然失败才认输,并且把
-// 两个原因都带上 —— 只报一个的话,现场分不清是"没拉起来"还是"拉起来了没赶上"。
+// 所以 owner 失败后,只要自己的 ctx 还有余量,就自己重试:proxy 多半已经被
+// owner fork 起来了,只是没赶上它的截止时间。**按 proxyRetryDelay(100ms)
+// 间隔一直试到自己的 ctx 用完**,而不是只试一次 —— fork 出来的 proxy 绑定
+// socket 要几十到几百毫秒,只试一次会在那个窗口里稳定地判错。
+//
+// 认输时把两个原因都带上（owner 的 + 自己最后一次的）—— 只报一个的话，
+// 现场分不清是"没拉起来"还是"拉起来了没赶上"。
 func waitForProxyStart(ctx context.Context, proxyPath string, attempt *proxyStartAttempt) (qmiTransport, error) {
 	select {
 	case <-attempt.done:
 		if attempt.err != nil {
-			if ctx.Err() != nil {
-				return nil, attempt.err
+			var lastErr error
+			for {
+				if err := ctx.Err(); err != nil {
+					return nil, errors.Join(attempt.err, lastErr, fmt.Errorf("wait for qmi-proxy %q startup: %w", proxyPath, err))
+				}
+				timer := time.NewTimer(proxyRetryDelay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return nil, errors.Join(attempt.err, lastErr, fmt.Errorf("wait for qmi-proxy %q startup: %w", proxyPath, ctx.Err()))
+				case <-timer.C:
+				}
+				conn, err := dialProxyHook(ctx, proxyPath)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
 			}
-			conn, err := dialProxyHook(ctx, proxyPath)
-			if err != nil {
-				return nil, fmt.Errorf("connect qmi-proxy %q after a failed startup by another caller: %w", proxyPath, errors.Join(attempt.err, err))
-			}
-			return conn, nil
 		}
 		conn, err := dialProxyHook(ctx, proxyPath)
 		if err != nil {

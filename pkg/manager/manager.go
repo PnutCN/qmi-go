@@ -168,6 +168,8 @@ type Manager struct {
 
 	// State
 	mu                sync.RWMutex
+	dataConfigMu      sync.Mutex // serializes data-config replacement with its disconnect/redial sequence
+	dataOpMu          sync.Mutex // serializes the actual dial/teardown operation with event-loop work
 	state             State
 	settings          *qmi.RuntimeSettings
 	controlReady      bool
@@ -178,6 +180,11 @@ type Manager struct {
 	coreReadyLastErr  string
 	coreReadySince    time.Time
 	desiredConnection bool
+	// reconfiguringData suppresses automatic reconnect scheduling while a
+	// transactional APN/IP-family replacement is disconnecting and redialing.
+	// Without this guard a failed redial can enqueue an event using the new
+	// config before the caller has a chance to restore the old one.
+	reconfiguringData bool
 	// connectedDataPlaneGeneration is the DataPlaneSnapshot.Generation the
 	// default connection was last dialed against. A QMAP mux binding can
 	// only be set before StartNetworkInterface, so an already-established
@@ -212,6 +219,13 @@ type Manager struct {
 	dataPlaneOps dataPlaneOps
 	pdnOps       pdnOps
 	netcfgOps    netcfgOps
+	// imsProbeSlot serializes temporary IMS WDS calls without serializing
+	// unrelated QMI operations. The probe is a real modem data call, so two
+	// concurrent probes must not race the modem's duplicate-call matching.
+	imsProbeSlot    chan struct{}
+	imsProbeWG      sync.WaitGroup
+	imsProbeCancel  context.CancelFunc
+	imsProbeBlocked bool
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -293,6 +307,7 @@ type Manager struct {
 	closeLogicalChannelHook           func(ctx context.Context, slot uint8, channel uint8) error
 	sendAPDUHook                      func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error)
 	newWDSService                     func(ctx context.Context, client *qmi.Client) (*qmi.WDSService, error)
+	imsProbeOps                       imsProbeOps
 	newNASService                     func(ctx context.Context, client *qmi.Client) (*qmi.NASService, error)
 	newDMSService                     func(ctx context.Context, client *qmi.Client) (*qmi.DMSService, error)
 	newUIMService                     func(ctx context.Context, client *qmi.Client) (*qmi.UIMService, error)
@@ -564,6 +579,9 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 		m.mu.Unlock()
 		return fmt.Errorf("manager already started")
 	}
+	// A previous failed start or an intentional Stop leaves cleanup's probe
+	// barrier closed. A fresh core start creates a new lifecycle epoch.
+	m.imsProbeBlocked = false
 	m.state = StateConnecting
 	m.desiredConnection = false
 	m.mu.Unlock()
@@ -610,6 +628,10 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 
 // Stop gracefully stops the connection manager / Stop 优雅停止连接管理器
 func (m *Manager) Stop() error {
+	// Serialize the state transition with ReconfigureDataConfig. The lock is
+	// intentionally held only while marking the manager stopping; keeping it
+	// across event-loop cleanup would deadlock eventStop's data operation.
+	m.dataConfigMu.Lock()
 	m.mu.Lock()
 	wasStopping := m.state == StateStopping
 	wasInactive := !m.coreReady && m.state == StateDisconnected
@@ -619,12 +641,16 @@ func (m *Manager) Stop() error {
 	}
 	cancel := m.cancel
 	m.mu.Unlock()
+	m.dataConfigMu.Unlock()
 
 	m.log.Info("Stopping connection manager...")
 	m.stopScheduledTimers()
 	if cancel != nil {
 		cancel()
 	}
+	// Drain temporary IMS calls before eventStop can disconnect the shared
+	// default data call. cleanup() repeats the barrier before client teardown.
+	m.blockIMSProbes()
 
 	if !wasStopping && !wasInactive {
 		select {
@@ -947,7 +973,7 @@ func (m *Manager) IsConnected() bool {
 func (m *Manager) Settings() *qmi.RuntimeSettings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.settings
+	return cloneRuntimeSettings(m.settings)
 }
 
 func (m *Manager) Stats() ManagerStats {
@@ -2094,6 +2120,16 @@ func (m *Manager) GetUSIMAID(ctx context.Context) ([]byte, error) {
 	})
 }
 
+// ListUIMApplications returns the complete application list from UIM card
+// status, including each application's state and full AID.
+func (m *Manager) ListUIMApplications(ctx context.Context) ([]qmi.UIMApplication, error) {
+	return withCardAccessValue(m, ctx, func() ([]qmi.UIMApplication, error) {
+		return withUIMRecoveryValue(m, "ListUIMApplications", func(uim *qmi.UIMService) ([]qmi.UIMApplication, error) {
+			return uim.ListApplications(ctx)
+		})
+	})
+}
+
 func (m *Manager) GetISIMAID(ctx context.Context) ([]byte, error) {
 	return withCardAccessValue(m, ctx, func() ([]byte, error) {
 		return withUIMRecoveryValue(m, "GetISIMAID", func(uim *qmi.UIMService) ([]byte, error) {
@@ -2102,14 +2138,14 @@ func (m *Manager) GetISIMAID(ctx context.Context) ([]byte, error) {
 	})
 }
 
-func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err error) {
+func (m *Manager) GetHomePLMN(ctx context.Context) (mcc, mnc string, err error) {
 	type nativeLocation struct {
 		mcc string
 		mnc string
 	}
 	location, err := withCardAccessValue(m, ctx, func() (nativeLocation, error) {
-		return withUIMRecoveryValue(m, "GetNativeMCCMNC", func(uim *qmi.UIMService) (nativeLocation, error) {
-			localMCC, localMNC, callErr := uim.GetNativeMCCMNC(ctx)
+		return withUIMRecoveryValue(m, "GetHomePLMN", func(uim *qmi.UIMService) (nativeLocation, error) {
+			localMCC, localMNC, callErr := uim.GetHomePLMN(ctx)
 			return nativeLocation{
 				mcc: localMCC,
 				mnc: localMNC,
@@ -2122,8 +2158,35 @@ func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err err
 	return location.mcc, location.mnc, nil
 }
 
+// GetNativeMCCMNC is retained for callers using the older name. Its
+// semantics are the strict SIM home PLMN semantics of GetHomePLMN.
+func (m *Manager) GetNativeMCCMNC(ctx context.Context) (mcc, mnc string, err error) {
+	return m.GetHomePLMN(ctx)
+}
+
+// GetServingPLMN returns the exact serving PLMN from the BCD-coded Cell
+// Location information. NAS ServingSystem's numeric MNC is intentionally not
+// used because it cannot preserve the two- versus three-digit distinction.
+func (m *Manager) GetServingPLMN(ctx context.Context) (mcc, mnc string, err error) {
+	serving, err := m.GetServingSystem(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	if serving == nil {
+		return "", "", fmt.Errorf("serving_plmn_unavailable: serving system is nil")
+	}
+	cell, err := m.NASGetCellLocationInfo(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("serving_plmn_unavailable: cell location: %w", err)
+	}
+	return qmi.ServingPLMNFromCellLocation(cell, serving.RadioInterface)
+}
+
 // RotateIP disconnects and reconnects to get a new IP address / RotateIP 断开并重新连接以获取新 IP 地址
 func (m *Manager) RotateIP() error {
+	m.dataOpMu.Lock()
+	defer m.dataOpMu.Unlock()
+
 	m.mu.Lock()
 	if m.state != StateConnected {
 		m.mu.Unlock()
@@ -2971,6 +3034,10 @@ func (m *Manager) checkSIM() error {
 }
 
 func (m *Manager) cleanup() {
+	// Temporary IMS probes use the shared QMI transport and own a WDS client
+	// ID. Stop or core recovery must drain them before this method clears and
+	// closes the shared client.
+	m.blockIMSProbes()
 	// Use timeout context for cleanup operations / 使用超时上下文进行清理操作
 	m.stopScheduledTimers()
 	// Two separate budgets on purpose. Releasing the secondary PDNs is network
@@ -3374,6 +3441,9 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	}
 
 	m.recoverAttempts.Add(1)
+	// Recovery disconnects the default data call before cleanup. Do not let
+	// that modem-side operation overlap an independent IMS probe call.
+	m.blockIMSProbes()
 	m.doDisconnect()
 	m.cleanup()
 	m.snapshot.Reset()
@@ -3404,6 +3474,12 @@ func (m *Manager) doRecoverFromModemReset() bool {
 		}
 		m.scheduleRecoverRetry("reinit_failed")
 		return false
+	}
+	if err := m.recoverDeclaredDataPlaneAfterModemReset(); err != nil {
+		// The QMI control core can be usable even when the host-side data
+		// topology is temporarily unavailable. Keep core recovery successful;
+		// QMAP-dependent callers will reject the degraded snapshot explicitly.
+		m.log.WithError(err).Warn("QMI core recovered but data-plane convergence failed")
 	}
 	m.mu.Lock()
 	m.markControlReadyLocked("recover_control_ready")
@@ -3457,6 +3533,7 @@ func (m *Manager) doRecoverFromModemReset() bool {
 
 	m.mu.Lock()
 	m.markCoreReadyLocked("recover_converged")
+	m.imsProbeBlocked = false
 	m.mu.Unlock()
 	m.setState(StateDisconnected)
 	if desiredConnection && m.cfg.AutoReconnect {
@@ -3468,6 +3545,39 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	}
 
 	return true
+}
+
+// recoverDeclaredDataPlaneAfterModemReset restores the topology declared by
+// the caller after cleanup has cleared the runtime snapshot and QMI services
+// have been allocated again. This must not be conditional on desiredConnection:
+// VoLTE can own a secondary PDN while the default data call is intentionally
+// disabled (NoDial), and that PDN still needs a live QMAP topology.
+func (m *Manager) recoverDeclaredDataPlaneAfterModemReset() error {
+	if m == nil || m.dataPlaneDisabled() {
+		return nil
+	}
+	spec := m.declaredDataPlaneSpec()
+	if spec.Mode == "" {
+		return nil
+	}
+
+	timeout := m.cfg.Timeouts.Init
+	if timeout <= 0 {
+		timeout = defaultTimeouts.Init
+	}
+	ctx, cancel := m.opContext(timeout)
+	defer cancel()
+	snapshot, err := m.ConvergeDataPlane(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("qmi manager: recover declared data-plane topology: %w", err)
+	}
+	if spec.Mode == DataPlaneModeQMAP && snapshot.Mode != DataPlaneModeQMAP {
+		m.log.WithField("requested_mode", spec.Mode).
+			WithField("actual_mode", snapshot.Mode).
+			WithField("degraded_reason", snapshot.DegradedReason).
+			Warn("QMI reset recovery restored control core with degraded data-plane topology")
+	}
+	return nil
 }
 
 func (m *Manager) hasPendingModemReset() bool {
@@ -3637,6 +3747,13 @@ func jitteredFullCheckInterval(base time.Duration) time.Duration {
 }
 
 func (m *Manager) doConnect() error {
+	m.dataOpMu.Lock()
+	defer m.dataOpMu.Unlock()
+	return m.doConnectLocked()
+}
+
+func (m *Manager) doConnectLocked() error {
+
 	m.mu.Lock()
 	if !m.desiredConnection {
 		m.mu.Unlock()
@@ -4031,18 +4148,44 @@ func (m *Manager) teardownDefaultDataInterface() {
 }
 
 func (m *Manager) doDisconnect() {
+	m.dataOpMu.Lock()
+	defer m.dataOpMu.Unlock()
+	_ = m.doDisconnectLocked()
+}
+
+func (m *Manager) doDisconnectLocked() error {
+
 	m.log.Info("Disconnecting...")
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
 	defer cancel()
+	return m.doDisconnectWithContextLocked(ctx)
+}
 
-	if m.handleV4 != 0 && m.wds != nil {
-		_ = m.wds.StopNetworkInterface(ctx, m.handleV4)
+// doDisconnectWithContextLocked tears down the default data call while the
+// caller owns dataOpMu. It always clears local handles, even when a modem
+// StopNetworkInterface request fails, and returns the collected QMI errors so
+// transactional callers can decide whether to commit a new configuration.
+func (m *Manager) doDisconnectWithContextLocked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var errs []error
+
+	if m.handleV4 != 0 {
+		if m.wds != nil {
+			if err := m.wds.StopNetworkInterface(ctx, m.handleV4); err != nil {
+				errs = append(errs, fmt.Errorf("stop IPv4 data call: %w", err))
+			}
+		}
 		m.handleV4 = 0
 	}
-	if m.handleV6 != 0 && m.wdsV6 != nil {
-		_ = m.wdsV6.StopNetworkInterface(ctx, m.handleV6)
+	if m.handleV6 != 0 {
+		if m.wdsV6 != nil {
+			if err := m.wdsV6.StopNetworkInterface(ctx, m.handleV6); err != nil {
+				errs = append(errs, fmt.Errorf("stop IPv6 data call: %w", err))
+			}
+		}
 		m.handleV6 = 0
-
 	}
 
 	m.teardownDefaultDataInterface()
@@ -4056,6 +4199,7 @@ func (m *Manager) doDisconnect() {
 
 	// Emit disconnected event / 发送断开连接事件
 	m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
+	return errors.Join(errs...)
 }
 
 func (m *Manager) doStatusCheck(full bool) {
@@ -4190,8 +4334,9 @@ func (m *Manager) handleDialFailure(err error) {
 
 	m.mu.RLock()
 	desiredConnection := m.desiredConnection
+	reconfiguringData := m.reconfiguringData
 	m.mu.RUnlock()
-	if !m.cfg.AutoReconnect || !desiredConnection {
+	if reconfiguringData || !m.cfg.AutoReconnect || !desiredConnection {
 		return
 	}
 

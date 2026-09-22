@@ -608,78 +608,49 @@ func successfulPDNOps(deleteMux func(string, uint8) error) pdnOps {
 // 而 OpenPDN 全程持 dataPlane.mu，并发的 OpenPDN 根本不存在。真正会发生的是
 // 上层重连/恢复路径为同一个 mux 再开一次 PDN，而第一条还活着。
 //
-// 漏过去不是"多开一条"而是**删掉正在用的那条**：netcfg.AddQMAPMux 在网卡已存在
-// 时返回成功，于是第二次调用走到 muxCreated = true，此后任一步失败，defer 里的
-// deleteMux 就把第一条 PDN 的网卡摘掉 —— 那条上面可能正跑着 IMS 注册与通话。
-//
-// 所以断言里 del_mux 一次都不能出现。
+// 漏过去不是「多开一条」而是**删掉正在用的那条**：netcfg.AddQMAPMux 在网卡
+// 已存在时返回成功，于是第二次调用走到 muxCreated = true，此后任一步失败，
+// defer 里的 deleteMux 就把第一条 PDN 的网卡摘掉 —— 那条上面可能正跑着
+// IMS 注册与通话。所以断言里 del_mux 一次都不能出现。
 func TestOpenPDNRejectsMuxHeldByLiveSession(t *testing.T) {
 	m := newCoexistTestManager(t, "qmimux0", 1)
-	m.client = &qmi.Client{}
-	// 一条活着的 IMS PDN，占着 mux 2。
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
 		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
-
-	var events []string
-	m.pdnOps = pdnOps{
-		bringUpMaster: func(string) error { return nil },
-		addMux: func(string, uint8) (string, error) {
-			events = append(events, "add_mux")
-			return "qmimux1", nil
-		},
-		deleteMux: func(string, uint8) error {
-			events = append(events, "del_mux")
-			return nil
-		},
+	addMuxCalled := false
+	deleteMuxCalled := false
+	m.pdnOps = successfulPDNOps(func(string, uint8) error {
+		deleteMuxCalled = true
+		return nil
+	})
+	m.pdnOps.addMux = func(string, uint8) (string, error) {
+		addMuxCalled = true
+		return "qmimux1", nil
 	}
 
-	_, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: 6})
-
+	_, err := m.OpenPDN(context.Background(), PDNRequest{APN: "ims", MuxID: 2, IPFamily: qmi.IpFamilyV4})
 	if !errors.Is(err, ErrPDNMuxConflict) {
 		t.Fatalf("err = %v, want ErrPDNMuxConflict", err)
 	}
-	for _, event := range events {
-		if event == "del_mux" {
-			t.Fatal("拒绝路径删掉了 mux —— 那是活着的那条 PDN 的网卡")
-		}
-		if event == "add_mux" {
-			t.Error("拒绝应发生在碰 mux 之前")
-		}
+	if addMuxCalled {
+		t.Fatal("OpenPDN called addMux for a mux held by a live session")
+	}
+	if deleteMuxCalled {
+		t.Fatal("OpenPDN deleted a mux while rejecting a conflicting session")
 	}
 }
 
-// TestOpenPDNAllowsDistinctMuxWhileAnotherSessionIsLive 是上一条的反面:
-// 拒绝必须只针对同一个 mux，否则第二条 PDN 就永远开不出来了 —— 而
-// 「IMS PDN 与数据 PDN 并存」正是这套东西存在的理由。
 func TestOpenPDNAllowsDistinctMuxWhileAnotherSessionIsLive(t *testing.T) {
 	m := newCoexistTestManager(t, "qmimux0", 1)
-	m.client = &qmi.Client{}
 	m.dataPlane.sessions = map[uint64]*managedPDNSession{
 		7: {closeDone: make(chan struct{}), muxID: 2, snapshot: PDNSnapshot{ID: 7, InterfaceName: "qmimux1"}},
 	}
+	m.pdnOps = successfulPDNOps(func(string, uint8) error { return nil })
+	m.pdnOps.addMux = func(string, uint8) (string, error) { return "qmimux2", nil }
 
-	m.pdnOps = pdnOps{
-		bringUpMaster: func(string) error { return nil },
-		addMux:        func(string, uint8) (string, error) { return "qmimux2", nil },
-		deleteMux:     func(string, uint8) error { return nil },
-		leaseWDS:      func(context.Context, *qmi.Client) (*qmi.WDSService, error) { return &qmi.WDSService{}, nil },
-		bind:          func(context.Context, *qmi.WDSService, qmi.MuxBinding) error { return nil },
-		start:         func(context.Context, *qmi.WDSService, PDNRequest) (uint32, error) { return 42, nil },
-		settings: func(context.Context, *qmi.WDSService, uint8) (*qmi.RuntimeSettings, error) {
-			return &qmi.RuntimeSettings{}, nil
-		},
-		discoverEndpoint: func(string) (uint32, error) { return 4, nil },
-		prepareUserspace: func(string) error { return nil },
-		bringUp:          func(string) error { return nil },
-		bringDown:        func(string) error { return nil },
-		stop:             func(context.Context, *qmi.WDSService, uint32) error { return nil },
-		releaseWDS:       func(*qmi.WDSService) error { return nil },
-	}
-
-	session, err := m.OpenPDN(context.Background(), PDNRequest{APN: "internet", MuxID: 3, IPFamily: 4})
+	session, err := m.OpenPDN(context.Background(), PDNRequest{APN: "internet", MuxID: 3, IPFamily: qmi.IpFamilyV4})
 	if err != nil {
-		t.Fatalf("mux 3 空闲，应当开得起来: %v", err)
+		t.Fatalf("OpenPDN() with a distinct mux error = %v", err)
 	}
 	if got := session.Snapshot().InterfaceName; got != "qmimux2" {
 		t.Fatalf("InterfaceName = %q, want qmimux2", got)
