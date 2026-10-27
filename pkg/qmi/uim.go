@@ -1677,7 +1677,10 @@ func decodePNNRecord(record int, data []byte) (PNNRecord, bool) {
 		length := int(data[i+1])
 		i += 2
 		if i+length > len(data) {
-			break
+			// 长度字节比实际多：有的卡把长度多算一位（2026-10-27 KPN 承载的 Speedtest Travel
+			// profile：`43 10 80 …` 声明 16 字节、实际 15，正好装下 16 个 GSM7 字符）。此前整条放弃，
+			// 卡名退成 PLMN 表里的运营商名。按实际剩下的字节解（越界的必然吃到记录末尾）。
+			length = len(data) - i
 		}
 		value := data[i : i+length]
 		i += length
