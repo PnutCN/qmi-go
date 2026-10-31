@@ -1105,10 +1105,15 @@ func (m *Manager) getPacketServiceState(ctx context.Context) (qmi.ConnectionStat
 	if m.queryPacketServiceState != nil {
 		return m.queryPacketServiceState(ctx)
 	}
-	if m.wds == nil {
+	// 查实际连着的那个族，见 packetStatusFamily。
+	switch packetStatusFamily(m.handleV4, m.handleV6, m.wds != nil, m.wdsV6 != nil) {
+	case familyV4:
+		return m.wds.GetPacketServiceStatus(ctx)
+	case familyV6:
+		return m.wdsV6.GetPacketServiceStatus(ctx)
+	default:
 		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
 	}
-	return m.wds.GetPacketServiceStatus(ctx)
 }
 
 func packetServiceStatusHasDataCall(status qmi.ConnectionStatus) bool {
@@ -3866,17 +3871,28 @@ func (m *Manager) doConnectLocked() error {
 
 	// Start IPv4 / IPv6 data calls / 启动 IPv4 / IPv6 数据呼叫。
 	// 任一拨通就继续；IPv4 被拒（如只给 IPv6 的网络）时照样拨 IPv6，见 dialDualStack。
+	// 回 NoEffect（模组上这个族已有会话）时先停掉再拨一次，见 dialRecoveringNoEffect。
 	dialV4 := func() (uint32, error) {
 		m.log.Info("Starting IPv4 data call...")
-		return m.wds.StartNetworkInterface(dialCtx,
-			m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV4)
+		return dialRecoveringNoEffect(func() (uint32, error) {
+			return m.wds.StartNetworkInterface(dialCtx,
+				m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV4)
+		}, func() error {
+			m.log.Warn("IPv4 data call already exists (NoEffect), stopping it before redial")
+			return m.stopExistingPacketDataCall(dialCtx, m.wds)
+		})
 	}
 	var dialV6 func() (uint32, error)
 	if m.wdsV6 != nil {
 		dialV6 = func() (uint32, error) {
 			m.log.Info("Starting IPv6 data call...")
-			return m.wdsV6.StartNetworkInterface(dialCtx,
-				m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
+			return dialRecoveringNoEffect(func() (uint32, error) {
+				return m.wdsV6.StartNetworkInterface(dialCtx,
+					m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
+			}, func() error {
+				m.log.Warn("IPv6 data call already exists (NoEffect), stopping it before redial")
+				return m.stopExistingPacketDataCall(dialCtx, m.wdsV6)
+			})
 		}
 	}
 	dial := dialDualStack(m.cfg.EnableIPv4, m.cfg.EnableIPv6, dialV4, dialV6)
@@ -4299,6 +4315,7 @@ func (m *Manager) doStatusCheck(full bool) {
 		if currentState == StateConnected {
 			m.log.Warn("Connection lost!")
 			m.handleV4 = 0
+			m.handleV6 = 0
 			m.flushDefaultDataAddresses()
 			m.setState(StateDisconnected)
 			m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
@@ -4316,7 +4333,9 @@ func (m *Manager) doStatusCheck(full bool) {
 }
 
 func (m *Manager) verifyIPConsistency() error {
-	if m.wds == nil || m.settings == nil {
+	// 只核对 IPv4：没有 IPv4 会话（只连着 IPv6，见 dialDualStack）时没什么可比，跳过 ——
+	// 不然取不到 / 取到空的 IPv4 设置都可能被当成「不一致」触发重拨。
+	if m.wds == nil || m.settings == nil || m.handleV4 == 0 {
 		return nil
 	}
 

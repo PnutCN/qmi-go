@@ -3,6 +3,8 @@ package manager
 import (
 	"errors"
 	"fmt"
+
+	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
 // dualStackDialResult 是一次双栈拨号的结果。
@@ -48,4 +50,47 @@ func dialDualStack(enableV4, enableV6 bool, dialV4, dialV6 func() (uint32, error
 		}
 	}
 	return r
+}
+
+// ipFamily 是健康检查要查哪个 WDS 客户端的分组业务状态。
+type ipFamily int
+
+const (
+	familyNone ipFamily = iota
+	familyV4
+	familyV6
+)
+
+// packetStatusFamily 选健康检查查哪个族：**实际连着的那个**。
+//
+// 从前只查 IPv4 客户端。v4v6 配置下 IPv4 被拒、只连上 IPv6（dialDualStack 的回退）时，IPv4
+// 客户端上没有会话、永远报 disconnected，健康检查就判「Connection lost!」→ 重拨 → IPv6 回 NoEffect
+// （会话其实还在）→ 无限循环（2026-10-31 vopive 5489）。IPv4 连着或都没连时与从前相同，查 IPv4。
+func packetStatusFamily(handleV4, handleV6 uint32, hasV4, hasV6 bool) ipFamily {
+	switch {
+	case handleV4 != 0 && hasV4:
+		return familyV4
+	case handleV6 != 0 && hasV6:
+		return familyV6
+	case hasV4:
+		return familyV4
+	case hasV6:
+		return familyV6
+	default:
+		return familyNone
+	}
+}
+
+// dialRecoveringNoEffect 拨一次；回 NoEffect（这个族在模组上已经有会话 —— 断开通知迟到、或上一轮没收尾）
+// 时先 stop 再拨一次。别的错误原样返回。
+func dialRecoveringNoEffect(dial func() (uint32, error), stop func() error) (uint32, error) {
+	h, err := dial()
+	var qmiErr *qmi.QMIError
+	if err == nil || !errors.As(err, &qmiErr) || qmiErr.ErrorCode != qmi.QMIErrNoEffect {
+		return h, err
+	}
+	if stopErr := stop(); stopErr != nil {
+		return 0, fmt.Errorf("%w（停掉残留会话也失败：%v）", err, stopErr)
+	}
+	return dial()
 }

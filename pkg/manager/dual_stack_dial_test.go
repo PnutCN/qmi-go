@@ -3,6 +3,8 @@ package manager
 import (
 	"errors"
 	"testing"
+
+	"github.com/iniwex5/qmi-go/pkg/qmi"
 )
 
 // 双栈拨号：IPv4 被拒而 IPv6 可用时要继续拨 IPv6（2026-10-31）。
@@ -79,5 +81,57 @@ func TestDialDualStackNothingEnabled(t *testing.T) {
 
 	if r.err == nil || c4+c6 != 0 {
 		t.Fatalf("什么都没开时应报错而不是假装连上：c4=%d c6=%d err=%v", c4, c6, r.err)
+	}
+}
+
+// 健康检查要查**实际连着的那个族**（2026-10-31）：v4v6 配置下 IPv4 被拒、只连上 IPv6 时，
+// 从前只查 IPv4 的 WDS 客户端 —— 它上面没有会话，永远报 disconnected，于是「Connection lost!」
+// → 重拨 → IPv6 回 NoEffect（会话其实还在）→ 两族都「失败」，无限循环（vopive 5489 15:38 起）。
+func TestPacketStatusFamily(t *testing.T) {
+	cases := []struct {
+		name               string
+		handleV4, handleV6 uint32
+		hasV4, hasV6       bool
+		want               ipFamily
+	}{
+		{"只连上 IPv6 查 IPv6", 0, 0x66, true, true, familyV6},
+		{"IPv4 连着照旧查 IPv4", 0x44, 0x66, true, true, familyV4},
+		{"只连上 IPv4", 0x44, 0, true, true, familyV4},
+		{"都没连：有 IPv4 客户端查 IPv4（与从前相同）", 0, 0, true, true, familyV4},
+		{"都没连、只有 IPv6 客户端", 0, 0, false, true, familyV6},
+		{"什么都没有", 0, 0, false, false, familyNone},
+	}
+	for _, c := range cases {
+		if got := packetStatusFamily(c.handleV4, c.handleV6, c.hasV4, c.hasV6); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// 拨号回 NoEffect = 这个族在模组上已经有会话（断开通知迟到、或上一轮没收尾）。先停掉再拨一次。
+func TestDialRecoveringNoEffect(t *testing.T) {
+	noEffect := &qmi.QMIError{ErrorCode: qmi.QMIErrNoEffect}
+	calls, stops := 0, 0
+	dial := func() (uint32, error) {
+		calls++
+		if calls == 1 {
+			return 0, noEffect
+		}
+		return 0x66, nil
+	}
+	stop := func() error { stops++; return nil }
+
+	h, err := dialRecoveringNoEffect(dial, stop)
+
+	if err != nil || h != 0x66 || calls != 2 || stops != 1 {
+		t.Fatalf("h=%#x err=%v calls=%d stops=%d", h, err, calls, stops)
+	}
+
+	// 别的错误不重试、不停会话。
+	calls, stops = 0, 0
+	other := errors.New("call end type=6 code=51")
+	_, err = dialRecoveringNoEffect(func() (uint32, error) { calls++; return 0, other }, stop)
+	if !errors.Is(err, other) || calls != 1 || stops != 0 {
+		t.Fatalf("err=%v calls=%d stops=%d", err, calls, stops)
 	}
 }
