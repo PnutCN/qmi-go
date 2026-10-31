@@ -3864,32 +3864,40 @@ func (m *Manager) doConnectLocked() error {
 		m.log.WithError(regErr).Debug("Failed to query registration state before dialing")
 	}
 
-	// Start IPv4 data call / 启动IPv4数据呼叫
-	if m.cfg.EnableIPv4 {
+	// Start IPv4 / IPv6 data calls / 启动 IPv4 / IPv6 数据呼叫。
+	// 任一拨通就继续；IPv4 被拒（如只给 IPv6 的网络）时照样拨 IPv6，见 dialDualStack。
+	dialV4 := func() (uint32, error) {
 		m.log.Info("Starting IPv4 data call...")
-		handle, err := m.wds.StartNetworkInterface(dialCtx,
+		return m.wds.StartNetworkInterface(dialCtx,
 			m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV4)
-		if err != nil {
-			m.log.WithError(err).Error("IPv4 dial failed")
-			m.handleDialFailure(err)
-			return err
-		}
-		m.handleV4 = handle
-		m.log.Infof("IPv4 connected, handle=0x%08x", handle)
 	}
-
-	// Start IPv6 data call / 启动IPv6数据呼叫
-	if m.cfg.EnableIPv6 && m.wdsV6 != nil {
-		m.log.Info("Starting IPv6 data call...")
-		handle, err := m.wdsV6.StartNetworkInterface(dialCtx,
-			m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
-		if err != nil {
-			m.log.WithError(err).Warn("IPv6 dial failed")
-			// Continue with IPv4 only
-		} else {
-			m.handleV6 = handle
-			m.log.Infof("IPv6 connected, handle=0x%08x", handle)
+	var dialV6 func() (uint32, error)
+	if m.wdsV6 != nil {
+		dialV6 = func() (uint32, error) {
+			m.log.Info("Starting IPv6 data call...")
+			return m.wdsV6.StartNetworkInterface(dialCtx,
+				m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
 		}
+	}
+	dial := dialDualStack(m.cfg.EnableIPv4, m.cfg.EnableIPv6, dialV4, dialV6)
+	if dial.err != nil {
+		m.log.WithError(dial.err).Error("Data call dial failed")
+		m.handleDialFailure(dial.err)
+		return dial.err
+	}
+	if dial.v4Err != nil {
+		m.log.WithError(dial.v4Err).Warn("IPv4 dial failed, continuing with IPv6 only")
+	}
+	if dial.v6Err != nil {
+		m.log.WithError(dial.v6Err).Warn("IPv6 dial failed, continuing with IPv4 only")
+	}
+	if dial.handleV4 != 0 {
+		m.handleV4 = dial.handleV4
+		m.log.Infof("IPv4 connected, handle=0x%08x", dial.handleV4)
+	}
+	if dial.handleV6 != 0 {
+		m.handleV6 = dial.handleV6
+		m.log.Infof("IPv6 connected, handle=0x%08x", dial.handleV6)
 	}
 
 	// Get IP settings and configure interface / 获取IP设置并配置接口
