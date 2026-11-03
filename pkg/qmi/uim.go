@@ -1599,17 +1599,10 @@ func (u *UIMService) GetNativeMCCMNC(ctx context.Context) (mcc string, mnc strin
 }
 
 func decodeEFSPN(data []byte) (string, error) {
-	if len(data) == 0 {
-		return "", fmt.Errorf("EF_SPN data empty")
-	}
-	name := data
-	if len(name) > 1 {
-		name = name[1:]
-	}
-	name = trimSPNPadding(name)
-	if len(name) == 0 {
+	if len(data) < 2 {
 		return "", fmt.Errorf("EF_SPN name empty")
 	}
+	name := data[1:]
 
 	var (
 		decoded string
@@ -1623,16 +1616,16 @@ func decodeEFSPN(data []byte) (string, error) {
 	case 0x82:
 		decoded, err = decodeSPNCompressedUCS2(name, 2)
 	default:
-		if isPrintableASCII(name) {
-			decoded = string(name)
-		} else {
-			decoded, err = decodeSPNGSM(name)
+		// GSM 的 00 是 @,24/40 是 ¤/¡,不能按 ASCII 或 NUL 填充处理。
+		if end := bytes.IndexByte(name, 0xff); end >= 0 {
+			name = name[:end]
 		}
+		decoded, err = decodeSPNGSM(name)
 	}
 	if err != nil {
 		return "", err
 	}
-	decoded = strings.TrimSpace(strings.ReplaceAll(decoded, "\x00", ""))
+	// 厂商选档会完整比较 SPN;填充必须由各编码解释,真实空格/NUL 不能在这里裁掉。
 	if decoded == "" {
 		return "", fmt.Errorf("EF_SPN name empty")
 	}
@@ -1822,12 +1815,18 @@ func decodeOPLPLMN(data []byte) string {
 }
 
 func decodeSPNUCS2(data []byte) (string, error) {
-	data = trimSPNPadding(data)
+	if len(data)%2 != 0 {
+		if data[len(data)-1] != 0xff {
+			return "", fmt.Errorf("UCS2 SPN odd length: %d", len(data))
+		}
+		data = data[:len(data)-1]
+	}
+	// 80 编码只去尾部整字 FFFF,逐字节去 00 会截坏 4E00 等有效字符。
+	for len(data) >= 2 && data[len(data)-2] == 0xff && data[len(data)-1] == 0xff {
+		data = data[:len(data)-2]
+	}
 	if len(data) == 0 {
 		return "", fmt.Errorf("UCS2 SPN empty")
-	}
-	if len(data)%2 != 0 {
-		return "", fmt.Errorf("UCS2 SPN odd length: %d", len(data))
 	}
 	runes := make([]uint16, 0, len(data)/2)
 	for i := 0; i < len(data); i += 2 {
@@ -1855,16 +1854,24 @@ func decodeSPNCompressedUCS2(data []byte, baseBytes int) (string, error) {
 	}
 
 	var b strings.Builder
-	for _, c := range payload {
+	for i := 0; i < len(payload); {
+		c := payload[i]
 		if c < 0x80 {
-			decoded, err := decodeSPNGSM([]byte{c})
+			end := i + 1
+			for end < len(payload) && payload[end] < 0x80 {
+				end++
+			}
+			// GSM 扩展字符占两个字节,连续段必须一起解码,不能把 ESC 独立成空格。
+			decoded, err := decodeSPNGSM(payload[i:end])
 			if err != nil {
 				return "", err
 			}
 			b.WriteString(decoded)
+			i = end
 			continue
 		}
 		b.WriteRune(rune(base + uint16(c&0x7F)))
+		i++
 	}
 	return b.String(), nil
 }

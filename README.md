@@ -27,6 +27,12 @@ It doesn't wrap AT commands — it speaks QMI/QMUX directly over `/dev/cdc-wdm*`
 | `IMSP` | IMS enabler status queries |
 | `VOICE` | Dial, answer, hang up, DTMF, USSD, supplementary services, call-status indications |
 
+EF_SPN 解码后的名称保留首尾空格和 GSM 字符原义,供宿主在本地按运营商配置的原始条件选档。
+填充必须按编码处理:UCS2 只移除末尾 `FFFF` 码元,压缩 UCS2 的计数范围内 `FF` 仍是有效字符,
+GSM 转义序列需要连续解码。界面如需规整名称,应在展示层处理。
+对应边界由 `TestDecodeEFSPNPreservesSelectorSpaces` 与编码夹具覆盖;
+语义参照 [AOSP IccUtils.adnStringFieldToString](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android17-release/telephony/java/com/android/internal/telephony/uicc/IccUtils.java)。
+
 ### The `manager` layer adds
 
 - Automatic dial and reconnect
