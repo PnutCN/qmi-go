@@ -44,6 +44,11 @@ GSM 转义序列需要连续解码。界面如需规整名称,应在展示层处
 - `VOICE` call/USSD event bridging
 - High-level query APIs for device, network, and SIM state
 
+`Manager.ReadSelectedDataAPN(ctx)` 只读当前默认数据连接的实际 APN，并在查询前后核对连接状态。
+未连接、缺少本实例持有的默认数据句柄或响应缺 APN 时返回错误；不以静态配置、IMS 或临时彩信 PDN 代替。
+底层 `WDSService.ReadActiveAPN` 只请求 APN 名，不修改 IP family，也不启动新连接。
+协议字段参照 [libqmi Get Current Settings](https://github.com/linux-mobile-broadband/libqmi/blob/main/data/qmi-service-wds.json)。
+
 ## Current limits
 
 - Native `QRTR` (`AF_QIPCRTR`) transport is available (see below) but requires a kernel with `CONFIG_QRTR` and is less battle-tested than the default `/dev/cdc-wdm*` + QMUX path
