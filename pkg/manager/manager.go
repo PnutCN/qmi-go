@@ -68,6 +68,8 @@ type Config struct {
 	Username        string      // Authentication username / 认证用户名
 	Password        string      // Authentication password / 认证密码
 	AuthType        uint8       // 0=none, 1=PAP, 2=CHAP, 3=PAP|CHAP / 认证类型
+	DataMTUv4       int         // 网络未给MTU时的默认数据IPv4回落；0不声明。
+	DataMTUv6       int         // 与IPv4独立，不能拿旧mtu字段自动补给IPv6。
 	EnableIPv4      bool        // Enable IPv4 / 启用 IPv4
 	EnableIPv6      bool        // Enable IPv6 / 启用 IPv6
 	PINCode         string      // SIM PIN code / SIM 卡 PIN 码
@@ -180,6 +182,11 @@ type Manager struct {
 	coreReadyLastErr  string
 	coreReadySince    time.Time
 	desiredConnection bool
+	// 默认数据配置的卡级租约；换卡取消后自动重连也不得复用旧凭据。
+	defaultDataGuard        func() bool
+	defaultDataVerify       func(context.Context) error
+	defaultDataExplicitAuth bool
+	defaultDataDial         func(context.Context) error // 夹具截住宿主配置；默认仍跑真实完整建链。
 	// reconfiguringData suppresses automatic reconnect scheduling while a
 	// transactional APN/IP-family replacement is disconnecting and redialing.
 	// Without this guard a failed redial can enqueue an event using the new
@@ -2188,9 +2195,16 @@ func (m *Manager) GetServingPLMN(ctx context.Context) (mcc, mnc string, err erro
 }
 
 // RotateIP disconnects and reconnects to get a new IP address / RotateIP 断开并重新连接以获取新 IP 地址
-func (m *Manager) RotateIP() error {
+func (m *Manager) RotateIP() (resultErr error) {
 	m.dataOpMu.Lock()
 	defer m.dataOpMu.Unlock()
+	defer func() { m.cleanupFailedDefaultDataCall(resultErr) }()
+	verifyCtx, verifyCancel := m.opContext(5 * time.Second)
+	verifyErr := m.verifyDefaultDataCurrent(verifyCtx)
+	verifyCancel()
+	if verifyErr != nil {
+		return verifyErr
+	}
 
 	m.mu.Lock()
 	if m.state != StateConnected {
@@ -2229,9 +2243,7 @@ func (m *Manager) RotateIP() error {
 	m.flushDefaultDataAddresses()
 
 	// 3. Reconnect / 3. 重新连接
-	handle, err := m.wds.StartNetworkInterface(ctx,
-		m.cfg.APN, m.cfg.Username, m.cfg.Password,
-		m.cfg.AuthType, qmi.IpFamilyV4)
+	handle, err := m.startDefaultDataCall(ctx, m.wds, qmi.IpFamilyV4)
 	if err != nil {
 		return m.rotateViaRadioReset()
 	}
@@ -2247,9 +2259,15 @@ func (m *Manager) RotateIP() error {
 
 	// Redial IPv6 alongside IPv4 so the v6 bearer isn't left permanently down / 与 IPv4 一起重拨 IPv6，避免 v6 承载永久丢失
 	m.redialIPv6(ctx)
+	if err := m.verifyDefaultDataCurrent(ctx); err != nil {
+		return err
+	}
 
 	// 4. Reconfigure network / 4. 重新配置网络
 	if err := m.configureNetwork(); err != nil {
+		return err
+	}
+	if err := m.verifyDefaultDataCurrent(ctx); err != nil {
 		return err
 	}
 
@@ -2280,7 +2298,14 @@ func (m *Manager) RotateIP() error {
 }
 
 // rotateViaRadioReset performs IP rotation by resetting the radio / rotateViaRadioReset 通过重置射频执行 IP 轮换
-func (m *Manager) rotateViaRadioReset() error {
+func (m *Manager) rotateViaRadioReset() (resultErr error) {
+	defer func() { m.cleanupFailedDefaultDataCall(resultErr) }()
+	verifyCtx, verifyCancel := m.opContext(5 * time.Second)
+	verifyErr := m.verifyDefaultDataCurrent(verifyCtx)
+	verifyCancel()
+	if verifyErr != nil {
+		return verifyErr
+	}
 	// A radio power cycle is device-wide: it destroys any secondary PDN
 	// riding the same radio (the VoLTE IMS bearer). This is a separate
 	// implementation from RadioReset(), so guarding that one is not enough --
@@ -2361,9 +2386,7 @@ func (m *Manager) rotateViaRadioReset() error {
 registered:
 
 	// 5. Reconnect / 6. 重新连接
-	handle, err := m.wds.StartNetworkInterface(ctx,
-		m.cfg.APN, m.cfg.Username, m.cfg.Password,
-		m.cfg.AuthType, qmi.IpFamilyV4)
+	handle, err := m.startDefaultDataCall(ctx, m.wds, qmi.IpFamilyV4)
 	if err != nil {
 		return fmt.Errorf("redial after radio reset failed: %w", err)
 	}
@@ -2371,9 +2394,15 @@ registered:
 
 	// Redial IPv6 alongside IPv4 so the v6 bearer isn't left permanently down / 与 IPv4 一起重拨 IPv6，避免 v6 承载永久丢失
 	m.redialIPv6(ctx)
+	if err := m.verifyDefaultDataCurrent(ctx); err != nil {
+		return err
+	}
 
 	// 6. Reconfigure network / 7. 重新配置网络
 	if err := m.configureNetwork(); err != nil {
+		return err
+	}
+	if err := m.verifyDefaultDataCurrent(ctx); err != nil {
 		return err
 	}
 
@@ -2403,6 +2432,10 @@ registered:
 // the existing "IPv4 is primary, IPv6 continues on a best-effort basis" behavior in doConnect.
 // redialIPv6 停止陈旧的 IPv6 handle 并重新拨号 IPv6，失败时仅记录日志，不影响调用方（与 doConnect 中 IPv4 为主、IPv6 尽力而为的行为一致）
 func (m *Manager) redialIPv6(ctx context.Context) {
+	if err := m.verifyDefaultDataCurrent(ctx); err != nil {
+		m.log.Warn("默认数据租约失效，取消IPv6重拨")
+		return
+	}
 	if !m.cfg.EnableIPv6 || m.wdsV6 == nil {
 		return
 	}
@@ -2410,9 +2443,7 @@ func (m *Manager) redialIPv6(ctx context.Context) {
 		_ = m.wdsV6.StopNetworkInterface(ctx, m.handleV6)
 		m.handleV6 = 0
 	}
-	handle, err := m.wdsV6.StartNetworkInterface(ctx,
-		m.cfg.APN, m.cfg.Username, m.cfg.Password,
-		m.cfg.AuthType, qmi.IpFamilyV6)
+	handle, err := m.startDefaultDataCall(ctx, m.wdsV6, qmi.IpFamilyV6)
 	if err != nil {
 		m.log.WithError(err).Warn("IPv6 redial failed during IP rotation")
 		return
@@ -3758,8 +3789,18 @@ func (m *Manager) doConnect() error {
 }
 
 func (m *Manager) doConnectLocked() error {
+	return m.doConnectLockedContext(context.Background())
+}
+
+func (m *Manager) doConnectLockedContext(parent context.Context) (resultErr error) {
+	defer func() { m.cleanupFailedDefaultDataCall(resultErr) }()
 
 	m.mu.Lock()
+	guard := m.defaultDataGuard
+	if guard != nil && !guard() {
+		m.mu.Unlock()
+		return context.Canceled
+	}
 	if !m.desiredConnection {
 		m.mu.Unlock()
 		return nil
@@ -3777,6 +3818,8 @@ func (m *Manager) doConnectLocked() error {
 
 	dialCtx, cancelDial := m.opContext(m.cfg.Timeouts.Dial)
 	defer cancelDial()
+	stopParent := context.AfterFunc(parent, cancelDial)
+	defer stopParent()
 
 	// EnsureDataPlaneTopology allocates WDA/WDS(V6), cleans up crash-residual
 	// mux state, and brings the declared topology to a stable snapshot
@@ -3875,8 +3918,7 @@ func (m *Manager) doConnectLocked() error {
 	dialV4 := func() (uint32, error) {
 		m.log.Info("Starting IPv4 data call...")
 		return dialRecoveringNoEffect(func() (uint32, error) {
-			return m.wds.StartNetworkInterface(dialCtx,
-				m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV4)
+			return m.startDefaultDataCall(dialCtx, m.wds, qmi.IpFamilyV4)
 		}, func() error {
 			m.log.Warn("IPv4 data call already exists (NoEffect), stopping it before redial")
 			return m.stopExistingPacketDataCall(dialCtx, m.wds)
@@ -3887,8 +3929,7 @@ func (m *Manager) doConnectLocked() error {
 		dialV6 = func() (uint32, error) {
 			m.log.Info("Starting IPv6 data call...")
 			return dialRecoveringNoEffect(func() (uint32, error) {
-				return m.wdsV6.StartNetworkInterface(dialCtx,
-					m.cfg.APN, m.cfg.Username, m.cfg.Password, m.cfg.AuthType, qmi.IpFamilyV6)
+				return m.startDefaultDataCall(dialCtx, m.wdsV6, qmi.IpFamilyV6)
 			}, func() error {
 				m.log.Warn("IPv6 data call already exists (NoEffect), stopping it before redial")
 				return m.stopExistingPacketDataCall(dialCtx, m.wdsV6)
@@ -3915,10 +3956,18 @@ func (m *Manager) doConnectLocked() error {
 		m.handleV6 = dial.handleV6
 		m.log.Infof("IPv6 connected, handle=0x%08x", dial.handleV6)
 	}
+	if err := m.verifyDefaultDataCurrent(dialCtx); err != nil {
+		m.handleDialFailure(err)
+		return err
+	}
 
 	// Get IP settings and configure interface / 获取IP设置并配置接口
 	if err := m.configureNetwork(); err != nil {
 		m.log.WithError(err).Error("Network configuration failed")
+		m.handleDialFailure(err)
+		return err
+	}
+	if err := m.verifyDefaultDataCurrent(dialCtx); err != nil {
 		m.handleDialFailure(err)
 		return err
 	}
@@ -3967,6 +4016,8 @@ func (m *Manager) defaultMuxBinding() (qmi.MuxBinding, error) {
 }
 
 func (m *Manager) configureNetwork() error {
+	var networkMTUv4, networkMTUv6 int
+	var active4, active6 bool
 	// Configure IP/DNS/routes on the interface published by topology
 	// convergence. Under QMAP the physical master only carries the muxes.
 	topology, master := m.defaultDataPlaneTarget()
@@ -4049,11 +4100,7 @@ func (m *Manager) configureNetwork() error {
 					m.log.Info("Skipping DNS configuration (--no-dns)")
 				}
 
-				// Set MTU
-				if settings.MTU > 0 {
-					m.log.Infof("Setting MTU: %d", settings.MTU)
-					netcfg.SetMTU(ifname, int(settings.MTU))
-				}
+				networkMTUv4, active4 = settings.MTU, true
 			}
 		}
 	}
@@ -4085,6 +4132,7 @@ func (m *Manager) configureNetwork() error {
 			m.mu.Unlock()
 
 			if settingsV6.IPv6Address != nil {
+				networkMTUv6, active6 = settingsV6.MTU, true
 				m.log.Infof("Configuring IPv6: %s/%d", settingsV6.IPv6Address, settingsV6.IPv6Prefix)
 				if err := netcfg.SetIPv6Address(ifname, settingsV6.IPv6Address, int(settingsV6.IPv6Prefix)); err != nil {
 					m.log.WithError(err).Error("Failed to set IPv6 address")
@@ -4102,6 +4150,14 @@ func (m *Manager) configureNetwork() error {
 		}
 	}
 
+	mtu, mtuErr := defaultDataMTU(networkMTUv4, networkMTUv6, m.cfg.DataMTUv4, m.cfg.DataMTUv6, active4, active6)
+	if mtuErr != nil {
+		return mtuErr
+	} else if mtu > 0 {
+		if err := m.resolvedNetcfgOps().setMTU(ifname, mtu); err != nil {
+			return errors.New("应用默认数据MTU失败")
+		}
+	}
 	// Final check: ensure up / 最后检查: 确保接口已启动
 	netcfg.BringUp(ifname)
 	m.log.Info("Network configuration completed")
@@ -4112,6 +4168,7 @@ func (m *Manager) configureNetwork() error {
 // default connection, making the physical-master invariant testable without
 // requiring root privileges.
 type netcfgOps struct {
+	setMTU         func(string, int) error
 	flushAddresses func(string) error
 	flushRoutes    func(string) error
 	bringDown      func(string) error
@@ -4119,6 +4176,9 @@ type netcfgOps struct {
 
 func (m *Manager) resolvedNetcfgOps() netcfgOps {
 	ops := m.netcfgOps
+	if ops.setMTU == nil {
+		ops.setMTU = netcfg.SetMTU
+	}
 	if ops.flushAddresses == nil {
 		ops.flushAddresses = netcfg.FlushAddresses
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -168,5 +170,68 @@ func TestCompletedTimedOutTransactionIsRememberedForLateResponse(t *testing.T) {
 	}
 	if got := len(c.transactions); got != 0 {
 		t.Fatalf("timed out request left %d active transaction(s)", got)
+	}
+}
+
+func TestReadLoopDropsLateResponseAfterCanceledTransaction(t *testing.T) {
+	conn, peer := net.Pipe()
+	late := make(chan struct{}, 1)
+	c := &Client{
+		conn: conn,
+		opts: ClientOptions{ReadDeadline: 5 * time.Millisecond, Logf: func(_ ClientLogLevel, format string, _ ...any) {
+			if strings.Contains(format, "received late response") {
+				late <- struct{}{}
+			}
+		}},
+		eventCh:            make(chan Event, 1),
+		writeCh:            make(chan writeRequest, 1),
+		closeCh:            make(chan struct{}),
+		transactions:       make(map[uint32]*transactionEntry),
+		recentTransactions: make(map[uint32]recentTransaction),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := c.SendRequest(ctx, ServiceUIM, 1, UIMReadRecord, nil)
+		result <- err
+	}()
+	wr := <-c.writeCh
+	request, err := UnmarshalPacket(wr.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wr.result <- nil
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatal("调用方取消未结束事务", err)
+	}
+	c.wg.Add(1)
+	go c.readLoop()
+	t.Cleanup(func() {
+		close(c.closeCh)
+		conn.Close()
+		peer.Close()
+		c.wg.Wait()
+	})
+	// 走真实帧读取/事务分派，迟到的普通响应不得被提升为SIM状态或其他异步事件。
+	packet := (&Packet{ServiceType: ServiceUIM, ClientID: 1, TransactionID: request.TransactionID, MessageID: UIMReadRecord}).Marshal()
+	packet[QmuxHeaderSize] = 0x02
+	if _, err := peer.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-late:
+	case <-time.After(time.Second):
+		t.Fatal("真实readLoop未识别已取消事务的迟到响应")
+	}
+	select {
+	case <-c.eventCh:
+		t.Fatal("迟到应答被错误分派成异步事件")
+	default:
+	}
+	key := uint32(ServiceUIM)<<16 | uint32(request.TransactionID)
+	if c.unmatchedResponses.Load() != 1 || c.isRecentTransaction(key, ServiceUIM, UIMReadRecord) {
+		t.Fatal("迟到响应没有消费已取消事务记录")
 	}
 }

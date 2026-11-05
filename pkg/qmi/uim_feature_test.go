@@ -467,7 +467,8 @@ func TestReadPNNRecordsReturnsContextCancellation(t *testing.T) {
 				return qmiErrorPacket(QMIErrInvalidArg)
 			}
 			cancel()
-			return readRecordPacket([]byte{0x43, 0x04, 'T', 'e', 's', 't'})
+			// 本例只验证取消停止后续读；迟到应答由client专项测试覆盖，不注入已取消事务。
+			return nil
 		default:
 			t.Errorf("unexpected message 0x%04x", req.MessageID)
 		}

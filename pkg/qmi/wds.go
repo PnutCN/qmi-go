@@ -428,12 +428,25 @@ func (w *WDSService) SetIPFamilyPreference(ctx context.Context, ipFamily uint8) 
 // StartNetworkInterface initiates a data call / StartNetworkInterface发起数据呼叫
 // Returns the handle needed to stop the call later / 返回稍后停止呼叫所需的句柄
 func (w *WDSService) StartNetworkInterface(ctx context.Context, apn string, username string, password string, authType uint8, ipFamily uint8) (uint32, error) {
+	return w.startNetworkInterface(ctx, apn, username, password, authType, ipFamily, false)
+}
+
+// StartNetworkInterfaceWithAuthentication使NONE也显式写TLV0x16，避免沿用模组旧profile认证。
+// 旧入口仍保留省略零值的兼容行为，新整组数据配置才使用此入口。
+func (w *WDSService) StartNetworkInterfaceWithAuthentication(ctx context.Context, apn, username, password string, authType, ipFamily uint8) (uint32, error) {
+	return w.startNetworkInterface(ctx, apn, username, password, authType, ipFamily, true)
+}
+
+func (w *WDSService) startNetworkInterface(ctx context.Context, apn, username, password string, authType, ipFamily uint8, explicitAuth bool) (uint32, error) {
 	// Set IP family first / 首先设置IP族
 	if err := w.SetIPFamilyPreference(ctx, ipFamily); err != nil {
 		// Non-fatal, continue / 非致命，继续
 	}
 
 	tlvs := buildStartNetworkTLVs(apn, username, password, authType, ipFamily, w.ProfileIndex, w.TechnologyPreference, w.CallType, w.HasCallType)
+	if explicitAuth && authType == 0 {
+		tlvs = append(tlvs, NewTLVUint8(0x16, 0))
+	}
 
 	resp, err := w.client.SendRequest(ctx, ServiceWDS, w.clientID, WDSStartNetworkInterface, tlvs)
 	if err != nil {
