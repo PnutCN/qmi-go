@@ -192,3 +192,18 @@ var ErrServiceNotSupported = errors.New("qmi service not supported by hardware")
 // platform or build that cannot support it (non-Linux, or the running kernel lacks
 // CONFIG_QRTR). ErrQRTRUnsupported 表示当前平台或内核不支持 QRTR (AF_QIPCRTR) 传输。
 var ErrQRTRUnsupported = errors.New("qmi: QRTR (AF_QIPCRTR) transport is unsupported on this platform")
+
+// ============================================================================
+// Connection Closed / 连接已断
+// ============================================================================
+
+// ErrConnectionClosed 表示 Client 的读循环已经退出（读失败、设备拔出或 Close）：
+// 之后不会再有任何回包，等待中的与新发的请求都立刻以它失败，而不是等到超时。
+// 读失败时返回的错误同时包着底层读错误，可用 errors.Is 取到（例如 io.EOF）。
+//
+// 文本保留 "connection closed" / "qmi: read failed" / "client closed" 这些片段：
+// 下游（manager 的 isUIMReadinessTransportFatal、nsim 的传输断开判定）按子串识别传输已断。
+var ErrConnectionClosed = errors.New("connection closed")
+
+// ErrClientClosed 表示 Client 已经 Close。它同时满足 errors.Is(err, ErrConnectionClosed)。
+var ErrClientClosed = fmt.Errorf("qmi: client closed (%w)", ErrConnectionClosed)

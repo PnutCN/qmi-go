@@ -170,6 +170,11 @@ type Client struct {
 	lateResponseSuppressed uint64
 	lastTxID               uint32 // atomic counter / 原子计数器
 	ctlTxID                uint32 // separate counter for CTL (1 byte) / CTL的独立计数器 (1字节)
+	// connErr 是连接终止的原因（读循环读失败，或 Close），由 mu 保护，一旦置上就不再清空。
+	// 读循环一死就不会再有回包：之后的请求必须在登记事务之前就拿到它，否则会写出去、
+	// 再等一个永远不会来的回包，直到调用方超时（默认 30 秒；AllocateClientID 三轮共 60 秒）。
+	// 登记与检查它在同一把锁里做，failPendingTransactions 也在这把锁里置它，二者不会互相错过。
+	connErr error
 
 	// Client ID cache / 客户端ID缓存
 	clientIDs map[uint16]uint8 // service -> clientID / 服务 -> 客户端ID
@@ -424,10 +429,15 @@ func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) 
 func (c *Client) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		// 先置 connErr 再关 closeCh：Close 一开始，新请求就在登记前得到 ErrClientClosed。
+		// 即使读循环早已因读失败退出，Close 之后也统一报 ErrClientClosed —— 那是调用方自己关的。
+		c.mu.Lock()
+		c.connErr = ErrClientClosed
+		c.mu.Unlock()
 		close(c.closeCh)
 		err = c.conn.Close()
 		c.wg.Wait()
-		c.failPendingTransactions(fmt.Errorf("client closed"))
+		c.failPendingTransactions(ErrClientClosed)
 		close(c.eventCh)
 	})
 	return err
@@ -584,7 +594,9 @@ func (c *Client) readLoop() {
 			default:
 			}
 			c.logf(ClientLogLevelWarn, "QMI: read failed: %v", err)
-			c.failPendingTransactions(err)
+			// 文本形如 "qmi: read failed: EOF (connection closed)"：下游按子串认传输已断，
+			// 底层错误与 ErrConnectionClosed 都能用 errors.Is 取到。
+			c.failPendingTransactions(fmt.Errorf("qmi: read failed: %w (%w)", err, ErrConnectionClosed))
 			return
 		}
 
@@ -722,8 +734,15 @@ func (c *Client) writeAll(data []byte) error {
 	return nil
 }
 
+// failPendingTransactions 记下连接终止原因并唤醒所有在等回包的请求。
+// 只能在读循环自身或读循环退出之后（Close 的 wg.Wait 之后）调用：读循环往 entry.ch 发包，
+// 与这里 close(entry.ch) 并发会 panic。
+// 已有原因时不覆盖（Close 先置了 ErrClientClosed，读循环随后因 conn 被关而读失败的情况）。
 func (c *Client) failPendingTransactions(cause error) {
 	c.mu.Lock()
+	if c.connErr == nil {
+		c.connErr = cause
+	}
 	for key, entry := range c.transactions {
 		delete(c.transactions, key)
 		close(entry.ch)
@@ -960,6 +979,10 @@ func (c *Client) SendRequest(ctx context.Context, service uint16, clientID uint8
 		deadline: deadline,
 	}
 	c.mu.Lock()
+	if connErr := c.connErr; connErr != nil {
+		c.mu.Unlock()
+		return nil, connErr
+	}
 	c.transactions[key] = entry
 	c.mu.Unlock()
 
@@ -989,7 +1012,7 @@ func (c *Client) SendRequest(ctx context.Context, service uint16, clientID uint8
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		return nil, c.terminalErr()
 	}
 
 	select {
@@ -1000,21 +1023,31 @@ func (c *Client) SendRequest(ctx context.Context, service uint16, clientID uint8
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		return nil, c.terminalErr()
 	}
 
 	// Wait for response / 等待响应
 	select {
 	case resp, ok := <-respCh:
 		if !ok || resp == nil {
-			return nil, fmt.Errorf("connection closed")
+			return nil, c.terminalErr()
 		}
 		return resp, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.closeCh:
-		return nil, fmt.Errorf("connection closed")
+		return nil, c.terminalErr()
 	}
+}
+
+// terminalErr 返回连接终止的原因；按调用时机它总是已经置上，兜底仍给 ErrConnectionClosed。
+func (c *Client) terminalErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connErr != nil {
+		return c.connErr
+	}
+	return ErrConnectionClosed
 }
 
 // Sync sends a QMI CTL sync request / Sync发送QMI CTL同步请求
@@ -1079,7 +1112,8 @@ func (c *Client) AllocateClientIDWithContext(ctx context.Context, service uint16
 			return clientID, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil {
+		// 连接已断时重试只会得到同一个错误，白等两轮 500ms。
+		if ctx.Err() != nil || errors.Is(err, ErrConnectionClosed) {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
