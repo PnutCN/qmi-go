@@ -31,6 +31,8 @@ type fakeQRTRSent struct {
 type fakeQRTRSocket struct {
 	localAddr sockaddrQRTR
 	recvCh    chan fakeQRTRDatagram
+	// failCh 注入一次不可重试的接收错误（模拟远端子系统复位等），套接字本身不关。
+	failCh    chan error
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
@@ -44,6 +46,7 @@ func newFakeQRTRSocket(local sockaddrQRTR) *fakeQRTRSocket {
 	return &fakeQRTRSocket{
 		localAddr: local,
 		recvCh:    make(chan fakeQRTRDatagram, 32),
+		failCh:    make(chan error, 1),
 		closeCh:   make(chan struct{}),
 	}
 }
@@ -75,6 +78,8 @@ func (s *fakeQRTRSocket) RecvFrom(buf []byte) (int, sockaddrQRTR, error) {
 			return 0, sockaddrQRTR{}, fmt.Errorf("fake qrtr socket closed")
 		}
 		return copy(buf, dg.data), dg.from, nil
+	case err := <-s.failCh:
+		return 0, sockaddrQRTR{}, err
 	case <-timer.C:
 		return 0, sockaddrQRTR{}, unix.EAGAIN
 	case <-s.closeCh:

@@ -105,6 +105,18 @@ type qrtrTransport struct {
 	// goroutine waiting on a services/enumGen change. A close-and-replace
 	// channel is used instead of sync.Cond because callers need timed waits.
 	notifyCh chan struct{}
+	// ctrlErr 是控制读协程因不可重试错误退出的原因（由 mu 保护）。它一死，NEW_LOOKUP 的回答
+	// 再也收不到：之后解析未缓存的服务要立刻失败，在等的解析也要被唤醒，而不是等满 qrtrLookupTimeout。
+	ctrlErr error
+
+	// fatalErr / fatalCh：某个数据套接字的读协程因不可重试错误（不是 Release / 重新分配 / Close
+	// 关掉的）退出。那个服务的回包再也不会来，而 Client 的读循环只认 Read 的错误 ——
+	// 从前读协程静默退出，Client 照样写请求、每个都等满超时。现在 Read 把它报出去，
+	// Client 读循环据此让所有等待者立刻失败，与 cdc-wdm 读失败同样处理。
+	// fatalErr 由 mu 保护，只置一次；fatalCh 随之关闭。
+	fatalErr  error
+	fatalCh   chan struct{}
+	fatalOnce sync.Once
 
 	rxCh      chan []byte
 	closeCh   chan struct{}
@@ -154,6 +166,7 @@ func newQRTRTransport(newSocket func() (qrtrRawSocket, error), logf ClientLogFun
 		notifyCh:   make(chan struct{}),
 		rxCh:       make(chan []byte, qrtrRxQueueSize),
 		closeCh:    make(chan struct{}),
+		fatalCh:    make(chan struct{}),
 	}
 
 	// A single dedicated reader owns ctrlSock: it continuously drains
@@ -196,18 +209,33 @@ func (t *qrtrTransport) Read(p []byte) (int, error) {
 
 	select {
 	case frame, ok := <-t.rxCh:
-		if !ok {
-			return 0, io.EOF
-		}
-		if len(frame) > len(p) {
-			return 0, fmt.Errorf("qrtr: synthesized frame of %d bytes exceeds read buffer of %d bytes", len(frame), len(p))
-		}
-		return copy(p, frame), nil
+		return copyRxFrame(p, frame, ok)
 	case <-timerC:
 		return 0, os.ErrDeadlineExceeded
 	case <-t.closeCh:
 		return 0, io.EOF
+	case <-t.fatalCh:
+		// 先把出事前已经排进队的帧交出去（可能正是某个在等的回包），队空了再报错。
+		select {
+		case frame, ok := <-t.rxCh:
+			return copyRxFrame(p, frame, ok)
+		default:
+		}
+		t.mu.Lock()
+		err := t.fatalErr
+		t.mu.Unlock()
+		return 0, err
 	}
+}
+
+func copyRxFrame(p, frame []byte, ok bool) (int, error) {
+	if !ok {
+		return 0, io.EOF
+	}
+	if len(frame) > len(p) {
+		return 0, fmt.Errorf("qrtr: synthesized frame of %d bytes exceeds read buffer of %d bytes", len(frame), len(p))
+	}
+	return copy(p, frame), nil
 }
 
 func (t *qrtrTransport) Write(p []byte) (int, error) {
@@ -460,6 +488,7 @@ func (t *qrtrTransport) runCtrlReader() {
 					continue
 				}
 			}
+			t.failCtrlReader(err)
 			return // ctrlSock closed (transport Close) or a fatal error
 		}
 		pkt, perr := unmarshalQRTRCtrlPkt(buf[:n])
@@ -489,6 +518,20 @@ func (t *qrtrTransport) runCtrlReader() {
 	}
 }
 
+// failCtrlReader 记下控制读协程的退出原因并唤醒所有在等 NEW_LOOKUP 回答的解析。
+// Close 关掉 ctrlSock 引起的退出是正常收尾，不记。
+func (t *qrtrTransport) failCtrlReader(err error) {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.ctrlErr = fmt.Errorf("qrtr: control socket reader exited: %w", err)
+	t.broadcastLocked()
+	t.mu.Unlock()
+	t.logging(ClientLogLevelWarn, "QMI/QRTR: control socket reader exited, service lookups will fail: %v", err)
+}
+
 // resolveService returns the {node,port} for a service, sending a
 // NEW_LOOKUP(service) and waiting (up to qrtrLookupTimeout) for runCtrlReader
 // to record the reply. It returns as soon as the service appears, so it never
@@ -500,10 +543,13 @@ func (t *qrtrTransport) resolveService(service uint16) (qrtrService, error) {
 		t.mu.Unlock()
 		return srv, nil
 	}
-	closed := t.closed
+	closed, ctrlErr := t.closed, t.ctrlErr
 	t.mu.Unlock()
 	if closed {
 		return qrtrService{}, fmt.Errorf("qrtr: transport closed")
+	}
+	if ctrlErr != nil {
+		return qrtrService{}, fmt.Errorf("qrtr: resolve service 0x%04x: %w", service, ctrlErr)
 	}
 
 	req := marshalQRTRCtrlPkt(newLookupRequest(uint32(service)))
@@ -522,6 +568,11 @@ func (t *qrtrTransport) resolveService(service uint16) (qrtrService, error) {
 			t.mu.Unlock()
 			return qrtrService{}, fmt.Errorf("qrtr: transport closed")
 		}
+		if t.ctrlErr != nil {
+			err := t.ctrlErr
+			t.mu.Unlock()
+			return qrtrService{}, fmt.Errorf("qrtr: resolve service 0x%04x: %w", service, err)
+		}
 		if !t.waitChangeLocked(deadline) {
 			t.mu.Unlock()
 			return qrtrService{}, fmt.Errorf("qrtr: service 0x%04x not found via NEW_LOOKUP", service)
@@ -537,7 +588,7 @@ func (t *qrtrTransport) resolveService(service uint16) (qrtrService, error) {
 func (t *qrtrTransport) enumerateServices() {
 	t.mu.Lock()
 	startGen := t.enumGen
-	closed := t.closed
+	closed := t.closed || t.ctrlErr != nil
 	t.mu.Unlock()
 	if closed {
 		return
@@ -551,7 +602,7 @@ func (t *qrtrTransport) enumerateServices() {
 
 	deadline := time.Now().Add(qrtrLookupTimeout)
 	t.mu.Lock()
-	for t.enumGen == startGen && !t.closed {
+	for t.enumGen == startGen && !t.closed && t.ctrlErr == nil {
 		if !t.waitChangeLocked(deadline) {
 			break
 		}
@@ -626,6 +677,7 @@ func (t *qrtrTransport) runClientReader(service uint16, cl *qrtrClient) {
 					continue
 				}
 			}
+			t.failDataReader(cl, err)
 			return // socket closed (release/Close) or a fatal error: stop reading
 		}
 		if n <= 0 {
@@ -633,6 +685,22 @@ func (t *qrtrTransport) runClientReader(service uint16, cl *qrtrClient) {
 		}
 		t.pushRx(rebuildFrame(service, cl.clientID, buf[:n]))
 	}
+}
+
+// failDataReader 区分数据读协程退出的两种原因：Release / 重新分配 / Close 关掉套接字是正常收尾
+// （那时 clients 表里已经不是它，或 closed 已置）；否则是致命错误，见 fatalErr 的说明。
+func (t *qrtrTransport) failDataReader(cl *qrtrClient, err error) {
+	t.mu.Lock()
+	released := t.closed || t.clients[cl.service] != cl
+	if !released && t.fatalErr == nil {
+		t.fatalErr = fmt.Errorf("qrtr: data socket reader for service 0x%04x exited: %w", cl.service, err)
+	}
+	t.mu.Unlock()
+	if released {
+		return
+	}
+	t.logging(ClientLogLevelWarn, "QMI/QRTR: data socket reader for service 0x%04x exited: %v", cl.service, err)
+	t.fatalOnce.Do(func() { close(t.fatalCh) })
 }
 
 func (t *qrtrTransport) pushRx(frame []byte) {
